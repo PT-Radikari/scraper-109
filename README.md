@@ -65,3 +65,94 @@ docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-r
 This command will create and run a Docker container named "playwright-runner-pintarnya" using the "playwright-runner:latest" image. It will also mount the "./db" directory from your local machine to the "/app/db" directory inside the container.
 
 This document provides a basic guide to setting up a Playwright project. The specific steps for building your project might vary depending on your project structure and configuration.
+
+---
+
+## Available Scripts
+
+### Viewer
+
+```
+npm run dev:viewer
+```
+
+Starts a local web dashboard on port **4000** that lets you start, stop, and monitor all scrapers from a browser UI. Also displays live logs and scraper status (idle / running / done / error) for each source.
+
+---
+
+### Individual Scrapers (development mode)
+
+Run a single scraper with ts-node (no build required):
+
+| Command | Source |
+|---|---|
+| `npm run dev:kitalulus` | Kitalulus (v1) |
+| `npm run dev:kitalulus-v2-vacancies` | Kitalulus v2 — vacancies |
+| `npm run dev:kitalulus-v2-applicants` | Kitalulus v2 — applicants |
+| `npm run dev:kitalulus-v2-process-applicants` | Kitalulus v2 — process applicants |
+| `npm run dev:jooble` | Jooble |
+| `npm run dev:seek` | Seek |
+| `npm run dev:pintarnya` | Pintarnya |
+| `npm run dev:glints` | Glints |
+| `npm run dev` | Generic (no source selected) |
+
+---
+
+### Run All Scrapers
+
+```
+npm run dev:all
+```
+
+Runs `scrape-all.sh`, which launches all scrapers sequentially in a single shell session.
+
+---
+
+### xvfb variants (Linux / headless servers)
+
+Prefix any scraper command with `xvfb:` to wrap it in `xvfb-run -a`, which provides a virtual display. Use these when running on a server without a physical display.
+
+```
+npm run xvfb:kitalulus
+npm run xvfb:kitalulus-v2-vacancies
+npm run xvfb:kitalulus-v2-applicants
+npm run xvfb:kitalulus-v2-process-applicants
+npm run xvfb:jooble
+npm run xvfb:seek
+npm run xvfb:pintarnya
+npm run xvfb:glints
+npm run xvfb          # generic, no source selected
+```
+
+---
+
+### Production (compiled)
+
+First build the project:
+
+```
+npm run build
+```
+
+Then run using the compiled output in `build/`:
+
+| Command | Source |
+|---|---|
+| `npm run start:kitalulus` | Kitalulus |
+| `npm run start:jooble` | Jooble |
+| `npm run start:seek` | Seek |
+| `npm run start:pintarnya` | Pintarnya |
+| `npm run start:glints` | Glints |
+| `npm run start` | Generic |
+
+All `start:*` commands automatically use `xvfb-run` for headless compatibility.
+
+---
+
+### Tests
+
+```
+npm test
+```
+
+Runs the Jest test suite.
