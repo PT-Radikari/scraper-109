@@ -11,6 +11,7 @@
     "dev:kitalulus-v2-process-applicants": "ts-node src/server.ts kitalulus-v2-process-applicants",
     "dev:jooble": "ts-node src/server.ts jooble",
     "dev:seek": "ts-node src/server.ts seek",
+    "dev:seek-auth": "ts-node src/seek-auth.ts",
     "dev:pintarnya": "ts-node src/server.ts pintarnya",
     "dev:glints": "ts-node src/server.ts glints",
     "dev": "ts-node src/server.ts",

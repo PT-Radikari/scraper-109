@@ -35,6 +35,17 @@ npm run dev:glints
 npm run dev:jooble
 ```
 
+Refresh SEEK authentication when `seek.json` expires:
+```
+npm run dev:seek-auth
+```
+Complete the SEEK login in the browser window. After it reaches the candidates page, the script updates `seek.json` with fresh cookies and local/session storage. Then rerun:
+```
+npm run dev:seek
+```
+If `seek.json` has `email` and `password`, the login form is prefilled but not submitted automatically.
+
+
 
 Building the Project locally
 
