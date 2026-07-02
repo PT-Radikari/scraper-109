@@ -895,8 +895,9 @@ export class KitaLulusV2 {
         return "0"; // Invalid date
       }
 
-      // Format the date in YYYY-MM-DD using padStart for consistent formatting
-      return date.toISOString().slice(0, 10).replace(/-/g, '-');
+      // Format the date in YYYY-MM-DD without toISOString() to avoid UTC offset shifting
+      const month = monthIndex.toString().padStart(2, '0');
+      return `${year}-${month}-01`;
     } catch (error) {
       console.error("Error converting date string:", error);
       return "0";
