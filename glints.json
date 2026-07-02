@@ -22,5 +22,6 @@
     "limit": 2,
     "timeout": 60000,
     "slowmo": 500,
-    "db_path": "../db/glints.db"
+    "db_path": "../db/glints.db",
+    "target_company": "PT Rajawali Berdikari Indonesia"
 }

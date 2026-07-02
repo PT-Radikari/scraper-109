@@ -47,6 +47,19 @@ class Glints {
         this.DB = new sqlite3_1.default.Database(this.DB_PATH);
         console.info("CONFIG GLINTS LOADED");
     }
+    getBrowserFallbackExecutablePath() {
+        const candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/opt/homebrew/bin/chromium",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ];
+        for (const candidate of candidates) {
+            if (fs_1.default.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
     /**
      * Sends a request with the provided applicant data.
      * @param param - The applicant data to be sent.
@@ -54,6 +67,7 @@ class Glints {
      */
     sendRequest(param) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b;
             try {
                 const bodyFormData = new form_data_1.default();
                 bodyFormData.append("channel", param.portal);
@@ -68,8 +82,8 @@ class Glints {
                 bodyFormData.append("date_of_birth", param.date_of_birth);
                 bodyFormData.append("salary_expectation", param.salary_expectation);
                 bodyFormData.append("work_experiences", JSON.stringify(param.work_experience));
-                bodyFormData.append("education", JSON.stringify(param.education));
-                bodyFormData.append("skill", JSON.stringify(param.skill));
+                bodyFormData.append("educations", JSON.stringify(param.education));
+                bodyFormData.append("skills", JSON.stringify(param.skill));
                 bodyFormData.append("location", param.location);
                 bodyFormData.append("gender", param.gender);
                 if (param.photo !== "") {
@@ -91,7 +105,7 @@ class Glints {
             catch (error) {
                 console.info("Error sending param", param);
                 console.error("Error sending request with error:", error);
-                console.error("Error sending request with response:", error.response.data);
+                console.error("Error sending request with response:", (_b = (_a = error.response) === null || _a === void 0 ? void 0 : _a.data) !== null && _b !== void 0 ? _b : error.message);
             }
         });
     }
@@ -124,18 +138,28 @@ class Glints {
      */
     ExtractListVacancyPage(page) {
         return __awaiter(this, void 0, void 0, function* () {
-            const lv = page.locator(`[data-cy="job-card-listed"]`);
-            const listVacancyPage = [];
-            for (let i = 0; i < (yield lv.count()); i++) {
-                const element = lv.nth(i);
-                const title = yield this.ExtractTextContent(element, '[data-cy="job-title-text"]');
-                const link = element.getByText('Kelola Kandidat').locator('..').locator('..');
-                listVacancyPage.push({
-                    title: title.toString(),
-                    link: "https://employers.glints.id" + (yield link.getAttribute('href'))
-                });
-            }
-            return listVacancyPage;
+            const vacancies = yield page.evaluate(() => {
+                var _a, _b, _c, _d, _e;
+                const byJobId = new Map();
+                const links = Array.from(document.querySelectorAll('a[href*="/manage-candidates"]'));
+                for (const link of links) {
+                    const href = new URL((_a = link.getAttribute("href")) !== null && _a !== void 0 ? _a : "", "https://employers.glints.id");
+                    const jobId = (_b = href.searchParams.get("jid")) !== null && _b !== void 0 ? _b : href.href;
+                    const card = link.closest('[data-cy="job-card-listed"]');
+                    const title = (_e = (_d = (_c = card === null || card === void 0 ? void 0 : card.querySelector('[data-cy="job-title-text"]')) === null || _c === void 0 ? void 0 : _c.textContent) === null || _d === void 0 ? void 0 : _d.trim()) !== null && _e !== void 0 ? _e : "";
+                    const isBaseLink = !href.searchParams.has("status");
+                    if (!title) {
+                        continue;
+                    }
+                    const existing = byJobId.get(jobId);
+                    if (!existing || isBaseLink) {
+                        byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
+                    }
+                }
+                return Array.from(byJobId.values()).map(({ title, link }) => ({ title, link }));
+            });
+            console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
+            return vacancies;
         });
     }
     /**
@@ -149,12 +173,13 @@ class Glints {
         return __awaiter(this, void 0, void 0, function* () {
             let elementFound = false;
             let startTime = Date.now();
-            const timeout = 300000;
+            const timeout = 30000;
             while (!elementFound && Date.now() - startTime < timeout) {
                 console.info("Checking for lazy-loaded element: %s", locator);
                 const element = page.locator(locator);
                 elementFound = (yield element.count()) > 0;
-                yield page.waitForTimeout(1000);
+                if (!elementFound)
+                    yield page.waitForTimeout(1000);
             }
             if (elementFound) {
                 console.info("Lazy-loaded element: %s found!", locator);
@@ -162,6 +187,7 @@ class Glints {
             else {
                 console.info("Element: %s not found within timeout!", locator);
             }
+            return elementFound;
         });
     }
     /**
@@ -216,6 +242,7 @@ class Glints {
      */
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             try {
                 this.DB = yield this.createDatabaseConnection();
                 console.info("Creating required tables...");
@@ -225,10 +252,24 @@ class Glints {
                 console.error(error);
                 console.log("Failed to create database connection. Exiting...");
             }
-            const browser = yield playwright_1.default.chromium.launch({
+            const launchOptions = {
                 headless: this.HEADLESS,
-                slowMo: this.SLOWMO
-            });
+                slowMo: this.SLOWMO,
+                args: ["--disable-crash-reporter", "--disable-crashpad"],
+            };
+            let browser;
+            try {
+                browser = yield playwright_1.default.chromium.launch(launchOptions);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                const fallbackExecutablePath = this.getBrowserFallbackExecutablePath();
+                if (!fallbackExecutablePath) {
+                    throw error;
+                }
+                console.info(`[GLINTS] Playwright bundled Chromium failed (${message.split("\n")[0]}). Falling back to local browser: ${fallbackExecutablePath}`);
+                browser = yield playwright_1.default.chromium.launch(Object.assign(Object.assign({}, launchOptions), { executablePath: fallbackExecutablePath }));
+            }
             this.CACHE_DIR = path_1.default.join(__dirname, "../cache");
             // Ensure the cache directory exists
             if (!fs_1.default.existsSync(this.CACHE_DIR)) {
@@ -270,19 +311,25 @@ class Glints {
                     }
                     else {
                         // Fetch the response and cache it
-                        const response = yield page.request.fetch(request);
-                        const body = yield response.body();
-                        const cacheEntry = {
-                            status: response.status(),
-                            contentType: response.headers()['content-type'],
-                            body: body.toString('base64')
-                        };
-                        yield this.saveToCache(url, cacheEntry);
-                        yield route.fulfill({
-                            status: response.status(),
-                            contentType: response.headers()['content-type'],
-                            body: body
-                        });
+                        try {
+                            const response = yield page.request.fetch(request, { timeout: 30000 });
+                            const body = yield response.body();
+                            const cacheEntry = {
+                                status: response.status(),
+                                contentType: response.headers()['content-type'],
+                                body: body.toString('base64')
+                            };
+                            yield this.saveToCache(url, cacheEntry);
+                            yield route.fulfill({
+                                status: response.status(),
+                                contentType: response.headers()['content-type'],
+                                body: body
+                            });
+                        }
+                        catch (fetchErr) {
+                            console.warn(`[GLINTS] Cache fetch timeout for ${url}, falling back to direct request`);
+                            yield route.continue();
+                        }
                     }
                 }
                 else {
@@ -290,7 +337,10 @@ class Glints {
                 }
             }));
             const startTime = Date.now();
-            yield page.goto("https://employers.glints.id");
+            yield page.goto("https://employers.glints.id", {
+                waitUntil: "domcontentloaded",
+                timeout: this.TIMEOUT,
+            });
             const loadTime = Date.now() - startTime;
             console.info(`Page loaded in ${loadTime}ms`);
             yield page.evaluate((localStorageData) => {
@@ -301,7 +351,10 @@ class Glints {
                 localStorage.setItem('mobileAppPromptViewedDate', JSON.stringify(new Date().toISOString()));
             }, this.LOCALSTORAGE);
             yield page.waitForTimeout(5000);
-            yield page.goto("https://employers.glints.id/dashboard");
+            yield page.goto("https://employers.glints.id/dashboard", {
+                waitUntil: "domcontentloaded",
+                timeout: this.TIMEOUT,
+            });
             yield page.waitForTimeout(3000);
             // Suppress VIP expired modal via localStorage, then dismiss if already shown
             yield page.evaluate(() => {
@@ -321,15 +374,31 @@ class Glints {
                 yield page.locator('button:has-text("Semua Loker")').first().click();
                 yield page.waitForTimeout(1000);
             }
-            yield this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
+            let jobCardsFound = yield this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
+            if (!jobCardsFound) {
+                console.info('[GLINTS] No cards in current tab. Switching to "Nonaktif" jobs.');
+                yield page.evaluate(() => {
+                    const nonActiveButton = Array.from(document.querySelectorAll("button"))
+                        .find((button) => { var _a; return (_a = button.textContent) === null || _a === void 0 ? void 0 : _a.includes("Nonaktif"); });
+                    nonActiveButton === null || nonActiveButton === void 0 ? void 0 : nonActiveButton.click();
+                });
+                yield page.waitForTimeout(1500);
+                jobCardsFound = yield this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
+            }
+            if (!jobCardsFound) {
+                const pageText = (_a = (yield page.locator("body").textContent())) === null || _a === void 0 ? void 0 : _a.replace(/\s+/g, " ").trim().slice(0, 500);
+                console.warn(`[GLINTS] Dashboard text while looking for cards: ${pageText}`);
+                console.warn("[GLINTS] No active job cards found on dashboard. All jobs may be closed or account has no active listings.");
+                yield browser.close();
+                console.log("DONE");
+                process.exit(0);
+            }
             const listVacancyPage = yield this.ExtractListVacancyPage(page);
             for (const it of listVacancyPage) {
                 if (this.COLLECTED == this.LIMIT) {
                     break;
                 }
                 yield page.goto(it.link);
-                yield page.waitForTimeout(2000);
-                yield page.click('#IN_REVIEW');
                 yield page.waitForTimeout(2000);
                 // Skip job if no candidates in this stage
                 if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
@@ -618,7 +687,7 @@ class Glints {
                 "Sep": "Sep",
                 "Okt": "Oct",
                 "Nov": "Nov",
-                "Des": "Des"
+                "Des": "Dec"
             };
             let appliedDateSplit = appliedDateText.split(" ");
             appliedDateSplit[0] = monthMap[appliedDateSplit[0]];
@@ -1179,9 +1248,11 @@ class Glints {
     insertApplicant(data) {
         return __awaiter(this, void 0, void 0, function* () {
             console.info(`Inserting applicant ${data.email} into the database...`);
+            const safeEmail = data.email.replace(/'/g, "''");
+            const safeData = JSON.stringify(data).replace(/'/g, "''");
             const insertQuery = `
       INSERT INTO applicants (email, data)
-      VALUES ('${data.email}', '${JSON.stringify(data)}')
+      VALUES ('${safeEmail}', '${safeData}')
     `;
             return new Promise((resolve, reject) => {
                 this.DB.run(insertQuery, (err) => {
@@ -1205,8 +1276,9 @@ class Glints {
     getApplicantByEmail(email) {
         return __awaiter(this, void 0, void 0, function* () {
             console.info(`Getting applicant by email ${email}...`);
+            const safeEmail = email.replace(/'/g, "''");
             const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${email}'
+      SELECT * FROM applicants WHERE email = '${safeEmail}'
     `;
             return new Promise((resolve, reject) => {
                 this.DB.get(selectQuery, (err, row) => {
