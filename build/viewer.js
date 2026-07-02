@@ -16,6 +16,9 @@ const SERVER = path_1.default.join(__dirname, "server.ts");
 const SCRAPERS = ["glints", "jooble", "seek", "pintarnya", "kitalulus"];
 const scraperState = {};
 const scraperProcesses = {};
+let scheduleEnabled = false;
+let scheduleIntervalHandle = null;
+let nextRunAt = null;
 app.use("/storage", express_1.default.static(path_1.default.join(ROOT_DIR, "storage")));
 for (const name of SCRAPERS) {
     scraperState[name] = { status: "idle", log: [] };
@@ -41,6 +44,42 @@ function runScraper(name) {
         delete scraperProcesses[name];
     });
 }
+function scheduleAll() {
+    for (const name of SCRAPERS) {
+        if (scraperState[name].status !== "running") {
+            runScraper(name);
+        }
+    }
+    nextRunAt = Date.now() + 3600000;
+}
+function enableSchedule() {
+    if (scheduleIntervalHandle)
+        return;
+    scheduleAll();
+    scheduleIntervalHandle = setInterval(scheduleAll, 3600000);
+    scheduleEnabled = true;
+}
+function disableSchedule() {
+    if (scheduleIntervalHandle)
+        clearInterval(scheduleIntervalHandle);
+    scheduleIntervalHandle = null;
+    scheduleEnabled = false;
+    nextRunAt = null;
+}
+const DB_FILES = [
+    { name: "glints", file: "glints.db" },
+    { name: "jooble", file: "jooble.db" },
+    { name: "kitalulus", file: "kitalulus.db" },
+    { name: "pintarnya", file: "pintarnya.db" },
+    { name: "seek", file: "seek.db" },
+];
+function runDB(dbFile, sql) {
+    try {
+        const dbPath = path_1.default.join(DB_DIR, dbFile);
+        (0, child_process_1.execSync)(`sqlite3 "${dbPath}" "${sql}"`, { encoding: "utf-8" });
+    }
+    catch (_a) { }
+}
 function queryDB(dbFile, sql) {
     try {
         const dbPath = path_1.default.join(DB_DIR, dbFile);
@@ -51,24 +90,23 @@ function queryDB(dbFile, sql) {
         return [];
     }
 }
+// Add scraped_at column to all DBs if not already present
+// Must use DEFAULT NULL — SQLite ALTER TABLE does not allow non-constant defaults like CURRENT_TIMESTAMP
+for (const src of DB_FILES) {
+    runDB(src.file, "ALTER TABLE applicants ADD COLUMN scraped_at DATETIME DEFAULT NULL");
+}
 function getAllApplicants() {
-    const sources = [
-        { name: "glints", file: "glints.db" },
-        { name: "jooble", file: "jooble.db" },
-        { name: "kitalulus", file: "kitalulus.db" },
-        { name: "pintarnya", file: "pintarnya.db" },
-        { name: "seek", file: "seek.db" },
-    ];
+    var _a, _b;
     const results = [];
-    for (const src of sources) {
-        const rows = queryDB(src.file, "SELECT id, email, data FROM applicants");
+    for (const src of DB_FILES) {
+        const rows = queryDB(src.file, "SELECT id, email, data, scraped_at FROM applicants");
         for (const row of rows) {
             try {
                 const data = typeof row.data === "string" ? JSON.parse(row.data) : {};
-                results.push(Object.assign({ _source: src.name, _id: row.id }, data));
+                results.push(Object.assign({ _source: src.name, _id: row.id, _scraped_at: (_a = row.scraped_at) !== null && _a !== void 0 ? _a : null }, data));
             }
-            catch (_a) {
-                results.push({ _source: src.name, _id: row.id, email: row.email });
+            catch (_c) {
+                results.push({ _source: src.name, _id: row.id, _scraped_at: (_b = row.scraped_at) !== null && _b !== void 0 ? _b : null, email: row.email });
             }
         }
     }
@@ -108,6 +146,17 @@ app.get("/api/scrape/logs/:name", (req, res) => {
         return res.status(400).json({ error: "Unknown scraper" });
     const s = scraperState[name];
     res.json({ status: s.status, log: s.log });
+});
+app.get("/api/schedule", (_req, res) => {
+    res.json({ enabled: scheduleEnabled, nextRunAt });
+});
+app.post("/api/schedule/enable", (_req, res) => {
+    enableSchedule();
+    res.json({ ok: true });
+});
+app.post("/api/schedule/disable", (_req, res) => {
+    disableSchedule();
+    res.json({ ok: true });
 });
 app.get("/", (_req, res) => {
     res.send(HTML);
@@ -210,6 +259,7 @@ const HTML = `<!DOCTYPE html>
     .btn:disabled { opacity: 0.45; cursor: default; }
 
     .btn-run-all { border-color: #111; font-weight: 600; font-size: 13px; padding: 5px 14px; }
+    .btn-schedule.enabled { border-color: #15803d; color: #15803d; font-weight: 600; }
 
     /* ── Per-scraper log panel ── */
     .log-panel {
@@ -238,8 +288,11 @@ const HTML = `<!DOCTYPE html>
       display: flex;
       gap: 8px;
       align-items: center;
+      flex-wrap: wrap;
       margin-top: 10px;
     }
+
+    .schedule-countdown { color: #555; font-size: 12px; }
 
     /* ── Filter bar ── */
     .controls {
@@ -366,6 +419,8 @@ const HTML = `<!DOCTYPE html>
     <div class="scraper-rows" id="scraper-rows"></div>
     <div class="panel-footer">
       <button class="btn btn-run-all" id="btn-run-all" onclick="runScraper('all')">Run All</button>
+      <button class="btn btn-schedule" id="btn-schedule" onclick="toggleSchedule()">Auto (hourly): OFF</button>
+      <span class="schedule-countdown" id="schedule-countdown"></span>
       <button class="btn" onclick="toggleAllLogs()">Toggle All Logs</button>
       <button class="btn" onclick="reloadApplicants()">Refresh Table</button>
     </div>
@@ -396,6 +451,7 @@ const HTML = `<!DOCTYPE html>
   <script>
     let allApplicants = [];
     let statusInterval = null;
+    let schedule = { enabled: false, nextRunAt: null };
     let openLogs = new Set();
     const SCRAPERS = ['glints', 'jooble', 'seek', 'pintarnya', 'kitalulus'];
 
@@ -543,8 +599,45 @@ const HTML = `<!DOCTYPE html>
       statusInterval = setInterval(pollStatus, 1500);
     }
 
+    async function fetchSchedule() {
+      const res = await fetch('/api/schedule');
+      schedule = await res.json();
+      updateScheduleUI();
+    }
+
+    async function toggleSchedule() {
+      const path = schedule.enabled ? '/api/schedule/disable' : '/api/schedule/enable';
+      await fetch(path, { method: 'POST' });
+      await fetchSchedule();
+      startPolling();
+      pollStatus();
+    }
+
+    function updateScheduleUI() {
+      const btn = document.getElementById('btn-schedule');
+      const countdown = document.getElementById('schedule-countdown');
+      if (!btn || !countdown) return;
+
+      btn.textContent = 'Auto (hourly): ' + (schedule.enabled ? 'ON' : 'OFF');
+      btn.classList.toggle('enabled', schedule.enabled);
+
+      if (!schedule.enabled || !schedule.nextRunAt) {
+        countdown.textContent = '';
+        return;
+      }
+
+      const ms = Math.max(0, schedule.nextRunAt - Date.now());
+      const totalMinutes = Math.ceil(ms / 60000);
+      if (totalMinutes >= 60) {
+        countdown.textContent = 'Next run in ' + Math.floor(totalMinutes / 60) + 'h ' + (totalMinutes % 60) + 'm';
+      } else {
+        countdown.textContent = 'Next run in ' + totalMinutes + 'm';
+      }
+    }
+
     let firstPoll = true;
     async function pollStatus() {
+      await fetchSchedule();
       const res = await fetch('/api/scrape/status');
       const status = await res.json();
 
@@ -556,7 +649,7 @@ const HTML = `<!DOCTYPE html>
       }
 
       const anyRunning = SCRAPERS.some(n => status[n].status === 'running');
-      if (!anyRunning) {
+      if (!anyRunning && !schedule.enabled) {
         clearInterval(statusInterval);
         statusInterval = null;
       }
@@ -597,6 +690,7 @@ const HTML = `<!DOCTYPE html>
           <td>\${esc(a.email || '-')}</td>
           <td>\${esc(a.applied_for || '-')}</td>
           <td>\${esc(a.applied_date || '-')}</td>
+          <td>\${esc(a._scraped_at ? a._scraped_at.slice(0,10) : '-')}</td>
           <td>\${esc(phone)}</td>
           <td>\${esc(a.location || '-')}</td>
           <td><button class="detail-btn" onclick="showDetail(\${allApplicants.indexOf(a)})">View</button></td>
@@ -608,7 +702,7 @@ const HTML = `<!DOCTYPE html>
           <thead>
             <tr>
               <th>#</th><th>Source</th><th>Name</th><th>Email</th>
-              <th>Applied For</th><th>Date</th><th>Phone</th><th>Location</th><th></th>
+              <th>Applied For</th><th>Applied Date</th><th>Scraped</th><th>Phone</th><th>Location</th><th></th>
             </tr>
           </thead>
           <tbody>\${rows}</tbody>
@@ -631,6 +725,7 @@ const HTML = `<!DOCTYPE html>
         \${field('Source', a._source)}
         \${field('Applied For', a.applied_for)}
         \${field('Applied Date', a.applied_date)}
+        \${field('Scraped At', a._scraped_at ? a._scraped_at.replace('T', ' ').slice(0,19) : null)}
         \${field('Email', a.email)}
         \${field('Phone', phone)}
         \${field('Location', a.location)}
@@ -727,6 +822,8 @@ const HTML = `<!DOCTYPE html>
     buildScraperRows(null);
     reloadApplicants();
     pollStatus();
+    fetchSchedule();
+    setInterval(updateScheduleUI, 30000);
   </script>
 </body>
 </html>`;
