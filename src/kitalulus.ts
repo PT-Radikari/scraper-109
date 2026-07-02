@@ -176,22 +176,19 @@ export class KitaLulus {
     const launchOptions: Parameters<typeof playwright.chromium.launch>[0] = {
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
+      args: ["--disable-crash-reporter", "--disable-crashpad"],
     };
 
     try {
       return await playwright.chromium.launch(launchOptions);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("Executable doesn't exist")) {
-        throw error;
-      }
-
       const fallbackExecutablePath = this.getBrowserFallbackExecutablePath();
       if (!fallbackExecutablePath) {
         throw error;
       }
 
-      console.info(`[LOGIN] Playwright bundled Chromium missing. Falling back to local browser: ${fallbackExecutablePath}`);
+      console.info(`[LOGIN] Playwright bundled Chromium failed (${message.split("\n")[0]}). Falling back to local browser: ${fallbackExecutablePath}`);
       return await playwright.chromium.launch({
         ...launchOptions,
         executablePath: fallbackExecutablePath,
@@ -233,19 +230,13 @@ export class KitaLulus {
       bodyFormData.append("applied_date", param.applied_date);
       bodyFormData.append("email", param.email);
       bodyFormData.append("fullname", param.name);
-      bodyFormData.append("channel", param.portal);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("appplied_for", param.applied_for);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("fullname", param.name);
       bodyFormData.append("nickname", param.nick_name);
       bodyFormData.append("gender", param.gender);
       bodyFormData.append("date_of_birth", param.date_of_birth);
       bodyFormData.append("age", param.age);
       bodyFormData.append("contact", JSON.stringify(param.whatapps));
       bodyFormData.append("summary", param.summary);
-      bodyFormData.append("lates_salary", param.salary_expectation);
+      bodyFormData.append("latest_salary", "");
       bodyFormData.append("salary_expectation", param.salary_expectation);
       bodyFormData.append("work_experiences", JSON.stringify(param.workExperience));
       bodyFormData.append("educations", JSON.stringify(param.education));
@@ -667,6 +658,7 @@ export class KitaLulus {
       let pageNumber = 1;
       let hasNextPage = true;
       while (hasNextPage) {
+        let newOnPage = 0;
         if (this.LIMIT > 0 && this.COLLECTED >= this.LIMIT) {
           console.info(`[DONE] Limit ${this.LIMIT} reached. Stopping.`);
           break;
@@ -708,7 +700,11 @@ export class KitaLulus {
             }
 
             console.info(`[CANDIDATE] Name: "${applicant.name}", Phone: ${applicant.whatapps.contact_number}`);
+            const collectedBefore = this.COLLECTED;
             await this.sendRequest(applicant);
+            if (this.COLLECTED > collectedBefore) {
+              newOnPage++;
+            }
 
             // Keep CV files on disk so the viewer can link directly to the saved document.
             await this.RemoveTempFile(applicant.photo);
@@ -719,6 +715,11 @@ export class KitaLulus {
               await detailHandle.cleanup();
             }
           }
+        }
+
+        if (newOnPage === 0) {
+          console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
+          break;
         }
 
         hasNextPage = await this.nextApplicantListPage(page);
@@ -1053,8 +1054,11 @@ export class KitaLulus {
         return ""; // Invalid date
       }
 
-      // Format the date in YYYY-MM-DD using padStart for consistent formatting
-      return date.toISOString().slice(0, 10).replace(/-/g, '-');
+      // Format the date in YYYY-MM-DD without toISOString() to avoid UTC offset shifting
+      const y = date.getFullYear();
+      const m = (date.getMonth() + 1).toString().padStart(2, '0');
+      const d = date.getDate().toString().padStart(2, '0');
+      return `${y}-${m}-${d}`;
     } catch (error) {
       console.error("Error converting date string:", error);
       return "";
@@ -1091,8 +1095,9 @@ export class KitaLulus {
         return "0"; // Invalid date
       }
 
-      // Format the date in YYYY-MM-DD using padStart for consistent formatting
-      return date.toISOString().slice(0, 10).replace(/-/g, '-');
+      // Format the date in YYYY-MM-DD without toISOString() to avoid UTC offset shifting
+      const month = monthIndex.toString().padStart(2, '0');
+      return `${year}-${month}-01`;
     } catch (error) {
       console.error("Error converting date string:", error);
       return "0";
@@ -1256,6 +1261,10 @@ export class KitaLulus {
    */
   async extractGender(page: any): Promise<string> {
     const genderText = await this.getOptionalText(page.locator(this.APPLICANT_GENDER_SELECTOR).locator("p"));
+    return this.translateGender(genderText);
+  }
+
+  async translateGender(genderText: string): Promise<string> {
     const genderType: Record<string, string> = {
       'Perempuan': 'FEMALE',
       'Laki-Laki': 'MALE'

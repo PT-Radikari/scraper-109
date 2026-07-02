@@ -97,20 +97,18 @@ class Pintarnya {
         return __awaiter(this, void 0, void 0, function* () {
             const launchOptions = {
                 headless: this.HEADLESS,
+                args: ["--disable-crash-reporter", "--disable-crashpad"],
             };
             try {
                 return yield playwright_1.default.chromium.launch(launchOptions);
             }
             catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
-                if (!message.includes("Executable doesn't exist")) {
-                    throw error;
-                }
                 const fallbackExecutablePath = this.getBrowserFallbackExecutablePath();
                 if (!fallbackExecutablePath) {
                     throw error;
                 }
-                console.info(`[LOGIN] Playwright bundled Chromium missing. Falling back to local browser: ${fallbackExecutablePath}`);
+                console.info(`[LOGIN] Playwright bundled Chromium failed (${message.split("\n")[0]}). Falling back to local browser: ${fallbackExecutablePath}`);
                 return yield playwright_1.default.chromium.launch(Object.assign(Object.assign({}, launchOptions), { executablePath: fallbackExecutablePath }));
             }
         });
@@ -122,7 +120,7 @@ class Pintarnya {
     // https://image.moengage.com
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b, _c, _d, _e;
+            var _a, _b;
             console.info("Establishing database connection...");
             this.DB = yield this.createDatabaseConnection();
             console.info("Creating required tables...");
@@ -141,8 +139,8 @@ class Pintarnya {
                 }
             });
             console.info(`[LOGIN] Navigating to ${this.SIGN_IN_URL}...`);
-            yield page.goto(this.SIGN_IN_URL);
-            yield page.waitForLoadState("load");
+            yield page.goto(this.SIGN_IN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+            yield page.waitForLoadState("domcontentloaded");
             console.info("[LOGIN] Waiting for submit button to appear...");
             yield this.checkLazyLoadedElement(page, page.locator(this.SIGN_IN_SUBMIT_SELECTOR));
             console.info("[LOGIN] Filling credentials...");
@@ -242,389 +240,33 @@ class Pintarnya {
                 yield jobVacancyDetailButton.click();
                 console.info("[VACANCY] Waiting for candidate page markers...");
                 yield this.waitCandidatePageReady(page);
-                let nthCard = 0;
-                let isScrappingCard = true;
-                try {
-                    yield this.errorCatcher(page);
-                    isScrappingCard = yield this.ensureCandidateCardsReady(page);
-                    if (!isScrappingCard) {
-                        console.info("[VACANCY] Kandidat page loaded, but no candidate cards are visible.");
-                    }
-                }
-                catch (error) {
-                    isScrappingCard = false;
-                }
-                /**
-                 * Applied for id
-                 *
-                 * @example https://pintarnya.com/perusahaan/candidates?job=283020
-                 * @returns 283020
-                 */
                 const pageUrl = page.url();
                 const appliedForId = pageUrl.split("job=")[1];
                 console.log({ appliedForId });
-                /**
-                 * Sync the jobVacancy data with the database.
-                 * If the jobVacancy is not found in the database, insert it.
-                 * If the jobVacancy is found in the database, check if the data is the same.
-                 * If the data is the same, move to the next job.
-                 * If the data is different, update the jobVacancy data.
-                 */
                 const jobVacancyInDatabase = yield this.getVacancyByPintarnyaJobId(appliedForId);
                 const applicantsOfJobVacancyInDatabase = yield this.countApplicantByPintarnyaJobId(appliedForId);
                 console.log({ applicantsOfJobVacancyInDatabase });
+                let shouldScrape = true;
                 if (jobVacancyInDatabase === undefined && appliedForId !== undefined) {
                     console.info(`[DB] New vacancy, inserting into local DB: "${jobVacancy.position}" (id: ${appliedForId})`);
                     yield this.insertJobVacancy(jobVacancy.position, jobVacancy.location, appliedForId, applicantCount);
+                    shouldScrape = applicantCount > 0;
                 }
                 else {
                     console.info(`[DB] Vacancy already in DB. DB applicants: ${jobVacancyInDatabase.applicants}, page applicants: ${applicantCount}, scraped: ${applicantsOfJobVacancyInDatabase}`);
-                    if (jobVacancy.position === jobVacancyInDatabase.position &&
-                        jobVacancy.location === jobVacancyInDatabase.location &&
-                        appliedForId === jobVacancyInDatabase.pintarnya_job_id &&
+                    if (appliedForId === jobVacancyInDatabase.pintarnya_job_id &&
                         applicantCount === jobVacancyInDatabase.applicants &&
                         jobVacancyInDatabase.applicants === applicantsOfJobVacancyInDatabase) {
                         console.info("[SKIP] No new applicants since last run. Moving to next vacancy.");
-                        isScrappingCard = false;
+                        shouldScrape = false;
                     }
                     else {
                         console.info("[VACANCY] Applicant count changed, re-scraping...");
+                        shouldScrape = applicantCount > 0;
                     }
                 }
-                /**
-                 * Scraping candidate card.
-                 */
-                while (isScrappingCard) {
-                    console.log("COLLECTED_APPLICANT: ", this.COLLECTED_APPLICANT);
-                    /**
-                     * Check if the limit is reached.
-                     * If the limit is reached, exit the loop.
-                     * Otherwise, continue scraping the next card.
-                     * The limit is set to 0 by default.
-                     * If the limit is set to 0, it will scrape all the cards.
-                     *
-                     */
-                    if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
-                        isScrappingCard = false;
-                        console.info("Scrape limit reached. Exiting...");
-                        process.exit(0);
-                    }
-                    /**
-                     * Check if the delay is reached.
-                     * If the delay is reached, wait for the delay time.
-                     * Otherwise, continue scraping the next card.
-                     * The delay is set to 0 by default.
-                     * If the delay is set to 0, it will not wait.
-                     * The delay_after is set to 0 by default.
-                     * If the delay_after is set to 0, it will not wait.
-                     * The delay_after is used to delay the scraping process after a certain number of collected applicants.
-                     * The delay_after works also on every multiple of the delay_after.
-                     */
-                    if (this.DELAY > 0 &&
-                        this.COLLECTED_APPLICANT > 0 &&
-                        this.COLLECTED_APPLICANT % this.DELAY_AFTER === 0) {
-                        console.info("Delaying the scraping process...", new Date());
-                        yield page.waitForTimeout(this.DELAY);
-                        console.info("Resuming the scraping process...", new Date());
-                    }
-                    try {
-                        console.info("-------------------------------------------------------");
-                        console.info(`[CANDIDATE] Scraping card #${nthCard + 1}...`);
-                        const cardSelector = `div[id="candidate-card-${nthCard + 1}"]`;
-                        yield this.errorCatcher(page);
-                        const card = page.locator(cardSelector);
-                        if (!(yield card.isVisible())) {
-                            isScrappingCard = false;
-                            console.log("Element with id candidate-card-%d is not found", nthCard + 1);
-                            console.log("Move to the next job...");
-                            break;
-                        }
-                        /**
-                         * Click the {nthCard} candidate card.
-                         * This will show the candidate detail on the right side of the page.
-                         */
-                        console.log("Clicking candidate card...");
-                        yield this.errorCatcher(page);
-                        yield card.click();
-                        yield page.waitForLoadState();
-                        /**
-                         * Wait for the candidate detail to be attached to the DOM.
-                         */
-                        const candidateCardDetail = page.locator("div#candidate-detail");
-                        yield this.checkLazyLoadedElement(page, candidateCardDetail);
-                        console.log("Getting candidate details...");
-                        /**
-                         * Get the candidate name.
-                         */
-                        yield this.errorCatcher(page);
-                        const candidateName = yield card
-                            .locator("h3")
-                            .textContent();
-                        console.log("Candidate name:", candidateName);
-                        if (candidateName === null) {
-                            console.log("Candidate name is null. Skipping...");
-                            nthCard++;
-                            continue;
-                        }
-                        /**
-                         * Wait the detail section load the proper data.
-                         */
-                        yield candidateCardDetail.getByText(candidateName, { exact: true }).isVisible();
-                        yield page.waitForLoadState();
-                        yield page.waitForTimeout(10000);
-                        /**
-                         * Get the candidate age and location.
-                        */
-                        yield this.errorCatcher(page);
-                        const candidateAgeAndLocation = yield candidateCardDetail
-                            .locator("div.justify-start")
-                            .nth(0)
-                            .textContent();
-                        const candidateAge = (_c = candidateAgeAndLocation === null || candidateAgeAndLocation === void 0 ? void 0 : candidateAgeAndLocation.split("•")[0]) === null || _c === void 0 ? void 0 : _c.trim();
-                        console.log("Candidate age:", candidateAge);
-                        const candidateLocation = (_d = candidateAgeAndLocation === null || candidateAgeAndLocation === void 0 ? void 0 : candidateAgeAndLocation.split("•")[1]) === null || _d === void 0 ? void 0 : _d.trim();
-                        console.log("Candidate location:", candidateLocation);
-                        /**
-                         * Get the candidate applied job and date.
-                         */
-                        yield this.errorCatcher(page);
-                        const candidateAppliedJobAndDate = yield candidateCardDetail
-                            .locator("div.mt-4")
-                            .textContent();
-                        console.log("Candidate applied job and date:", candidateAppliedJobAndDate);
-                        const appliedFor = candidateAppliedJobAndDate === null || candidateAppliedJobAndDate === void 0 ? void 0 : candidateAppliedJobAndDate.split("pada")[0].replace("Melamar", "").trim();
-                        console.log("Applied job:", appliedFor);
-                        const appliedDate = candidateAppliedJobAndDate === null || candidateAppliedJobAndDate === void 0 ? void 0 : candidateAppliedJobAndDate.split("pada")[1].trim();
-                        console.log("Applied date:", appliedDate);
-                        /**
-                         * Get the candidate email.
-                         */
-                        yield this.errorCatcher(page);
-                        const candidateEmail = yield candidateCardDetail
-                            .locator("div.justify-start")
-                            .nth(1)
-                            .locator("button")
-                            .nth(0)
-                            .locator("p")
-                            .textContent();
-                        console.log("Candidate email:", candidateEmail);
-                        /**
-                         * Check is candidate data already exist in the database
-                         * If exist, skip the data
-                         * If not exist, insert the data
-                         */
-                        console.info(`[CANDIDATE] Name: ${candidateName}, Email: ${candidateEmail || "(none)"}`);
-                        const applicantInDatabase = yield this.getApplicantByEmail(candidateEmail || "");
-                        if (applicantInDatabase !== undefined &&
-                            applicantInDatabase.email === candidateEmail &&
-                            applicantInDatabase.applied_for_id === appliedForId) {
-                            console.info("[SKIP] Already in local DB, skipping.");
-                            this.SKIPPED_APPLICANT_BY_DATABASE++;
-                            nthCard++;
-                            continue;
-                        }
-                        console.info("[PHONE] Clicking phone reveal button...");
-                        yield this.errorCatcher(page);
-                        const candidatePhoneButton = candidateCardDetail
-                            .locator("div.justify-start")
-                            .nth(1)
-                            .locator("button")
-                            .nth(1);
-                        yield candidatePhoneButton.click();
-                        console.info("[PHONE] Waiting for 'Kontak Kandidat' modal...");
-                        const candidatePhoneModal = page
-                            .locator("div")
-                            .filter({ hasText: /^Kontak Kandidat$/ });
-                        yield this.checkLazyLoadedElement(page, candidatePhoneModal);
-                        yield candidatePhoneModal.waitFor({ state: "attached" });
-                        const candidatePhone = yield candidatePhoneModal
-                            .locator("..")
-                            .locator("p")
-                            .nth(2)
-                            .textContent();
-                        console.info(`[PHONE] Phone: ${candidatePhone || "(none)"}`);
-                        yield this.errorCatcher(page);
-                        yield candidatePhoneModal.locator("img").click();
-                        /**
-                         * Get the candidate latest salary.
-                         */
-                        const latestSalaryLabel = candidateCardDetail.getByText("Gaji terakhir");
-                        yield this.errorCatcher(page);
-                        latestSalaryLabel.scrollIntoViewIfNeeded();
-                        const latestSalary = yield latestSalaryLabel
-                            .locator("..")
-                            .locator("div")
-                            .nth(1)
-                            .textContent();
-                        console.log("Latest salary:", latestSalary);
-                        /**
-                         * Get the candidate experience.
-                         */
-                        const experienceLabel = candidateCardDetail.getByRole("heading", {
-                            name: "Pengalaman Kerja",
-                        });
-                        let experiences = [];
-                        if (yield experienceLabel.isVisible()) {
-                            yield this.errorCatcher(page);
-                            experienceLabel.scrollIntoViewIfNeeded();
-                            const experienceWrapper = experienceLabel.locator("..").locator("..");
-                            const anyUlInsideExperienceWrapper = experienceWrapper
-                                .locator("ul")
-                                .all();
-                            for (const experience of yield anyUlInsideExperienceWrapper) {
-                                const experienceDetail = experience.locator("ul");
-                                if ((yield experienceDetail.count()) > 0) {
-                                    const company = yield experience.locator("li").nth(0).textContent();
-                                    console.log("Company:", company);
-                                    const position = yield experienceDetail
-                                        .locator(".fw-600")
-                                        .first()
-                                        .textContent();
-                                    console.log("Position:", position);
-                                    const longEmployment = yield experienceDetail
-                                        .locator(".fw-500")
-                                        .nth(0)
-                                        .textContent();
-                                    console.log("Long employment:", longEmployment);
-                                    const description = yield experienceDetail
-                                        .locator(".fw-500")
-                                        .nth(1)
-                                        .locator("div")
-                                        .nth(0)
-                                        .textContent();
-                                    console.log("Description:", description);
-                                    const [periodFrom, periodTo] = this.extractEmploymentPeriod(longEmployment !== null && longEmployment !== void 0 ? longEmployment : "-");
-                                    experiences.push({
-                                        position: position !== null && position !== void 0 ? position : "-",
-                                        organization: company !== null && company !== void 0 ? company : "-",
-                                        job_desc: this.cleanString(description !== null && description !== void 0 ? description : "") || "-",
-                                        period_from: periodFrom !== null && periodFrom !== void 0 ? periodFrom : "0",
-                                        period_to: periodTo !== null && periodTo !== void 0 ? periodTo : "0",
-                                    });
-                                }
-                            }
-                        }
-                        /**
-                         * Get the candidate education.
-                         */
-                        const educationLabel = candidateCardDetail.getByRole("heading", {
-                            name: "Pendidikan",
-                        });
-                        yield this.errorCatcher(page);
-                        yield educationLabel.scrollIntoViewIfNeeded();
-                        const educationWrapper = educationLabel.locator("..");
-                        const education = yield educationWrapper.locator("p").allTextContents();
-                        console.log("Education:", education);
-                        /**
-                         * Get the candidate skills.
-                         */
-                        const skillsLabel = candidateCardDetail.getByRole("heading", {
-                            name: /Keahlian/,
-                        });
-                        let skills = [];
-                        if (yield skillsLabel.isVisible()) {
-                            yield this.errorCatcher(page);
-                            yield skillsLabel.scrollIntoViewIfNeeded();
-                            const skillsWrapper = skillsLabel.locator("..");
-                            const skillBadges = yield skillsWrapper
-                                .locator("div")
-                                .filter({
-                                hasNotText: "Keahlian terverifikasi oleh Pintarnya",
-                            })
-                                .allTextContents();
-                            console.log("Skills:", skillBadges.slice(3));
-                            // push all data from index 3 to the end of the array
-                            skills.push(...skillBadges.slice(3));
-                        }
-                        /**
-                         * Get the candidate photo
-                         */
-                        console.log("Checking photo...");
-                        yield this.errorCatcher(page);
-                        const photo = yield candidateCardDetail
-                            .getByAltText("photo profile")
-                            .getAttribute("src");
-                        const photoUrl = this.BASE_URL + photo;
-                        const photoFile = photo ? yield this.urlToFile(photoUrl, `${candidateName}.webp`) : null;
-                        console.log("Photo:", photo);
-                        console.info("[CV] Checking for CV...");
-                        yield this.errorCatcher(page);
-                        const downloadCVPromise = page.waitForEvent("download");
-                        const cvTabButton = candidateCardDetail.getByText("CV").first();
-                        yield cvTabButton.click();
-                        let downloadCVButton = candidateCardDetail.getByRole("button", {
-                            name: "Download CV",
-                        });
-                        if (!(yield downloadCVButton.isVisible())) {
-                            downloadCVButton = candidateCardDetail.getByRole("button", {
-                                name: "Download Profil",
-                            });
-                        }
-                        let cvUrl = "-";
-                        if (yield downloadCVButton.isVisible()) {
-                            yield this.errorCatcher(page);
-                            yield downloadCVButton.click();
-                            const downloadCV = yield downloadCVPromise;
-                            cvUrl = downloadCV.url().replace("blob:", "");
-                            console.log("Download CV:", downloadCV.url());
-                        }
-                        const cvFile = yield this.urlToFile(cvUrl, `${candidateName}.pdf`);
-                        /**
-                         * Get education level
-                         */
-                        const qualificationButton = candidateCardDetail.getByText("Hasil Kualifikasi").first();
-                        yield this.errorCatcher(page);
-                        yield qualificationButton.click();
-                        yield page.waitForLoadState();
-                        const educationQualificationLabel = candidateCardDetail.locator(".fw-600").filter({ hasText: "Pendidikan" }).first();
-                        const educationQualificationWrapper = educationQualificationLabel.locator("..");
-                        const educationLevel = (_e = yield educationQualificationWrapper.locator("p.fw-600").first().textContent()) !== null && _e !== void 0 ? _e : "-";
-                        console.log("Education Level:", educationLevel);
-                        /**
-                         * Get the candidate gender
-                         */
-                        const genderLabel = candidateCardDetail.locator(".fw-600").filter({ hasText: "Jenis Kelamin" }).first();
-                        const genderWrapper = genderLabel.locator("..");
-                        const gender = yield genderWrapper.locator("p.fw-600").first().textContent();
-                        console.log("Gender: ", gender);
-                        const applicant = {
-                            channel: this.CHANNEL,
-                            type: this.TYPE,
-                            applied_for: appliedFor !== null && appliedFor !== void 0 ? appliedFor : "",
-                            applied_for_id: appliedForId !== null && appliedForId !== void 0 ? appliedForId : "",
-                            applied_date: appliedDate ? this.parseStringDate(appliedDate) : "",
-                            email: candidateEmail !== null && candidateEmail !== void 0 ? candidateEmail : "",
-                            fullname: candidateName !== null && candidateName !== void 0 ? candidateName : "",
-                            nickname: "",
-                            photo: photoFile,
-                            date_of_birth: "",
-                            age: parseInt(candidateAge !== null && candidateAge !== void 0 ? candidateAge : "0"),
-                            contact: {
-                                type: "phone",
-                                contact_number: candidatePhone !== null && candidatePhone !== void 0 ? candidatePhone : "",
-                            },
-                            summary: "",
-                            latest_salary: this.cleanSalary(latestSalary !== null && latestSalary !== void 0 ? latestSalary : "0"),
-                            salary_expectation: 0,
-                            work_experiences: experiences,
-                            educations: [this.extractEducationData(education, educationLevel)],
-                            skills: this.cleanSkills(skills),
-                            location: candidateLocation !== null && candidateLocation !== void 0 ? candidateLocation : "",
-                            reference_links: [],
-                            cv: cvFile,
-                            gender: gender ? this.cleanGender(gender) : "",
-                        };
-                        console.log("Applicant:", applicant);
-                        /**
-                         * Send the applicant data to the API.
-                         */
-                        yield this.sendRequest(applicant);
-                    }
-                    catch (error) {
-                        console.log(error);
-                    }
-                    nthCard++;
-                    console.info("-------------------------------------------------------");
+                if (shouldScrape) {
+                    yield this.scrapeTableRows(page, appliedForId, jobVacancy.position);
                 }
                 if (jobVacancyList.lastIndexOf(jobVacancy) === jobVacancyList.length - 1) {
                     console.info("All jobVacancies have been processed. Exiting...");
@@ -884,6 +526,26 @@ class Pintarnya {
         const monthNumber = new Date(Date.parse(month + " 1, 2022")).getMonth() + 1;
         return `${year}-${monthNumber.toString().padStart(2, "0")}-01`;
     }
+    parseAnyDate(date) {
+        const parts = date.trim().split(/\s+/);
+        if (parts.length !== 3)
+            return '';
+        const [day, month, year] = parts;
+        // Try Indonesian months first, then JS Date for English months
+        const idxId = INDONESIAN_MONTHS.indexOf(month);
+        if (idxId >= 0) {
+            const monthNum = (idxId + 1).toString().padStart(2, '0');
+            return `${year}-${monthNum}-${day.padStart(2, '0')}`;
+        }
+        // Fallback: let JS parse it (handles "May", "January", etc.)
+        const parsed = new Date(Date.parse(`${day} ${month} ${year}`));
+        if (!isNaN(parsed.getTime())) {
+            const m = (parsed.getMonth() + 1).toString().padStart(2, '0');
+            const d = parsed.getDate().toString().padStart(2, '0');
+            return `${parsed.getFullYear()}-${m}-${d}`;
+        }
+        return '';
+    }
     /**
      * Cleans the skills array.
      * @param {string[]} skills The skills array.
@@ -1028,7 +690,8 @@ class Pintarnya {
                 ];
             }
             console.info("[DB] Inserting applicant into local DB...");
-            yield this.insertApplicant(param.email, param.applied_for_id, param);
+            const databaseKey = param.email || param.contact.contact_number;
+            yield this.insertApplicant(databaseKey, param.applied_for_id, param);
             this.COLLECTED_APPLICANT++;
             console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED_APPLICANT}`);
         });
@@ -1039,6 +702,219 @@ class Pintarnya {
      */
     cleanString(jobDesc) {
         return jobDesc.replace(/[^a-zA-Z0-9\s,.()]/g, " ");
+    }
+    scrapeTableRows(page, appliedForId, vacancyTitle) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Wait for any initial table to appear
+            try {
+                yield page.waitForSelector('table tbody tr', { timeout: this.TIMEOUT });
+            }
+            catch (_a) {
+                console.info("[CANDIDATE] No candidate table found on page.");
+                return;
+            }
+            // Click "Melamar" tab to see applicants.
+            // The tab button has innerText "Melamar\n\n23" so playwright accessible name is "Melamar 23".
+            // We wait for rows to clear (0) then wait for new rows to appear, avoiding the race where
+            // waitForSelector resolves on the old rows before the tab reload removes them.
+            try {
+                const melamarTab = page.getByRole('button', { name: /^Melamar\s/ }).first();
+                if (yield melamarTab.isVisible({ timeout: 3000 })) {
+                    console.info("[NAV] Clicking Melamar tab...");
+                    yield melamarTab.click();
+                    // Wait for table to clear first (tab transition empties rows briefly)
+                    yield page.waitForFunction(() => document.querySelectorAll('table tbody tr').length === 0, { timeout: 5000 }).catch(() => { });
+                    // Then wait for new rows to populate
+                    yield page.waitForFunction(() => document.querySelectorAll('table tbody tr').length > 0, { timeout: this.TIMEOUT });
+                    console.info("[NAV] Melamar tab rows loaded.");
+                }
+            }
+            catch (err) {
+                console.error("[NAV] Could not switch to Melamar tab:", err);
+            }
+            // Pintarnya uses virtual scrolling — only ~12 rows are in the DOM at a time.
+            // Rows have data-index=N. Get total count from the display text ("X dari Y Kandidat").
+            const totalCount = yield page.evaluate(() => {
+                const match = document.body.innerText.match(/(\d+) dari (\d+) Kandidat/);
+                return match ? parseInt(match[2]) : 0;
+            });
+            const domCount = yield page.locator('table tbody tr').count();
+            console.info(`[CANDIDATE] Total candidates: ${totalCount} (${domCount} in DOM right now).`);
+            if (totalCount === 0) {
+                console.info("[CANDIDATE] No candidates found.");
+                return;
+            }
+            // Scroll container back to top before iterating
+            yield page.evaluate(() => {
+                const container = document.querySelector('.h-screen.overflow-auto');
+                if (container)
+                    container.scrollTop = 0;
+            });
+            yield page.waitForTimeout(300);
+            const pageSize = Math.max(domCount, 1);
+            let newOnPage = 0;
+            for (let idx = 0; idx < totalCount; idx++) {
+                if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
+                    console.info("Scrape limit reached. Exiting...");
+                    process.exit(0);
+                }
+                if (this.DELAY > 0 && this.COLLECTED_APPLICANT > 0 && this.COLLECTED_APPLICANT % this.DELAY_AFTER === 0) {
+                    console.info("Delaying the scraping process...", new Date());
+                    yield page.waitForTimeout(this.DELAY);
+                    console.info("Resuming the scraping process...", new Date());
+                }
+                console.info(`-------------------------------------------------------`);
+                console.info(`[CANDIDATE] Scraping row ${idx + 1} of ${totalCount}...`);
+                // Scroll until the row with this data-index is rendered in the DOM
+                yield this.ensureRowVisible(page, idx);
+                const row = page.locator(`table tbody tr[data-index="${idx}"]`);
+                if ((yield row.count()) === 0) {
+                    console.info(`[CANDIDATE] Row data-index=${idx} not found after scrolling, skipping.`);
+                }
+                else {
+                    const inserted = yield this.scrapeTableRow(page, row, appliedForId, vacancyTitle);
+                    if (inserted) {
+                        newOnPage++;
+                    }
+                }
+                const endOfPage = (idx + 1) % pageSize === 0 || idx === totalCount - 1;
+                if (endOfPage) {
+                    if (newOnPage === 0) {
+                        console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
+                        break;
+                    }
+                    newOnPage = 0;
+                }
+            }
+        });
+    }
+    // Scrolls the virtual list container until the row with the given data-index appears in the DOM.
+    ensureRowVisible(page, dataIndex) {
+        return __awaiter(this, void 0, void 0, function* () {
+            for (let attempt = 0; attempt < 30; attempt++) {
+                const inDom = yield page.evaluate((idx) => {
+                    return !!document.querySelector(`table tbody tr[data-index="${idx}"]`);
+                }, dataIndex);
+                if (inDom)
+                    return;
+                yield page.evaluate(() => {
+                    var _a;
+                    const container = (_a = document.querySelector('.h-screen.overflow-auto')) !== null && _a !== void 0 ? _a : [...document.querySelectorAll('div')].find((el) => {
+                        const s = getComputedStyle(el);
+                        return (s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+                    });
+                    if (container)
+                        container.scrollTop += 400;
+                });
+                yield page.waitForTimeout(150);
+            }
+            console.info(`[SCROLL] data-index=${dataIndex} still not in DOM after 30 scroll attempts.`);
+        });
+    }
+    scrapeTableRow(page, row, appliedForId, vacancyTitle) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s;
+            try {
+                // Clicking "Hubungi Kandidat" triggers GET /api/pr/candidate/{id} which
+                // returns the full candidate profile (phone, email, CV, experience, etc.).
+                // We intercept that response instead of parsing the DOM or opening WA tabs.
+                const hubungiBtn = row.locator('button').filter({ hasText: 'Hubungi Kandidat' });
+                const [response] = yield Promise.all([
+                    page.waitForResponse((resp) => /\/api\/pr\/candidate\/\d+$/.test(resp.url()) && resp.status() === 200, { timeout: this.TIMEOUT }),
+                    hubungiBtn.click(),
+                ]);
+                const json = yield response.json();
+                const d = json === null || json === void 0 ? void 0 : json.data;
+                if (!d) {
+                    console.info('[CANDIDATE] Empty API response, skipping.');
+                    yield page.keyboard.press('Escape').catch(() => { });
+                    return false;
+                }
+                const name = (_a = d.fullname) !== null && _a !== void 0 ? _a : '';
+                const phone = ((_b = d.contact_phone) !== null && _b !== void 0 ? _b : '').replace(/^\+/, '');
+                const email = (_c = d.email) !== null && _c !== void 0 ? _c : '';
+                const dedupeKey = phone || email;
+                console.info(`[CANDIDATE] Name: ${name}, phone: ${phone}, email: ${email}`);
+                if (!dedupeKey) {
+                    console.info(`[SKIP] No contact info for ${name}.`);
+                    yield page.keyboard.press('Escape').catch(() => { });
+                    return false;
+                }
+                const existingApplicant = yield this.getApplicantByEmail(dedupeKey);
+                if ((existingApplicant === null || existingApplicant === void 0 ? void 0 : existingApplicant.email) === dedupeKey && (existingApplicant === null || existingApplicant === void 0 ? void 0 : existingApplicant.applied_for_id) === appliedForId) {
+                    console.info(`[SKIP] Already in local DB: ${name} (${dedupeKey}).`);
+                    this.SKIPPED_APPLICANT_BY_DATABASE++;
+                    yield page.keyboard.press('Escape').catch(() => { });
+                    return false;
+                }
+                const cvUrl = (_f = (_e = (_d = d.cv) === null || _d === void 0 ? void 0 : _d.download_url) !== null && _e !== void 0 ? _e : d.cv_url) !== null && _f !== void 0 ? _f : '';
+                console.info(`[CV] URL: ${cvUrl || '(none)'}`);
+                const cvFile = cvUrl ? yield this.urlToFile(cvUrl, `${name}.pdf`) : null;
+                const workExperiences = ((_g = d.work_experiences) !== null && _g !== void 0 ? _g : []).map((exp) => {
+                    var _a, _b, _c, _d, _e, _f, _g, _h;
+                    return ({
+                        position: (_b = (_a = exp.title) !== null && _a !== void 0 ? _a : exp.position) !== null && _b !== void 0 ? _b : '',
+                        organization: (_d = (_c = exp.company) !== null && _c !== void 0 ? _c : exp.organization) !== null && _d !== void 0 ? _d : '',
+                        job_desc: (_f = (_e = exp.description) !== null && _e !== void 0 ? _e : exp.job_desc) !== null && _f !== void 0 ? _f : '',
+                        period_from: (_g = exp.start_date) !== null && _g !== void 0 ? _g : '',
+                        period_to: (_h = exp.end_date) !== null && _h !== void 0 ? _h : '',
+                    });
+                });
+                const educations = ((_h = d.educations) !== null && _h !== void 0 ? _h : []).map((edu) => {
+                    var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+                    return ({
+                        education: (_c = (_a = edu.level) !== null && _a !== void 0 ? _a : (_b = d.education) === null || _b === void 0 ? void 0 : _b.name) !== null && _c !== void 0 ? _c : '',
+                        institution: (_e = (_d = edu.name) !== null && _d !== void 0 ? _d : d.institute_name) !== null && _e !== void 0 ? _e : '',
+                        period_start_year: (_g = (_f = edu.start_date) === null || _f === void 0 ? void 0 : _f.substring(0, 4)) !== null && _g !== void 0 ? _g : '',
+                        period_end_year: (_j = (_h = edu.end_date) === null || _h === void 0 ? void 0 : _h.substring(0, 4)) !== null && _j !== void 0 ? _j : '',
+                    });
+                });
+                if (educations.length === 0) {
+                    educations.push({
+                        education: (_k = (_j = d.education) === null || _j === void 0 ? void 0 : _j.name) !== null && _k !== void 0 ? _k : '',
+                        institution: (_l = d.institute_name) !== null && _l !== void 0 ? _l : '',
+                        period_start_year: '',
+                        period_end_year: '',
+                    });
+                }
+                const skills = ((_m = d.skills) !== null && _m !== void 0 ? _m : []).map((s) => { var _a; return (_a = s.name) !== null && _a !== void 0 ? _a : ''; }).filter(Boolean);
+                const applicant = {
+                    channel: this.CHANNEL,
+                    type: this.TYPE,
+                    applied_for: vacancyTitle,
+                    applied_for_id: appliedForId,
+                    applied_date: (_o = d.applied_at) !== null && _o !== void 0 ? _o : '',
+                    email: email,
+                    fullname: name,
+                    nickname: '',
+                    photo: null,
+                    date_of_birth: '',
+                    age: (_p = d.age) !== null && _p !== void 0 ? _p : 0,
+                    contact: { type: 'phone', contact_number: phone },
+                    summary: (_q = d.about) !== null && _q !== void 0 ? _q : '',
+                    latest_salary: (_r = d.salary) !== null && _r !== void 0 ? _r : 0,
+                    salary_expectation: 0,
+                    work_experiences: workExperiences,
+                    educations: educations,
+                    skills: skills,
+                    location: (_s = d.location) !== null && _s !== void 0 ? _s : '',
+                    reference_links: [],
+                    cv: cvFile,
+                    gender: '',
+                };
+                // Close any dialog that opened
+                yield page.keyboard.press('Escape').catch(() => { });
+                yield page.waitForTimeout(300);
+                console.info(`[CANDIDATE] Sending: ${name}`);
+                yield this.sendRequest(applicant);
+                return true;
+            }
+            catch (error) {
+                console.error('[CANDIDATE] Error scraping table row:', error);
+                yield page.keyboard.press('Escape').catch(() => { });
+                return false;
+            }
+        });
     }
     waitCandidatePageReady(page_1) {
         return __awaiter(this, arguments, void 0, function* (page, retryCount = 0) {
@@ -1075,25 +951,94 @@ class Pintarnya {
     }
     waitForCandidateCards(page) {
         return __awaiter(this, void 0, void 0, function* () {
+            const selectors = [
+                'div[id^="candidate-card-"]',
+                '[id*="candidate-card"]',
+                '[data-testid*="candidate"]',
+                '[class*="candidate-card"]',
+            ];
+            for (const selector of selectors) {
+                try {
+                    const el = page.locator(selector).first();
+                    if (yield el.isVisible({ timeout: 4000 })) {
+                        console.info(`[NAV] Candidate cards found via selector: ${selector}`);
+                        return true;
+                    }
+                }
+                catch ( /* try next */_a) { /* try next */ }
+            }
+            return false;
+        });
+    }
+    scrollCandidateList(page) {
+        return __awaiter(this, void 0, void 0, function* () {
             try {
-                yield page.waitForSelector('div[id^="candidate-card-"]', {
-                    state: "visible",
-                    timeout: this.TIMEOUT,
+                yield page.evaluate(() => {
+                    const scrollTargets = [
+                        document.querySelector('#filter-container'),
+                        document.querySelector('aside'),
+                        document.querySelector('[class*="overflow-y"]'),
+                        document.querySelector('[class*="overflow-scroll"]'),
+                    ];
+                    for (const el of scrollTargets) {
+                        if (el) {
+                            el.scrollTop += 600;
+                        }
+                    }
+                    window.scrollBy(0, 400);
                 });
-                return true;
+                yield page.waitForTimeout(1500);
             }
-            catch (_a) {
-                return false;
+            catch ( /* ignore */_a) { /* ignore */ }
+        });
+    }
+    findCandidateCard(page, nthCard) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Try 1-indexed ID (original pattern)
+            const byId1 = page.locator(`div[id="candidate-card-${nthCard + 1}"]`);
+            if (yield byId1.isVisible({ timeout: 1500 }).catch(() => false)) {
+                return byId1;
             }
+            // Try 0-indexed ID
+            const byId0 = page.locator(`div[id="candidate-card-${nthCard}"]`);
+            if (yield byId0.isVisible({ timeout: 1500 }).catch(() => false)) {
+                return byId0;
+            }
+            // Try nth element among any candidate-card-* divs
+            const allCards = page.locator('[id*="candidate-card"]');
+            const count = yield allCards.count();
+            if (count > nthCard) {
+                const el = allCards.nth(nthCard);
+                if (yield el.isVisible({ timeout: 1500 }).catch(() => false)) {
+                    return el;
+                }
+            }
+            return null;
         });
     }
     ensureCandidateCardsReady(page) {
         return __awaiter(this, void 0, void 0, function* () {
+            // Scroll to trigger lazy loading before checking
+            yield this.scrollCandidateList(page);
             if (yield this.waitForCandidateCards(page)) {
                 return true;
             }
+            // Try selecting "Melamar" status filter and scroll again
             yield this.selectMelamarCandidateStatus(page);
-            return yield this.waitForCandidateCards(page);
+            yield this.scrollCandidateList(page);
+            const found = yield this.waitForCandidateCards(page);
+            if (!found) {
+                // Debug: dump IDs present on the page to help identify the real selector
+                try {
+                    const ids = yield page.evaluate(() => Array.from(document.querySelectorAll('[id]'))
+                        .map((el) => el.id)
+                        .filter((id) => id.length > 0)
+                        .slice(0, 50));
+                    console.info("[DEBUG] IDs present on page:", ids);
+                }
+                catch ( /* ignore */_a) { /* ignore */ }
+            }
+            return found;
         });
     }
     selectMelamarCandidateStatus(page) {
@@ -1178,10 +1123,10 @@ class Pintarnya {
             try {
                 yield this.errorCatcher(page);
                 yield this.waitCandidatePageReady(page);
-                isScrappingCard = yield this.ensureCandidateCardsReady(page);
+                yield this.ensureCandidateCardsReady(page);
             }
             catch (error) {
-                isScrappingCard = false;
+                // ignore detection failure; let while loop's visibility check decide
             }
             const pageUrl = page.url();
             const appliedForId = pageUrl.split("job=")[1];
@@ -1190,13 +1135,18 @@ class Pintarnya {
                 const applicantsOfJobVacancyInDatabase = yield this.countApplicantByPintarnyaJobId(appliedForId);
                 if (jobVacancyInDatabase === undefined) {
                     yield this.insertJobVacancy("Pintarnya Kandidat Page", "", appliedForId, applicantCount);
+                    isScrappingCard = applicantCount > 0;
                 }
                 else if (applicantCount === jobVacancyInDatabase.applicants &&
                     jobVacancyInDatabase.applicants === applicantsOfJobVacancyInDatabase) {
                     console.info("[SKIP] No new applicants on the current Kandidat page.");
                     isScrappingCard = false;
                 }
+                else {
+                    isScrappingCard = applicantCount > 0;
+                }
             }
+            let newOnPage = 0;
             while (isScrappingCard) {
                 if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
                     console.info("Scrape limit reached. Exiting...");
@@ -1205,10 +1155,10 @@ class Pintarnya {
                 try {
                     console.info("-------------------------------------------------------");
                     console.info(`[CANDIDATE] Scraping card #${nthCard + 1} from current Kandidat page...`);
-                    const cardSelector = `div[id="candidate-card-${nthCard + 1}"]`;
                     yield this.errorCatcher(page);
-                    const card = page.locator(cardSelector);
-                    if (!(yield card.isVisible())) {
+                    const card = yield this.findCandidateCard(page, nthCard);
+                    if (card === null) {
+                        console.log("Candidate card #%d not found. Stopping.", nthCard + 1);
                         break;
                     }
                     yield card.click();
@@ -1339,13 +1289,20 @@ class Pintarnya {
                         cv: null,
                         gender: gender ? this.cleanGender(gender) : "",
                     };
+                    const collectedBefore = this.COLLECTED_APPLICANT;
                     yield this.sendRequest(applicant);
+                    if (this.COLLECTED_APPLICANT > collectedBefore) {
+                        newOnPage++;
+                    }
                 }
                 catch (error) {
                     console.log(error);
                 }
                 nthCard++;
                 console.info("-------------------------------------------------------");
+            }
+            if (newOnPage === 0) {
+                console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
             }
         });
     }
@@ -1576,13 +1533,17 @@ class Pintarnya {
                 applied_date: param.applied_date,
                 portal: 'pintarnya',
                 gender: param.gender,
+                age: param.age,
                 location: param.location,
+                summary: param.summary,
+                latest_salary: param.latest_salary,
                 salary_expectation: param.salary_expectation,
                 work_experience: param.work_experiences,
                 education: param.educations,
                 skill: param.skills,
                 contact: param.contact,
                 date_of_birth: param.date_of_birth,
+                reference_links: param.reference_links,
             };
             const data = JSON.stringify(normalized).replace(/'/g, "''");
             const insertQuery = `

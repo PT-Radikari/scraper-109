@@ -437,22 +437,19 @@ export class Pintarnya {
   async launchBrowser(): Promise<playwright.Browser> {
     const launchOptions: Parameters<typeof playwright.chromium.launch>[0] = {
       headless: this.HEADLESS,
+      args: ["--disable-crash-reporter", "--disable-crashpad"],
     };
 
     try {
       return await playwright.chromium.launch(launchOptions);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("Executable doesn't exist")) {
-        throw error;
-      }
-
       const fallbackExecutablePath = this.getBrowserFallbackExecutablePath();
       if (!fallbackExecutablePath) {
         throw error;
       }
 
-      console.info(`[LOGIN] Playwright bundled Chromium missing. Falling back to local browser: ${fallbackExecutablePath}`);
+      console.info(`[LOGIN] Playwright bundled Chromium failed (${message.split("\n")[0]}). Falling back to local browser: ${fallbackExecutablePath}`);
       return await playwright.chromium.launch({
         ...launchOptions,
         executablePath: fallbackExecutablePath,
@@ -934,7 +931,9 @@ export class Pintarnya {
     // Fallback: let JS parse it (handles "May", "January", etc.)
     const parsed = new Date(Date.parse(`${day} ${month} ${year}`));
     if (!isNaN(parsed.getTime())) {
-      return parsed.toISOString().split('T')[0];
+      const m = (parsed.getMonth() + 1).toString().padStart(2, '0');
+      const d = parsed.getDate().toString().padStart(2, '0');
+      return `${parsed.getFullYear()}-${m}-${d}`;
     }
     return '';
   }
@@ -1095,7 +1094,8 @@ export class Pintarnya {
     }
 
     console.info("[DB] Inserting applicant into local DB...");
-    await this.insertApplicant(param.email, param.applied_for_id, param);
+    const databaseKey = param.email || param.contact.contact_number;
+    await this.insertApplicant(databaseKey, param.applied_for_id, param);
     this.COLLECTED_APPLICANT++;
     console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED_APPLICANT}`);
   }
@@ -1163,6 +1163,8 @@ export class Pintarnya {
     });
     await page.waitForTimeout(300);
 
+    const pageSize = Math.max(domCount, 1);
+    let newOnPage = 0;
     for (let idx = 0; idx < totalCount; idx++) {
       if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
         console.info("Scrape limit reached. Exiting...");
@@ -1184,10 +1186,21 @@ export class Pintarnya {
       const row = page.locator(`table tbody tr[data-index="${idx}"]`);
       if (await row.count() === 0) {
         console.info(`[CANDIDATE] Row data-index=${idx} not found after scrolling, skipping.`);
-        continue;
+      } else {
+        const inserted = await this.scrapeTableRow(page, row, appliedForId, vacancyTitle);
+        if (inserted) {
+          newOnPage++;
+        }
       }
 
-      await this.scrapeTableRow(page, row, appliedForId, vacancyTitle);
+      const endOfPage = (idx + 1) % pageSize === 0 || idx === totalCount - 1;
+      if (endOfPage) {
+        if (newOnPage === 0) {
+          console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
+          break;
+        }
+        newOnPage = 0;
+      }
     }
   }
 
@@ -1217,7 +1230,7 @@ export class Pintarnya {
     row: playwright.Locator,
     appliedForId: string,
     vacancyTitle: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       // Clicking "Hubungi Kandidat" triggers GET /api/pr/candidate/{id} which
       // returns the full candidate profile (phone, email, CV, experience, etc.).
@@ -1237,7 +1250,7 @@ export class Pintarnya {
       if (!d) {
         console.info('[CANDIDATE] Empty API response, skipping.');
         await page.keyboard.press('Escape').catch(() => {});
-        return;
+        return false;
       }
 
       const name: string = d.fullname ?? '';
@@ -1250,7 +1263,7 @@ export class Pintarnya {
       if (!dedupeKey) {
         console.info(`[SKIP] No contact info for ${name}.`);
         await page.keyboard.press('Escape').catch(() => {});
-        return;
+        return false;
       }
 
       const existingApplicant = await this.getApplicantByEmail(dedupeKey);
@@ -1258,7 +1271,7 @@ export class Pintarnya {
         console.info(`[SKIP] Already in local DB: ${name} (${dedupeKey}).`);
         this.SKIPPED_APPLICANT_BY_DATABASE++;
         await page.keyboard.press('Escape').catch(() => {});
-        return;
+        return false;
       }
 
       const cvUrl: string = d.cv?.download_url ?? d.cv_url ?? '';
@@ -1296,7 +1309,7 @@ export class Pintarnya {
         applied_for: vacancyTitle,
         applied_for_id: appliedForId,
         applied_date: d.applied_at ?? '',
-        email: dedupeKey,
+        email: email,
         fullname: name,
         nickname: '',
         photo: null,
@@ -1321,10 +1334,12 @@ export class Pintarnya {
 
       console.info(`[CANDIDATE] Sending: ${name}`);
       await this.sendRequest(applicant);
+      return true;
 
     } catch (error) {
       console.error('[CANDIDATE] Error scraping table row:', error);
       await page.keyboard.press('Escape').catch(() => {});
+      return false;
     }
   }
 
@@ -1559,6 +1574,7 @@ export class Pintarnya {
       }
     }
 
+    let newOnPage = 0;
     while (isScrappingCard) {
       if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
         console.info("Scrape limit reached. Exiting...");
@@ -1733,13 +1749,21 @@ export class Pintarnya {
           gender: gender ? this.cleanGender(gender) : "",
         };
 
+        const collectedBefore = this.COLLECTED_APPLICANT;
         await this.sendRequest(applicant);
+        if (this.COLLECTED_APPLICANT > collectedBefore) {
+          newOnPage++;
+        }
       } catch (error) {
         console.log(error);
       }
 
       nthCard++;
       console.info("-------------------------------------------------------");
+    }
+
+    if (newOnPage === 0) {
+      console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
     }
   }
 
@@ -1965,16 +1989,20 @@ export class Pintarnya {
       email: param.email,
       applied_for: param.applied_for,
       applied_date: param.applied_date,
-      portal: 'pintarnya',
-      gender: param.gender,
-      location: param.location,
-      salary_expectation: param.salary_expectation,
-      work_experience: param.work_experiences,
-      education: param.educations,
-      skill: param.skills,
-      contact: param.contact,
-      date_of_birth: param.date_of_birth,
-    };
+        portal: 'pintarnya',
+        gender: param.gender,
+        age: param.age,
+        location: param.location,
+        summary: param.summary,
+        latest_salary: param.latest_salary,
+        salary_expectation: param.salary_expectation,
+        work_experience: param.work_experiences,
+        education: param.educations,
+        skill: param.skills,
+        contact: param.contact,
+        date_of_birth: param.date_of_birth,
+        reference_links: param.reference_links,
+      };
     const data = JSON.stringify(normalized).replace(/'/g, "''");
 
     const insertQuery = `
