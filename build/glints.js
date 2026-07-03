@@ -26,6 +26,7 @@ class Glints {
      * @param {GlintsConfigJson} config - The configuration object for Glints.
      */
     constructor(config) {
+        var _a;
         this.HEADLESS = true;
         this.LIMIT = 0;
         this.COOKIES = [];
@@ -36,6 +37,7 @@ class Glints {
         this.SLOWMO = 10000;
         this.DB_PATH = "";
         this.CACHE_DIR = '';
+        this.TARGETCOMPANY = '';
         this.HEADLESS = config.headless;
         this.LIMIT = config.limit;
         this.COOKIES = config.cookies;
@@ -45,6 +47,7 @@ class Glints {
         this.SLOWMO = config.slowmo;
         this.DB_PATH = path_1.default.join(__dirname, config.db_path);
         this.DB = new sqlite3_1.default.Database(this.DB_PATH);
+        this.TARGETCOMPANY = (_a = config.target_company) !== null && _a !== void 0 ? _a : '';
         console.info("CONFIG GLINTS LOADED");
     }
     getBrowserFallbackExecutablePath() {
@@ -59,6 +62,46 @@ class Glints {
             }
         }
         return null;
+    }
+    /**
+     * Selects the target company from the Glints company switcher dropdown on the dashboard.
+     * Required when the account manages multiple companies — the wrong company will return empty results.
+     */
+    selectTargetCompany(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.TARGETCOMPANY)
+                return;
+            const TARGET = this.TARGETCOMPANY;
+            // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
+            const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+            if ((yield ubahLocator.count()) === 0) {
+                console.info('[GLINTS] No company switcher found, skipping company selection.');
+                return;
+            }
+            // The current company name is displayed in a paragraph adjacent to the combobox.
+            // When the dropdown is closed there is no visible option list, so this paragraph is the only
+            // occurrence of the company name on the page.
+            const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET}$`) });
+            if ((yield alreadySelected.count()) > 0) {
+                console.info(`[GLINTS] Company already set to: ${TARGET}`);
+                return;
+            }
+            console.info(`[GLINTS] Switching company to: ${TARGET}`);
+            // Click the "Ubah" button to open the dropdown
+            yield ubahLocator.locator('..').click();
+            yield page.waitForTimeout(1000);
+            // Try ARIA option role first (react-select exposes these), fall back to div text match
+            const optionByRole = page.getByRole('option', { name: TARGET, exact: true });
+            if ((yield optionByRole.count()) > 0) {
+                yield optionByRole.click();
+            }
+            else {
+                yield page.locator('div').filter({ hasText: new RegExp(`^${TARGET}$`) }).last().click();
+            }
+            // Wait for the page to reload with the new company's data
+            yield page.waitForTimeout(3000);
+            console.info(`[GLINTS] Company switched to: ${TARGET}`);
+        });
     }
     /**
      * Sends a request with the provided applicant data.
@@ -356,6 +399,8 @@ class Glints {
                 timeout: this.TIMEOUT,
             });
             yield page.waitForTimeout(3000);
+            // Switch to the correct company before scraping — wrong company returns empty results
+            yield this.selectTargetCompany(page);
             // Suppress VIP expired modal via localStorage, then dismiss if already shown
             yield page.evaluate(() => {
                 var _a, _b, _c;
