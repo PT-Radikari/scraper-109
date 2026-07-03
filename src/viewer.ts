@@ -1,10 +1,30 @@
 import express from "express";
+import axios from "axios";
 import { execSync, spawn, ChildProcess } from "child_process";
 import path from "path";
 
 const app = express();
 const PORT = 4000;
 app.use(express.json());
+
+// AI Proxy to hide API Key
+app.post("/api/ai/*", async (req, res) => {
+  try {
+    const path = req.path.replace("/api/ai", "");
+    const response = await axios({
+      method: "POST",
+      url: `https://9router.aryahanif.xyz/v1${path}`,
+      data: req.body,
+      headers: {
+        "Authorization": `Bearer ${process.env.NINE_ROUTER_KEY || process.env.API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+    res.json(response.data);
+  } catch (e: any) {
+    res.status(e.response?.status || 500).json(e.response?.data || { error: e.message });
+  }
+});
 
 const DB_DIR = path.join(__dirname, "../db");
 const ROOT_DIR = path.join(__dirname, "../");
@@ -186,6 +206,7 @@ const HTML = `<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Scraper Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/page-agent@1.10.0/dist/iife/page-agent.demo.js?autoInit=false" crossorigin="true"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -629,6 +650,8 @@ const HTML = `<!DOCTYPE html>
       pollStatus();
     }
 
+    // PageAgent auto-inits from the script URL query params (baseURL/model/lang/showPanel).
+
     function updateScheduleUI() {
       const btn = document.getElementById('btn-schedule');
       const countdown = document.getElementById('schedule-countdown');
@@ -840,6 +863,19 @@ const HTML = `<!DOCTYPE html>
     pollStatus();
     fetchSchedule();
     setInterval(updateScheduleUI, 30000);
+
+    // PageAgent init — after CDN IIFE has run, so window.PageAgent is a real class.
+    try {
+      window.pageAgent = new window.PageAgent({
+        model: 'qwen3.5-plus',
+        baseURL: '/api/ai',
+        apiKey: 'proxy',
+        language: 'en-US',
+      });
+      window.pageAgent.panel && window.pageAgent.panel.show();
+    } catch (err) {
+      console.error('[page-agent] init failed:', err);
+    }
   </script>
 </body>
 </html>`;

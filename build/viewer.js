@@ -1,14 +1,44 @@
 "use strict";
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
+const axios_1 = __importDefault(require("axios"));
 const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
 const app = (0, express_1.default)();
 const PORT = 4000;
 app.use(express_1.default.json());
+// AI Proxy to hide API Key
+app.post("/api/ai/*", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const path = req.path.replace("/api/ai", "");
+        const response = yield (0, axios_1.default)({
+            method: "POST",
+            url: `https://9router.aryahanif.xyz/v1${path}`,
+            data: req.body,
+            headers: {
+                "Authorization": `Bearer ${process.env.NINE_ROUTER_KEY || process.env.API_KEY}`,
+                "Content-Type": "application/json",
+            },
+        });
+        res.json(response.data);
+    }
+    catch (e) {
+        res.status(((_a = e.response) === null || _a === void 0 ? void 0 : _a.status) || 500).json(((_b = e.response) === null || _b === void 0 ? void 0 : _b.data) || { error: e.message });
+    }
+}));
 const DB_DIR = path_1.default.join(__dirname, "../db");
 const ROOT_DIR = path_1.default.join(__dirname, "../");
 const TS_NODE = path_1.default.join(__dirname, "../node_modules/.bin/ts-node");
@@ -170,6 +200,7 @@ const HTML = `<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Scraper Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/page-agent@1.10.0/dist/iife/page-agent.demo.js?autoInit=false" crossorigin="true"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -613,6 +644,8 @@ const HTML = `<!DOCTYPE html>
       pollStatus();
     }
 
+    // PageAgent auto-inits from the script URL query params (baseURL/model/lang/showPanel).
+
     function updateScheduleUI() {
       const btn = document.getElementById('btn-schedule');
       const countdown = document.getElementById('schedule-countdown');
@@ -824,6 +857,19 @@ const HTML = `<!DOCTYPE html>
     pollStatus();
     fetchSchedule();
     setInterval(updateScheduleUI, 30000);
+
+    // PageAgent init — after CDN IIFE has run, so window.PageAgent is a real class.
+    try {
+      window.pageAgent = new window.PageAgent({
+        model: 'qwen3.5-plus',
+        baseURL: '/api/ai',
+        apiKey: 'proxy',
+        language: 'en-US',
+      });
+      window.pageAgent.panel && window.pageAgent.panel.show();
+    } catch (err) {
+      console.error('[page-agent] init failed:', err);
+    }
   </script>
 </body>
 </html>`;
