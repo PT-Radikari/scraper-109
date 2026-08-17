@@ -4,6 +4,7 @@ import axios from "axios";
 import FormData from "form-data";
 import path from "path";
 import sqlite3 from 'sqlite3';
+import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 
 /**
  * Represents a cookie.
@@ -1316,7 +1317,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
@@ -1325,6 +1326,15 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
           resolve(console.log("Inserted vacancy."));
         }
       });
+    });
+
+    // Dual-write: mirror the vacancy into the central Supabase database.
+    await ingestPortalVacancy({
+      source_portal: "glints",
+      source_vacancy_id: pintarnyaJobId,
+      position,
+      location,
+      applicants_count: applicants,
     });
   }
 
@@ -1344,7 +1354,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       VALUES ('${data.email}', '${JSON.stringify(data)}')
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
@@ -1354,6 +1364,10 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
         }
       });
     });
+
+    // Dual-write: the local SQLite row above stays the fallback, this mirrors
+    // the applicant into the central Supabase database.
+    await ingestPortalApplicant(data as unknown as PortalApplicant, "glints");
   }
 
   /**

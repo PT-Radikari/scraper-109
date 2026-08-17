@@ -4,6 +4,7 @@ import path from "path";
 import FormData from "form-data";
 import axios from "axios";
 import sqlite3 from 'sqlite3';
+import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 
 export interface KitaLulusConfigJson {
   headless: boolean;
@@ -1285,7 +1286,7 @@ export class KitaLulus {
       VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
@@ -1294,6 +1295,15 @@ export class KitaLulus {
           resolve(console.log("Inserted vacancy."));
         }
       });
+    });
+
+    // Dual-write: mirror the vacancy into the central Supabase database.
+    await ingestPortalVacancy({
+      source_portal: "kitalulus",
+      source_vacancy_id: pintarnyaJobId,
+      position,
+      location,
+      applicants_count: applicants,
     });
   }
 
@@ -1313,7 +1323,7 @@ export class KitaLulus {
       VALUES ('${data.email}', '${JSON.stringify(data)}')
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
@@ -1323,6 +1333,10 @@ export class KitaLulus {
         }
       });
     });
+
+    // Dual-write: the local SQLite row above stays the fallback, this mirrors
+    // the applicant into the central Supabase database.
+    await ingestPortalApplicant(data as unknown as PortalApplicant, "kitalulus");
   }
 
   /**

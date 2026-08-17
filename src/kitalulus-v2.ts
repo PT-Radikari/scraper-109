@@ -4,6 +4,7 @@ import path from "path";
 import FormData from "form-data";
 import axios from "axios";
 import sqlite3 from 'sqlite3';
+import { ingestPortalApplicant, PortalApplicant } from "./central/portalBridge";
 import { GQLKitalulusApplicant } from "./gql-kitalulus-applicant";
 
 export interface KitaLulusConfigJsonV2 {
@@ -1222,7 +1223,7 @@ export class KitaLulusV2 {
 						status='${status}'
 			`;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
@@ -1232,6 +1233,13 @@ export class KitaLulusV2 {
         }
       });
     });
+
+    // Dual-write: the local SQLite row above stays the fallback, this mirrors
+    // the applicant into the central Supabase database.
+    await ingestPortalApplicant(
+      { ...(data as unknown as PortalApplicant), type: status },
+      "kitalulus-v2"
+    );
   }
 
   /**

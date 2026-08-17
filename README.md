@@ -65,3 +65,34 @@ docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-r
 This command will create and run a Docker container named "playwright-runner-pintarnya" using the "playwright-runner:latest" image. It will also mount the "./db" directory from your local machine to the "/app/db" directory inside the container.
 
 This document provides a basic guide to setting up a Playwright project. The specific steps for building your project might vary depending on your project structure and configuration.
+Central Supabase Ingestion
+
+Scraped candidates, job vacancies and applications are mirrored into a central Supabase (Postgres) database, on top of the per-portal SQLite databases in `db/`.
+
+Dual-write: each scraper writes its local SQLite row first, then the entity is upserted into the central `scraper` schema. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
+
+IDRKOS cross-check: every candidate is checked against the IDRKOS candidate pool before it lands centrally. A candidate already in IDRKOS is linked through `idrkos_staf_id` and marked `idrkos_verified`; a new candidate (scraped or onboarded through QR) is marked `scraped_new` and prioritised at the top of the talent listings (`scraper.talent_listing`). The check runs against the `cross_check_idrkos_candidate` Postgres function, falling back to the IDRKOS `/talents` API.
+
+Setup:
+```
+cp .env.sample .env          # then fill in the Supabase and IDRKOS credentials
+psql "$CENTRAL_DATABASE_URL" -f migrations/0001_central_ingestion.sql
+```
+The migration also creates `scraper.idrkos_talents`, the view the cross-check reads. Point it at whichever table holds the IDRKOS candidate pool.
+
+Running the background sync:
+```
+npm run central:sync         # long-lived runner, one pass every CENTRAL_SYNC_INTERVAL_MS
+npm run central:sync-once    # a single pass, for a cron entry
+npm run central:stats        # outbox counters (pending / synced / failed)
+```
+
+Run it alongside the scrapers in docker:
+```
+docker run -d --name playwright-runner-central-sync -v ./db:/app/db --env-file .env --rm playwright-runner:latest npm run start:central-sync
+```
+
+Or from cron, replacing the daemon:
+```
+*/5 * * * * cd /app && npm run start:central-sync-once >> /var/log/central-sync.log 2>&1
+```
