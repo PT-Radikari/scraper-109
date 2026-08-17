@@ -2,6 +2,7 @@ import playwright from "playwright";
 import fs from "fs";
 import axios from "axios";
 import FormData from "form-data";
+import { trackBrowser } from "./browserRegistry";
 
 /**
  * Represents a cookie.
@@ -186,10 +187,10 @@ export class Seek {
    * @returns A Promise that resolves when the scraping is complete.
    */
   async Scrape(): Promise<void> {
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: 5000,
-    });
+    }));
     const page = await browser.newPage();
 
     await page.goto("https://id.employer.seek.com", {timeout:600000});

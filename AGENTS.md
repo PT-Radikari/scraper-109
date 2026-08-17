@@ -10,6 +10,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Because of the above, code that needs SQLite should load it lazily and sit behind an interface. `src/central/store.ts` is that interface; `LocalStore` is the SQLite implementation and `InMemoryStore` the portable one, and `tests/central/localStore.test.ts` runs the same contract against both (skipping the SQLite half when the binding will not load).
 - The scrapers build their SQL by string interpolation. Anything new should use bound parameters, as `src/central/localStore.ts` does.
 
+## Portal scraper retries
+
+- `src/server.ts` runs every portal command through `runWithRetry` (`src/retry.ts`), so a failed Playwright scrape is retried with exponential backoff and the process exits non-zero only once the attempt budget is spent. Each attempt constructs a **fresh** scraper instance; scraper objects carry per-run state (DB handle, `COLLECTED`) and must not be reused across attempts.
+- The scrapers only call `browser.close()` on the happy path. Any new `playwright.*.launch(...)` must therefore be wrapped in `trackBrowser(...)` (`src/browserRegistry.ts`), which is how a failed attempt closes the leftover browser before the next one starts.
+
 ## Central Supabase ingestion
 
 - `src/central/` mirrors scraped candidates, vacancies and applications into a central Supabase database on top of the per-portal SQLite files in `db/`. It talks PostgREST over axios rather than adding a Postgres driver. See the "Central Supabase Ingestion" section of `README.md` for setup and the runner commands, `.env.sample` for configuration, and `migrations/0001_central_ingestion.sql` for the schema and the `cross_check_idrkos_candidate` function.

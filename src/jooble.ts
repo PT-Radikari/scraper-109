@@ -5,6 +5,7 @@ import path from "path";
 import FormData from "form-data";
 import sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
+import { trackBrowser } from "./browserRegistry";
 
 /**
  * Represents a cookie.
@@ -228,10 +229,10 @@ export class Jooble {
       console.log("Failed to create database connection. Exiting...");
     }
 
-    const browser = await playwright.firefox.launch({
+    const browser = trackBrowser(await playwright.firefox.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 

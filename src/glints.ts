@@ -5,6 +5,7 @@ import FormData from "form-data";
 import path from "path";
 import sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
+import { trackBrowser } from "./browserRegistry";
 
 /**
  * Represents a cookie.
@@ -316,10 +317,10 @@ export class Glints {
       console.log("Failed to create database connection. Exiting...");
     }
 
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO
-    });
+    }));
 
     this.CACHE_DIR = path.join(__dirname, "../cache");
     // Ensure the cache directory exists
