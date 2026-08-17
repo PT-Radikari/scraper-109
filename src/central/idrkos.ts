@@ -140,6 +140,12 @@ export class IdrkosService {
       const row = Array.isArray(payload) ? payload[0] : payload;
       if (!row) return newCandidateResult("rpc");
 
+      // A deployed database may still run an older function version whose
+      // final fallback links on name alone; that link is untrustworthy, so
+      // it is rejected here just like the local re-verification on the API
+      // path in pickTalent.
+      if (row.match_field === "name") return newCandidateResult("rpc");
+
       return this.toResult(
         Boolean(row.matched && row.idrkos_staf_id),
         row.idrkos_staf_id ? String(row.idrkos_staf_id) : null,

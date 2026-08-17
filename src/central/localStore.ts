@@ -173,6 +173,8 @@ export class LocalStore implements CentralStore {
         payload = excluded.payload,
         source_portal = excluded.source_portal,
         sync_state = 'pending',
+        attempts = 0,
+        last_error = NULL,
         updated_at = excluded.updated_at
       `,
       [entityType, naturalKey, sourcePortal, JSON.stringify(payload), now, now]

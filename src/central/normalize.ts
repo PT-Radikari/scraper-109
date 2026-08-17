@@ -35,10 +35,10 @@ export function normalizePhone(phone?: string | null): string | null {
   let digits = phone.replace(/[^\d]/g, "");
   if (!digits) return null;
 
-  if (digits.startsWith("0")) {
-    digits = ID_COUNTRY_CODE + digits.replace(/^0+/, "");
-  } else if (digits.startsWith("00" + ID_COUNTRY_CODE)) {
+  if (digits.startsWith("00" + ID_COUNTRY_CODE)) {
     digits = digits.slice(2);
+  } else if (digits.startsWith("0")) {
+    digits = ID_COUNTRY_CODE + digits.replace(/^0+/, "");
   }
 
   // Too short to be a real number; treat as unusable rather than key on noise.

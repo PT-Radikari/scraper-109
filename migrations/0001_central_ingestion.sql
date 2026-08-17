@@ -146,13 +146,16 @@ create or replace view scraper.idrkos_talents as
 --
 -- Takes scraped candidate identity fields and reports whether the candidate is
 -- already in the IDRKOS pool. Identity fields are tried most-trustworthy first
--- (NIK, then email, then phone, then exact normalised name).
+-- (NIK, then email, then phone). Name alone is NOT a valid linking identifier:
+-- a common Indonesian name can collide across unrelated staff members, so
+-- p_full_name is accepted for call-site compatibility but can never produce a
+-- match on its own.
 --
 -- Returns exactly one row:
 --   matched          - true when the candidate exists in IDRKOS
 --   idrkos_staf_id   - the IDRKOS staf id to link, null for new candidates
 --   status           - 'idrkos_verified' or 'scraped_new'
---   match_field      - which field matched: nik | email | phone | name
+--   match_field      - which field matched: nik | email | phone
 --   listing_priority - 0 for scraped_new (top of the listing), 100 otherwise
 -- ---------------------------------------------------------------------------
 create or replace function scraper.cross_check_idrkos_candidate(
@@ -175,7 +178,6 @@ declare
   v_email     text := lower(nullif(trim(p_email), ''));
   v_phone     text := nullif(regexp_replace(coalesce(p_phone, ''), '[^0-9]', '', 'g'), '');
   v_nik       text := nullif(regexp_replace(coalesce(p_nik, ''), '[^0-9]', '', 'g'), '');
-  v_name      text := lower(nullif(regexp_replace(trim(coalesce(p_full_name, '')), '\s+', ' ', 'g'), ''));
   v_staf_id   text;
   v_field     text;
 begin
@@ -203,14 +205,6 @@ begin
     where right(t.phone_digits, 9) = right(v_phone, 9)
     limit 1;
     if v_staf_id is not null then v_field := 'phone'; end if;
-  end if;
-
-  if v_staf_id is null and v_name is not null then
-    select t.idrkos_staf_id into v_staf_id
-    from scraper.idrkos_talents t
-    where t.full_name = v_name
-    limit 1;
-    if v_staf_id is not null then v_field := 'name'; end if;
   end if;
 
   if v_staf_id is null then

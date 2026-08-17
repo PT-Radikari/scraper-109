@@ -164,6 +164,29 @@ describe("central/IdrkosService", () => {
     expect(api.requests).toHaveLength(0);
   });
 
+  it("rejects an RPC match_field of \"name\" and treats the candidate as new", async () => {
+    // An older deployed function version may still link on name alone; the
+    // client must not trust that, even though matched/idrkos_staf_id look
+    // legitimate on the wire.
+    const rpc = new FakeTransport().pushData([
+      {
+        matched: true,
+        idrkos_staf_id: "staf-99",
+        status: "idrkos_verified",
+        match_field: "name",
+        listing_priority: 100,
+      },
+    ]);
+    const { service } = buildService({ rpc });
+
+    const result = await service.crossCheckCandidate({ full_name: "Budi Santoso" });
+
+    expect(result.matched).toBe(false);
+    expect(result.status).toBe("scraped_new");
+    expect(result.idrkos_staf_id).toBeNull();
+    expect(result.source).toBe("rpc");
+  });
+
   it("tries the NIK before the email in api mode", async () => {
     const api = new FakeTransport().pushData([{ staf_id: 3, nik: "3201-0101-9001-0001" }]);
     const { service, apiTransport } = buildService({ api, config: { idrkosMode: "api" } });

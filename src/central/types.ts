@@ -114,8 +114,8 @@ export type CandidateCrossCheckResult = {
   /** IDRKOS staf id when matched, `null` for new candidates. */
   idrkos_staf_id: string | null;
   status: Exclude<CandidateVerificationStatus, "pending">;
-  /** Which identity field produced the match: `email`, `phone`, `nik`, `name`. */
-  match_field: "email" | "phone" | "nik" | "name" | null;
+  /** Which identity field produced the match: `email`, `phone`, `nik`. */
+  match_field: "email" | "phone" | "nik" | null;
   /** Listing priority to store on the candidate row. Lower sorts first. */
   listing_priority: number;
   /** Which backend answered: the Supabase RPC, the IDRKOS API, or neither. */

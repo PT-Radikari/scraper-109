@@ -104,6 +104,26 @@ function describeStoreContract(name: string, build: () => CentralStore, skip = f
       expect(row?.last_error).toBe("boom again");
     });
 
+    it("gives a revived row a fresh retry budget instead of re-parking it immediately", async () => {
+      await store.upsertOutbox("candidate", "k", "glints", { v: 1 });
+      await store.markFailure("candidate", "k", "boom", 2);
+      await store.markFailure("candidate", "k", "boom again", 2);
+      expect((await store.getOutbox("candidate", "k"))?.sync_state).toBe("failed");
+
+      // The candidate is scraped again: the row is re-upserted.
+      await store.upsertOutbox("candidate", "k", "glints", { v: 2 });
+      const revived = await store.getOutbox("candidate", "k");
+      expect(revived?.sync_state).toBe("pending");
+      expect(revived?.attempts).toBe(0);
+      expect(revived?.last_error).toBeNull();
+
+      // A single subsequent failure must not re-park it: the budget is fresh.
+      await store.markFailure("candidate", "k", "boom once more", 2);
+      const afterOneFailure = await store.getOutbox("candidate", "k");
+      expect(afterOneFailure?.sync_state).toBe("pending");
+      expect(afterOneFailure?.attempts).toBe(1);
+    });
+
     it("lists pending rows of one entity type, oldest first, honouring the limit", async () => {
       await store.upsertOutbox("candidate", "a", "glints", {});
       await store.upsertOutbox("candidate", "b", "glints", {});
