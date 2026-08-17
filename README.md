@@ -82,16 +82,19 @@ Central Supabase Ingestion
 
 Scraped candidates, job vacancies and applications are mirrored into a central Supabase (Postgres) database, on top of the per-portal SQLite databases in `db/`.
 
-Dual-write: each scraper writes its local SQLite row first, then the entity is upserted into the central `scraper` schema. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
+Dual-write: each scraper writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
 
 IDRKOS cross-check: every candidate is checked against the IDRKOS candidate pool before it lands centrally. A candidate already in IDRKOS is linked through `idrkos_staf_id` and marked `idrkos_verified`; a new candidate (scraped or onboarded through QR) is marked `scraped_new` and prioritised at the top of the talent listings (`scraper.talent_listing`). The check runs against the `cross_check_idrkos_candidate` Postgres function, falling back to the IDRKOS `/talents` API.
 
-Setup:
+Candidate stream: freshly scraped candidates are streamed into the central talent table (`public.talent_scraping`) continuously, rather than pushed one blocking request at a time. A candidate is written to the local outbox, handed to the stream and the scrape moves on; the stream sends a batch as soon as it holds `CENTRAL_TALENT_STREAM_MAX_BATCH` candidates or `CENTRAL_TALENT_STREAM_FLUSH_MS` has elapsed, and records the central outcome on the outbox row afterwards. A rejected batch therefore leaves the row `pending` for the sync runner exactly like a failed direct push. Set `CENTRAL_TALENT_STREAM_ENABLED=false` to upsert one candidate per request instead, and `CENTRAL_TALENT_SCHEMA` / `CENTRAL_TALENT_TABLE` to write somewhere other than `public.talent_scraping`.
+
+Setup (`.env.sample` points at the self-hosted Supabase at `http://rekrutmen-supabase-a4b9d1-122-49-230-39.sslip.io`; change `CENTRAL_SUPABASE_URL` for any other deployment):
 ```
 cp .env.sample .env          # then fill in the Supabase and IDRKOS credentials
 psql "$CENTRAL_DATABASE_URL" -f migrations/0001_central_ingestion.sql
+psql "$CENTRAL_DATABASE_URL" -f migrations/0002_talent_scraping.sql
 ```
-The migration also creates `scraper.idrkos_talents`, the view the cross-check reads. Point it at whichever table holds the IDRKOS candidate pool.
+Migration 0001 also creates `scraper.idrkos_talents`, the view the cross-check reads. Point it at whichever table holds the IDRKOS candidate pool. Migration 0002 creates the `talent_scraping` table the candidate stream writes to.
 
 Running the background sync:
 ```

@@ -65,6 +65,12 @@ export function testConfig(overrides: Partial<CentralConfig> = {}): CentralConfi
     supabaseUrl: "https://central.test",
     supabaseKey: "test-service-key",
     scraperSchema: "scraper",
+    talentSchema: "public",
+    talentTable: "talent_scraping",
+    talentStreamEnabled: true,
+    // No flush window in tests: a batch leaves as soon as it is handed over.
+    talentStreamFlushMs: 0,
+    talentStreamMaxBatch: 25,
     authSchema: "radixa_auth",
     centralEnabled: true,
     localDbPath: ":memory:",

@@ -2,6 +2,7 @@ import { CentralIngestionService } from "../../src/central/ingestion";
 import { InMemoryStore } from "../../src/central/memoryStore";
 import {
   closeIngestionService,
+  flushIngestionStream,
   ingestPortalApplicant,
   ingestPortalVacancy,
   setIngestionService,
@@ -131,17 +132,22 @@ describe("central/portalBridge", () => {
       const result = await ingestPortalApplicant(GLINTS_APPLICANT, "glints");
 
       expect(result.candidate?.natural_key).toBe("glints:email:john@example.com");
-      expect(result.candidate?.pushed_to_central).toBe(true);
+      // The candidate is streamed; the application is pushed straight away.
+      expect(result.candidate?.queued_for_central).toBe(true);
       expect(result.application?.pushed_to_central).toBe(true);
-      expect(transport.requests.map((request) => request.url)).toEqual([
-        "https://central.test/rest/v1/candidates",
+
+      await flushIngestionStream();
+
+      expect(transport.requests.map((request) => request.url).sort()).toEqual([
         "https://central.test/rest/v1/applications",
+        "https://central.test/rest/v1/talent_scraping",
       ]);
     });
 
     it("never lets an ingestion failure escape into the scraper", async () => {
       const service = {
         ingestCandidate: jest.fn().mockRejectedValue(new Error("boom")),
+        flushStream: jest.fn(),
         close: jest.fn(),
       };
       setIngestionService(service as unknown as CentralIngestionService);

@@ -12,6 +12,7 @@ export * from "./store";
 export * from "./localStore";
 export * from "./memoryStore";
 export * from "./idrkos";
+export * from "./talentStream";
 export * from "./ingestion";
 export * from "./syncRunner";
 export * from "./portalBridge";

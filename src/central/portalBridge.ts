@@ -47,7 +47,24 @@ export function setIngestionService(replacement: CentralIngestionService | null)
 }
 
 /**
- * Closes and clears the shared service.
+ * Sends whatever the candidate stream still holds, leaving the service open.
+ *
+ * Candidates are streamed rather than pushed one by one, so a scraper that
+ * wants its latest batch visible in `talent_scraping` right now calls this.
+ * Never throws, for the same reason the ingest helpers do not.
+ */
+export async function flushIngestionStream(): Promise<void> {
+  if (!service && !initPromise) return;
+  try {
+    const ingestion = await getIngestionService();
+    await ingestion.flushStream();
+  } catch (error) {
+    console.warn("Central candidate stream flush skipped:", (error as Error).message);
+  }
+}
+
+/**
+ * Drains the candidate stream, then closes and clears the shared service.
  */
 export async function closeIngestionService(): Promise<void> {
   if (service) await service.close();

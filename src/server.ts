@@ -6,6 +6,7 @@ import { Glints, GlintsConfigJson } from "./glints";
 import { Pintarnya, PintarnyaConfigJson } from "./pintarnya";
 import { CentralIngestionService } from "./central/ingestion";
 import { CentralSyncRunner, startCentralSyncDaemon } from "./central/syncRunner";
+import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import fs from "fs";
@@ -78,6 +79,11 @@ async function runPortal(command: string): Promise<void> {
   } catch (error) {
     console.error(`${command} scraper failed on every attempt`, error);
     process.exitCode = 1;
+  } finally {
+    // The last candidates of a run may still be sitting in the stream's flush
+    // window; draining here gets them into `talent_scraping` now instead of
+    // leaving them for the next sync pass.
+    await closeIngestionService();
   }
 }
 
