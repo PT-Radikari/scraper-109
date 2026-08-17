@@ -30,6 +30,19 @@ export type CentralConfig = {
   supabaseKey: string;
   /** Schema that holds the scraped mirror tables. */
   scraperSchema: string;
+  /** Schema holding the talent table candidates are streamed into. */
+  talentSchema: string;
+  /** Table freshly scraped candidates are streamed into. */
+  talentTable: string;
+  /**
+   * False to upsert every candidate on its own HTTP round-trip instead of
+   * coalescing them into batches.
+   */
+  talentStreamEnabled: boolean;
+  /** How long a partially filled candidate batch waits before it is flushed. */
+  talentStreamFlushMs: number;
+  /** Candidate count that flushes a batch immediately. */
+  talentStreamMaxBatch: number;
   /** Schema that holds the IDRKOS/auth tables. */
   authSchema: string;
   /** False when Supabase credentials are missing or ingestion is switched off. */
@@ -102,6 +115,11 @@ export function loadCentralConfig(env: NodeJS.ProcessEnv = process.env): Central
     supabaseUrl,
     supabaseKey,
     scraperSchema: env.CENTRAL_SCRAPER_SCHEMA || "scraper",
+    talentSchema: env.CENTRAL_TALENT_SCHEMA || "public",
+    talentTable: env.CENTRAL_TALENT_TABLE || "talent_scraping",
+    talentStreamEnabled: readBool(env, "CENTRAL_TALENT_STREAM_ENABLED", true),
+    talentStreamFlushMs: readInt(env, "CENTRAL_TALENT_STREAM_FLUSH_MS", 2000),
+    talentStreamMaxBatch: readInt(env, "CENTRAL_TALENT_STREAM_MAX_BATCH", 25),
     authSchema: env.CENTRAL_AUTH_SCHEMA || "radixa_auth",
     centralEnabled:
       readBool(env, "CENTRAL_INGESTION_ENABLED", true) &&

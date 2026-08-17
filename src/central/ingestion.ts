@@ -9,7 +9,9 @@
  *
  * Candidates additionally run through the IDRKOS cross-check before the
  * central upsert, so the central row already carries `idrkos_staf_id` and the
- * `idrkos_verified` / `scraped_new` status.
+ * `idrkos_verified` / `scraped_new` status. They land in the central talent
+ * table (`talent_scraping`) through {@link TalentScrapingStream}, which
+ * batches the writes without changing when a row counts as pushed.
  */
 
 import { CentralConfig, loadCentralConfig } from "./config";
@@ -23,21 +25,27 @@ import {
   normalizeIdentity,
 } from "./normalize";
 import { SupabaseRestClient } from "./supabaseClient";
+import { TalentScrapingStream } from "./talentStream";
 import {
   BatchIngestResult,
   CandidateCrossCheckResult,
   CentralEntityType,
   IngestResult,
   LISTING_PRIORITY,
+  OutboxRow,
   ScrapedApplication,
   ScrapedBatch,
   ScrapedCandidate,
   ScrapedJobVacancy,
 } from "./types";
 
-/** Central table names, per entity type. */
-const CENTRAL_TABLES: Record<CentralEntityType, string> = {
-  candidate: "candidates",
+/**
+ * Central table names for the entity types with a fixed destination.
+ *
+ * Candidates are not listed here: they go to the configured talent table
+ * ({@link CentralConfig.talentTable}) through the streaming writer.
+ */
+const CENTRAL_TABLES: Record<Exclude<CentralEntityType, "candidate">, string> = {
   job_vacancy: "job_vacancies",
   application: "applications",
 };
@@ -49,6 +57,9 @@ const CONFLICT_TARGETS: Record<CentralEntityType, string> = {
   application: "natural_key",
 };
 
+/** Every entity type the outbox can hold, in replay order. */
+const ENTITY_TYPES: CentralEntityType[] = ["candidate", "job_vacancy", "application"];
+
 /**
  * Collaborators the service needs; all are injectable for tests.
  */
@@ -57,6 +68,7 @@ export type IngestionServiceDeps = {
   store?: CentralStore;
   supabase?: SupabaseRestClient;
   idrkos?: IdrkosService;
+  talentStream?: TalentScrapingStream;
 };
 
 /**
@@ -67,6 +79,9 @@ export class CentralIngestionService {
   private readonly store: CentralStore;
   private readonly supabase: SupabaseRestClient;
   private readonly idrkos: IdrkosService;
+  private readonly talentStream: TalentScrapingStream;
+  /** Outbox updates owed by candidates already handed to the stream. */
+  private readonly streamWrites = new Set<Promise<void>>();
 
   /**
    * @param deps Optional collaborators; defaults are built from the environment.
@@ -76,6 +91,8 @@ export class CentralIngestionService {
     this.store = deps.store || new LocalStore(this.config.localDbPath);
     this.supabase = deps.supabase || new SupabaseRestClient(this.config);
     this.idrkos = deps.idrkos || new IdrkosService(this.config, this.supabase);
+    this.talentStream =
+      deps.talentStream || new TalentScrapingStream(this.config, this.supabase);
   }
 
   /**
@@ -86,10 +103,23 @@ export class CentralIngestionService {
   }
 
   /**
-   * Closes the local fallback store.
+   * Drains the candidate stream and closes the local fallback store.
    */
   async close(): Promise<void> {
+    await this.talentStream.close();
+    await Promise.all(this.streamWrites);
     await this.store.close();
+  }
+
+  /**
+   * Sends whatever the candidate stream still holds, without closing it.
+   *
+   * A scraper that wants its last few candidates in `talent_scraping` before
+   * it reports success calls this; otherwise the flush window handles it.
+   */
+  async flushStream(): Promise<void> {
+    await this.talentStream.flush();
+    await Promise.all(this.streamWrites);
   }
 
   /**
@@ -184,10 +214,24 @@ export class CentralIngestionService {
     for (const candidate of batch.candidates || []) {
       results.push(await this.ingestSafely(() => this.ingestCandidate(candidate), "candidate"));
     }
+    // The candidates of a batch travel together, before the applications that
+    // reference them.
+    await this.flushStream();
+
     for (const application of batch.applications || []) {
       results.push(
         await this.ingestSafely(() => this.ingestApplication(application), "application")
       );
+    }
+
+    // Streamed candidates are only "pushed" once their batch has landed, so a
+    // batch result waits for the stream before it counts anything.
+    await this.flushStream();
+    for (const result of results) {
+      if (!result.queued_for_central || result.pushed_to_central) continue;
+      const row = await this.store.getOutbox(result.entity_type, result.natural_key);
+      result.pushed_to_central = row?.sync_state === "synced";
+      if (!result.pushed_to_central && row?.last_error) result.error = row.last_error;
     }
 
     return {
@@ -213,13 +257,29 @@ export class CentralIngestionService {
 
     if (!this.config.centralEnabled) return { pushed, failed };
 
-    for (const entityType of Object.keys(CENTRAL_TABLES) as CentralEntityType[]) {
+    // Candidates still travelling in the stream are settled first, so a replay
+    // never competes with the write it is about to duplicate.
+    await this.flushStream();
+
+    for (const entityType of ENTITY_TYPES) {
       const rows = await this.store.listPending(entityType, limit);
 
-      for (const row of rows) {
+      // Replayed candidates are queued before any of them is awaited, so the
+      // stream coalesces the whole replay into batches instead of paying one
+      // flush window per row.
+      const queued =
+        entityType === "candidate" ? rows.map((row) => this.queueReplay(row)) : null;
+      if (queued && queued.length > 0) void this.talentStream.flush();
+
+      for (const [index, row] of rows.entries()) {
         try {
-          const payload = JSON.parse(row.payload) as Record<string, unknown>;
-          await this.pushToCentral(entityType, payload);
+          if (queued) {
+            const failure = await queued[index];
+            if (failure) throw failure;
+          } else {
+            const payload = JSON.parse(row.payload) as Record<string, unknown>;
+            await this.pushToCentral(entityType, payload);
+          }
           await this.store.markSynced(entityType, row.natural_key);
           pushed++;
         } catch (error) {
@@ -350,6 +410,16 @@ export class CentralIngestionService {
       return result;
     }
 
+    // Candidates stream: the scrape hands the row to the writer and moves on,
+    // so a slow central database never throttles the portal run. The outbox
+    // row above is what makes that safe, and the bookkeeping below records the
+    // real outcome once the batch lands.
+    if (entityType === "candidate") {
+      result.queued_for_central = true;
+      this.trackStreamWrite(entityType, naturalKey, payload);
+      return result;
+    }
+
     try {
       await this.pushToCentral(entityType, payload);
       await this.store.markSynced(entityType, naturalKey);
@@ -368,7 +438,76 @@ export class CentralIngestionService {
   }
 
   /**
-   * Upserts one row into the central Supabase table.
+   * Hands a candidate to the stream and settles its outbox row later.
+   *
+   * The returned work is remembered so {@link flushStream} and {@link close}
+   * can wait for the store updates instead of racing them against the closing
+   * SQLite handle.
+   * @param entityType Always `candidate`; kept explicit for the store calls.
+   * @param naturalKey Stable key of the candidate.
+   * @param payload Central payload.
+   */
+  private trackStreamWrite(
+    entityType: CentralEntityType,
+    naturalKey: string,
+    payload: Record<string, unknown>
+  ): void {
+    const work = this.talentStream
+      .write(naturalKey, payload)
+      .then(
+        () => this.store.markSynced(entityType, naturalKey),
+        (error: Error) => {
+          console.warn(
+            `Central upsert failed for ${entityType} ${naturalKey}, kept in local outbox:`,
+            error.message
+          );
+          return this.store.markFailure(
+            entityType,
+            naturalKey,
+            error.message,
+            this.config.maxAttempts
+          );
+        }
+      )
+      .catch((error: Error) => {
+        console.warn(`Could not record central outcome for ${naturalKey}:`, error.message);
+      })
+      .finally(() => {
+        this.streamWrites.delete(work);
+      });
+
+    this.streamWrites.add(work);
+  }
+
+  /**
+   * Queues one outbox row for the candidate stream straight away.
+   *
+   * The rejection is captured rather than propagated: the caller awaits these
+   * promises one after another, and an unobserved rejection in the meantime
+   * would surface as an unhandled rejection.
+   * @param row The outbox row to replay.
+   * @returns The failure, or `null` when the row landed centrally.
+   */
+  private queueReplay(row: OutboxRow): Promise<Error | null> {
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payload) as Record<string, unknown>;
+    } catch (error) {
+      return Promise.resolve(error as Error);
+    }
+
+    return this.pushToCentral("candidate", payload).then(
+      () => null,
+      (error: Error) => error
+    );
+  }
+
+  /**
+   * Pushes one row to the central Supabase database.
+   *
+   * Candidates go through the streaming writer so a burst of them travels as
+   * one request; the returned promise still only resolves once the row has
+   * actually landed, so the caller's outbox bookkeeping is unaffected.
    * @param entityType Kind of entity.
    * @param payload Central payload.
    */
@@ -376,6 +515,11 @@ export class CentralIngestionService {
     entityType: CentralEntityType,
     payload: Record<string, unknown>
   ): Promise<void> {
+    if (entityType === "candidate") {
+      await this.talentStream.write(String(payload.natural_key), payload);
+      return;
+    }
+
     await this.supabase.upsert(CENTRAL_TABLES[entityType], [payload], {
       onConflict: CONFLICT_TARGETS[entityType],
       schema: this.config.scraperSchema,

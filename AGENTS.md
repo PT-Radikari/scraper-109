@@ -19,6 +19,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - `src/central/` mirrors scraped candidates, vacancies and applications into a central Supabase database on top of the per-portal SQLite files in `db/`. It talks PostgREST over axios rather than adding a Postgres driver. See the "Central Supabase Ingestion" section of `README.md` for setup and the runner commands, `.env.sample` for configuration, and `migrations/0001_central_ingestion.sql` for the schema and the `cross_check_idrkos_candidate` function.
 - Scrapers hook in through `src/central/portalBridge.ts`, called right after their existing local insert. The bridge swallows its own failures on purpose: a central problem must never abort a scraping run, since the local outbox already holds the row.
+- Candidates are the one entity that is **not** pushed synchronously: `src/central/talentStream.ts` batches them into `talent_scraping` and settles the outbox row afterwards, so `IngestResult.pushed_to_central` is false right after `ingestCandidate` and `queued_for_central` is what the caller sees. Anything that asserts on the central write must `await service.flushStream()` (or `flushIngestionStream()`) first; `src/server.ts` drains through `closeIngestionService()` when a portal run ends.
 
 ## Maintaining this file
 

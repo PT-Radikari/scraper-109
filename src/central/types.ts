@@ -152,8 +152,16 @@ export type IngestResult = {
   natural_key: string;
   /** Always true when the local SQLite fallback write succeeded. */
   stored_locally: boolean;
-  /** True when the central Supabase upsert succeeded. */
+  /**
+   * True when the central Supabase upsert succeeded.
+   *
+   * Always false for streamed candidates: they are handed to the talent
+   * stream and confirmed asynchronously, so {@link queued_for_central} is
+   * what the caller can observe synchronously.
+   */
   pushed_to_central: boolean;
+  /** True when the row was accepted by the candidate stream. */
+  queued_for_central?: boolean;
   /** Populated when the central push failed and the row stays pending. */
   error?: string;
   /** Present for candidates once the IDRKOS cross-check has run. */

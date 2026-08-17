@@ -94,12 +94,16 @@ describe("central/CentralIngestionService", () => {
       const result = await service.ingestCandidate(CANDIDATE);
 
       expect(result.stored_locally).toBe(true);
-      expect(result.pushed_to_central).toBe(true);
+      // Candidates are streamed: the scrape does not wait on the network.
+      expect(result.queued_for_central).toBe(true);
       expect(result.natural_key).toBe("glints:email:john@example.com");
       expect(result.cross_check).toEqual(VERIFIED);
 
+      await service.flushStream();
+
       const request = transport.requests[0];
-      expect(request.url).toBe("https://central.test/rest/v1/candidates");
+      expect(request.url).toBe("https://central.test/rest/v1/talent_scraping");
+      expect(request.headers["Content-Profile"]).toBe("public");
       expect(request.params).toEqual({ on_conflict: "natural_key" });
       const [row] = request.data as Record<string, unknown>[];
       expect(row.idrkos_staf_id).toBe("staf-77");
@@ -122,6 +126,7 @@ describe("central/CentralIngestionService", () => {
         source_portal: "glints",
         email: "fresh@example.com",
       });
+      await service.flushStream();
 
       const [row] = transport.requests[0].data as Record<string, unknown>[];
       expect(row.status).toBe("scraped_new");
@@ -139,7 +144,9 @@ describe("central/CentralIngestionService", () => {
       const { service, store, transport } = await buildService({ verdict: NEW });
 
       await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
       await service.ingestCandidate({ ...CANDIDATE, email: " john@example.COM " });
+      await service.flushStream();
 
       // One local row for one human, and both pushes target the same key.
       const counts = await store.countByState();
@@ -160,10 +167,10 @@ describe("central/CentralIngestionService", () => {
       const { service, store } = await buildService({ transport });
 
       const result = await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
 
       expect(result.stored_locally).toBe(true);
       expect(result.pushed_to_central).toBe(false);
-      expect(result.error).toContain("503");
 
       const outbox = await store.getOutbox("candidate", result.natural_key);
       expect(outbox?.sync_state).toBe("pending");
@@ -181,9 +188,11 @@ describe("central/CentralIngestionService", () => {
       });
 
       const result = await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
 
       expect(result.stored_locally).toBe(true);
       expect(result.pushed_to_central).toBe(false);
+      expect(result.queued_for_central).toBeUndefined();
       expect(transport.requests).toHaveLength(0);
       expect((await store.getOutbox("candidate", result.natural_key))?.sync_state).toBe("pending");
 
@@ -195,6 +204,7 @@ describe("central/CentralIngestionService", () => {
       const { service, store } = await buildService({ transport });
 
       const result = await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
       expect(result.pushed_to_central).toBe(false);
 
       // Central is back: the queued row goes through untouched.
@@ -212,6 +222,7 @@ describe("central/CentralIngestionService", () => {
       const { service, store } = await buildService({ transport, config: { maxAttempts: 2 } });
 
       const result = await service.ingestCandidate(CANDIDATE); // attempt 1
+      await service.flushStream();
       await service.flushPending(); // attempt 2 -> budget exhausted
 
       const outbox = await store.getOutbox("candidate", result.natural_key);
@@ -310,7 +321,7 @@ describe("central/CentralIngestionService", () => {
       // Vacancies go first so the application can reference an existing row.
       expect(transport.requests.map((request) => request.url)).toEqual([
         "https://central.test/rest/v1/job_vacancies",
-        "https://central.test/rest/v1/candidates",
+        "https://central.test/rest/v1/talent_scraping",
         "https://central.test/rest/v1/applications",
       ]);
 
@@ -341,6 +352,7 @@ describe("central/CentralIngestionService", () => {
       const { service, store } = await buildService({ transport, verdict: NEW });
 
       const result = await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
       expect(result.pushed_to_central).toBe(false);
 
       // IDRKOS now knows this candidate.
@@ -370,6 +382,7 @@ describe("central/CentralIngestionService", () => {
       const { service } = await buildService();
 
       await service.ingestCandidate(CANDIDATE);
+      await service.flushStream();
 
       expect(await service.stats()).toEqual({ pending: 0, synced: 1, failed: 0 });
 
