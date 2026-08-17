@@ -1,6 +1,7 @@
 import axios from "axios";
 import playwright from "playwright";
 import sqlite3 from 'sqlite3';
+import { ingestPortalApplicant, ingestPortalVacancy } from "./central/portalBridge";
 import fs from "fs";
 import path from "path";
 
@@ -1606,7 +1607,7 @@ export class Pintarnya {
       VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
@@ -1615,6 +1616,15 @@ export class Pintarnya {
           resolve(console.log("Inserted vacancy."));
         }
       });
+    });
+
+    // Dual-write: mirror the vacancy into the central Supabase database.
+    await ingestPortalVacancy({
+      source_portal: "pintarnya",
+      source_vacancy_id: pintarnyaJobId,
+      position,
+      location,
+      applicants_count: applicants,
     });
   }
 
@@ -1687,7 +1697,7 @@ export class Pintarnya {
       VALUES ('${email}', '${appliedForId}')
     `;
 
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.DB.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
@@ -1697,6 +1707,13 @@ export class Pintarnya {
         }
       });
     });
+
+    // Dual-write: the local SQLite row above stays the fallback, this mirrors
+    // the applicant into the central Supabase database.
+    await ingestPortalApplicant(
+      { email, applied_for_id: appliedForId, portal: "pintarnya" },
+      "pintarnya"
+    );
   }
 
   /**

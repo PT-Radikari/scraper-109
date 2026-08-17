@@ -12,6 +12,9 @@
     "dev:pintarnya": "ts-node src/server.ts pintarnya",
     "dev:glints": "ts-node src/server.ts glints",
     "dev": "ts-node src/server.ts",
+    "central:sync": "ts-node src/server.ts central-sync",
+    "central:sync-once": "ts-node src/server.ts central-sync-once",
+    "central:stats": "ts-node src/server.ts central-stats",
     "xvfb:kitalulus": "xvfb-run -a ts-node src/server.ts kitalulus",
     "xvfb:kitalulus-v2-vacancies": "xvfb-run -a ts-node src/server.ts kitalulus-v2-vacancies",
     "xvfb:kitalulus-v2-applicants": "xvfb-run -a ts-node src/server.ts kitalulus-v2-applicants",
@@ -28,6 +31,8 @@
     "start:pintarnya": "xvfb-run node build/server.js pintarnya",
     "start:glints": "xvfb-run node build/server.js glints",
     "start": "xvfb-run node build/server.js",
+    "start:central-sync": "node build/server.js central-sync",
+    "start:central-sync-once": "node build/server.js central-sync-once",
     "test": "jest"
   },
   "author": "",

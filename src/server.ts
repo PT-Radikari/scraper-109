@@ -4,6 +4,8 @@ import { Jooble, JoobleConfigJson } from "./jooble";
 import { Seek, SeekConfigJson } from "./seek";
 import { Glints, GlintsConfigJson } from "./glints";
 import { Pintarnya, PintarnyaConfigJson } from "./pintarnya";
+import { CentralIngestionService } from "./central/ingestion";
+import { CentralSyncRunner, startCentralSyncDaemon } from "./central/syncRunner";
 import fs from "fs";
 import path from "path";
 
@@ -80,6 +82,30 @@ switch (command) {
   case "pintarnya":
     console.log("Will run pintarnya scraper");
     PT.Scrape();
+    break;
+
+  case "central-sync":
+    console.log("Will run central Supabase sync daemon");
+    void startCentralSyncDaemon();
+    break;
+
+  case "central-sync-once":
+    console.log("Will run a single central Supabase sync pass");
+    void (async () => {
+      const runner = new CentralSyncRunner();
+      await runner.runOnce();
+      await runner.stop();
+    })();
+    break;
+
+  case "central-stats":
+    console.log("Will report central ingestion outbox stats");
+    void (async () => {
+      const service = new CentralIngestionService();
+      await service.init();
+      console.log(await service.stats());
+      await service.close();
+    })();
     break;
 
   default:
