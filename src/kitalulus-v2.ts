@@ -6,6 +6,7 @@ import axios from "axios";
 import sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, PortalApplicant } from "./central/portalBridge";
 import { GQLKitalulusApplicant } from "./gql-kitalulus-applicant";
+import { trackBrowser } from "./browserRegistry";
 
 export interface KitaLulusConfigJsonV2 {
   headless: boolean;
@@ -171,10 +172,10 @@ export class KitaLulusV2 {
       console.error(error);
       console.log("Failed to create database connection. Exiting...");
     }
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 
@@ -343,10 +344,10 @@ export class KitaLulusV2 {
       console.log("Failed to create database connection. Exiting...");
     }
     // create browser
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 
@@ -435,10 +436,10 @@ export class KitaLulusV2 {
     }
 
     // create browser
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 

@@ -36,6 +36,19 @@ npm run dev:jooble
 ```
 
 
+Scraper Retries
+
+Every portal run launched through `src/server.ts` (`kitalulus`, `kitalulus-v2-*`, `jooble`, `seek`, `glints`, `pintarnya`) is wrapped in an exponential-backoff retry loop: a failed run is retried from scratch — a fresh scraper instance, a fresh browser — after a growing delay, and the process exits with status 1 only once the attempt budget is spent.
+
+The policy is read from the environment (see `.env.sample`, defaults in `src/retry.ts`):
+```
+SCRAPER_RETRY_MAX_ATTEMPTS=5      # total attempts including the first; 1 disables retrying
+SCRAPER_RETRY_BASE_DELAY_MS=30000 # delay before the second attempt
+SCRAPER_RETRY_MAX_DELAY_MS=300000 # cap for a single delay
+SCRAPER_RETRY_FACTOR=2            # delay multiplier per failed attempt
+SCRAPER_RETRY_JITTER=true         # randomise each delay within [delay/2, delay]
+```
+
 Building the Project locally
 
 Run build script: Assuming your project has a build script defined in a package.json file, run the following command to execute it:

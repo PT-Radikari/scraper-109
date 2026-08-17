@@ -5,6 +5,7 @@ import FormData from "form-data";
 import axios from "axios";
 import sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
+import { trackBrowser } from "./browserRegistry";
 
 export interface KitaLulusConfigJson {
   headless: boolean;
@@ -576,10 +577,10 @@ export class KitaLulus {
       console.error(error);
       console.log("Failed to create database connection. Exiting...");
     }
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 

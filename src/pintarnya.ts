@@ -4,6 +4,7 @@ import sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy } from "./central/portalBridge";
 import fs from "fs";
 import path from "path";
+import { trackBrowser } from "./browserRegistry";
 
 const INDONESIAN_MONTHS = [
   "Januari",
@@ -436,9 +437,9 @@ export class Pintarnya {
     /**
      * Launch the browser.
      */
-    const browser = await playwright.chromium.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
-    });
+    }));
     const page = await browser.newPage();
     page.setDefaultTimeout(this.TIMEOUT);
 
