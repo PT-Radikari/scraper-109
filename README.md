@@ -9,7 +9,7 @@ Stable internet connection: You'll need an internet connection to download requi
 Installation
 
 Open your terminal: Launch your command prompt (Windows) or terminal (macOS/Linux).
-Install dependencies: Run the following command to install the necessary dependencies for your project:
+Install dependencies: `node_modules/` is not committed to the repository, so this step is required on every fresh checkout (the Docker build below runs it for you):
 ```
 npm install
 ```
@@ -72,7 +72,7 @@ npm run build
 ```
 
 Run with docker: Assuming your have installed docker, run the following command to execute it:
-Build
+Build (the image runs `npm install` during the build, so a checkout without `node_modules/` is all it needs)
 ```
 docker build -t playwright-runner . 
 ```

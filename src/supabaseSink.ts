@@ -116,7 +116,10 @@ export class SupabaseSink {
   }
 
   /**
-   * Upserts one vacancy, deduped on (portal, portal_vacancy_id).
+   * Upserts one vacancy, deduped on (portal, portal_vacancy_id). Status is
+   * written only on first insert; the refresh PATCH for an existing row
+   * touches last_seen_at alone so downstream status transitions survive
+   * re-scrapes.
    * @returns the numeric id of the (inserted or existing) row.
    */
   async upsertVacancy(v: VacancyInput): Promise<number> {
@@ -139,10 +142,7 @@ export class SupabaseSink {
 
     await axios.patch(
       `${this.url}/rest/v1/portal_vacancies?id=eq.${id}`,
-      {
-        last_seen_at: new Date().toISOString(),
-        ...(v.status !== undefined ? { status: v.status } : {}),
-      },
+      { last_seen_at: new Date().toISOString() },
       { headers: this.headers({ Prefer: "return=minimal" }) },
     );
     return id;
@@ -154,7 +154,8 @@ export class SupabaseSink {
    * @returns the numeric id of the (inserted or existing) row.
    */
   async upsertCandidate(c: CandidateInput): Promise<number> {
-    if (!c.portal_candidate_id && !c.email) {
+    const email = c.email || null;
+    if (!c.portal_candidate_id && !email) {
       throw new Error("SupabaseSink: candidate requires portal_candidate_id or email");
     }
     const onConflict =
@@ -165,6 +166,7 @@ export class SupabaseSink {
     const candidate = {
       ...c,
       portal_candidate_id: c.portal_candidate_id || null,
+      email,
     };
     const response = await axios.post(
       `${this.url}/rest/v1/portal_candidates`,
@@ -178,7 +180,7 @@ export class SupabaseSink {
     );
     const filters: Record<string, string> = c.portal_candidate_id
       ? { portal: `eq.${c.portal}`, portal_candidate_id: `eq.${c.portal_candidate_id}` }
-      : { portal: `eq.${c.portal}`, email: `eq.${c.email ?? ""}` };
+      : { portal: `eq.${c.portal}`, email: `eq.${email}` };
     const id = response.data[0]
       ? Number(response.data[0].id)
       : await this.findId("portal_candidates", filters);

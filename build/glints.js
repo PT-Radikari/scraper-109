@@ -61,6 +61,7 @@ class Glints {
         this.APIDESTINATION = "";
         this.TIMEOUT = 30000;
         this.COLLECTED = 0;
+        this.VACANCIES_SEEN = 0;
         this.SLOWMO = 10000;
         this.DB_PATH = "";
         this.CACHE_DIR = '';
@@ -141,6 +142,14 @@ class Glints {
         (_a = this.sink) !== null && _a !== void 0 ? _a : (this.sink = new supabaseSink_1.SupabaseSink());
         return this.sink;
     }
+    /** Number of vacancy links discovered by this run. */
+    getVacanciesSeen() {
+        return this.VACANCIES_SEEN;
+    }
+    /** Number of applicants successfully persisted by this run. */
+    getCollectedCount() {
+        return this.COLLECTED;
+    }
     ensureLegacyDatabase() {
         return __awaiter(this, void 0, void 0, function* () {
             if (this.DB)
@@ -209,7 +218,8 @@ class Glints {
      *   2. Upserts a synthesized vacancy row. glints carries no explicit
      *      vacancy_id on every applicant, so the key falls back to
      *      sha1(portal + applied_for).
-     *   3. Upserts the candidate (keyed by sha1 of email).
+     *   3. Upserts the candidate, keyed by sha1 of the email, falling back to
+     *      sha1 of the profile URL when the modal exposes no email.
      *   4. Links the application to the vacancy/candidate pair.
      * Re-scrapes are idempotent in Supabase, so this path does not require the
      * legacy native SQLite module.
@@ -218,17 +228,18 @@ class Glints {
      */
     sendToSink(param) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
+            var _a, _b;
             try {
                 const sink = this.getSink();
                 const vacancyId = crypto_1.default
                     .createHash("sha1")
                     .update(`${param.portal}${param.applied_for}`)
                     .digest("hex");
-                const candidateId = crypto_1.default
-                    .createHash("sha1")
-                    .update(param.url_profile)
-                    .digest("hex");
+                const email = ((_a = param.email) !== null && _a !== void 0 ? _a : "").trim();
+                const candidateKeySource = email !== "" ? email : param.url_profile;
+                const candidateId = candidateKeySource
+                    ? crypto_1.default.createHash("sha1").update(candidateKeySource).digest("hex")
+                    : null;
                 const appliedDate = param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
                 const cvKey = param.cv !== "" ? yield sink.uploadArtifact(param.portal, "cv", param.cv) : null;
                 const photoKey = param.photo !== "" ? yield sink.uploadArtifact(param.portal, "photo", param.photo) : null;
@@ -242,8 +253,8 @@ class Glints {
                 });
                 const candidateRowId = yield sink.upsertCandidate({
                     portal: param.portal,
-                    portal_candidate_id: param.url_profile ? candidateId : null,
-                    email: param.email,
+                    portal_candidate_id: candidateId,
+                    email: email !== "" ? email : null,
                     name: param.name,
                     cv_object_key: cvKey,
                     photo_object_key: photoKey,
@@ -259,7 +270,7 @@ class Glints {
             catch (error) {
                 console.info("Error writing applicant to Supabase sink", param);
                 console.error("Error writing to Supabase sink with error:", error);
-                console.error("Error writing to Supabase sink with response:", (_a = error.response) === null || _a === void 0 ? void 0 : _a.data);
+                console.error("Error writing to Supabase sink with response:", (_b = error.response) === null || _b === void 0 ? void 0 : _b.data);
                 throw error;
             }
         });
@@ -544,6 +555,7 @@ class Glints {
                 throw new Error("[GLINTS] No job cards found after checking all dashboard tabs");
             }
             const listVacancyPage = yield this.ExtractListVacancyPage(page);
+            this.VACANCIES_SEEN = listVacancyPage.length;
             if (listVacancyPage.length === 0) {
                 throw new Error("[GLINTS] Job cards were visible but none contained a manage-candidates link");
             }
@@ -589,6 +601,10 @@ class Glints {
     /**
      * Extracts and processes applicant details from a table row.
      *
+     * Rows are processed newest-first within the currently rendered pagination
+     * page only; pages themselves are still visited in the portal's default
+     * order. That per-page scope is the accepted guarantee for this slice.
+     *
      * @param page - The Playwright page object representing the web page.
      * @param job - The job title for which the applicant is applying.
      * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
@@ -610,14 +626,16 @@ class Glints {
                     break;
                 }
                 const element = lv.nth(rows[i].index);
+                let photo = "";
+                let cv = "";
                 try {
-                    const photo = yield this.extractPhoto(element);
+                    photo = yield this.extractPhoto(element);
                     const dateOfBirth = yield this.extractDateOfBirth(element);
                     const name = yield this.extractName(element);
                     const gender = yield this.extractGender(element);
                     const location = yield this.extractLocation(element);
                     const salaryExpectation = yield this.extractSalaryExpectation(element);
-                    const appliedDate = yield this.extractAppliedDate(element);
+                    const appliedDate = rows[i].appliedDate;
                     // cell row of applicant
                     yield element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
                     const modalDetailButtonBelumSelesai = yield page.getByText('Belum Sesuai', { exact: true });
@@ -629,7 +647,7 @@ class Glints {
                     const email = yield this.extractEmail(page, modalDetail);
                     const workExperience = yield this.extractWorkExperience(modalDetail);
                     const education = yield this.extractEducation(modalDetail);
-                    const cv = yield this.extractCV(page);
+                    cv = yield this.extractCV(page);
                     const applicant = {
                         portal: "glints",
                         type: "applicant",
@@ -651,8 +669,6 @@ class Glints {
                         url_profile: yield page.url(),
                     };
                     yield this.sendToSink(applicant);
-                    yield this.RemoveTempFile(photo);
-                    yield this.RemoveTempFile(cv);
                     yield page.keyboard.press('Escape');
                     console.info("collected :", this.COLLECTED);
                 }
@@ -661,6 +677,10 @@ class Glints {
                     console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
                     if (axios_1.default.isAxiosError(error))
                         throw error;
+                }
+                finally {
+                    yield this.RemoveTempFile(photo);
+                    yield this.RemoveTempFile(cv);
                 }
             }
         });

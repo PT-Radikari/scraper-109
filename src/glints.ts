@@ -127,6 +127,7 @@ export class Glints {
   private APIDESTINATION: string = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
+  private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
   private DB_PATH: string = "";
   private DB?: sqlite3.Database;
@@ -225,6 +226,16 @@ export class Glints {
     return this.sink;
   }
 
+  /** Number of vacancy links discovered by this run. */
+  getVacanciesSeen(): number {
+    return this.VACANCIES_SEEN;
+  }
+
+  /** Number of applicants successfully persisted by this run. */
+  getCollectedCount(): number {
+    return this.COLLECTED;
+  }
+
   private async ensureLegacyDatabase(): Promise<void> {
     if (this.DB) return;
     this.DB = await this.createDatabaseConnection();
@@ -290,7 +301,8 @@ export class Glints {
    *   2. Upserts a synthesized vacancy row. glints carries no explicit
    *      vacancy_id on every applicant, so the key falls back to
    *      sha1(portal + applied_for).
-   *   3. Upserts the candidate (keyed by sha1 of email).
+   *   3. Upserts the candidate, keyed by sha1 of the email, falling back to
+   *      sha1 of the profile URL when the modal exposes no email.
    *   4. Links the application to the vacancy/candidate pair.
    * Re-scrapes are idempotent in Supabase, so this path does not require the
    * legacy native SQLite module.
@@ -304,10 +316,11 @@ export class Glints {
         .createHash("sha1")
         .update(`${param.portal}${param.applied_for}`)
         .digest("hex");
-      const candidateId = crypto
-        .createHash("sha1")
-        .update(param.url_profile)
-        .digest("hex");
+      const email = (param.email ?? "").trim();
+      const candidateKeySource = email !== "" ? email : param.url_profile;
+      const candidateId = candidateKeySource
+        ? crypto.createHash("sha1").update(candidateKeySource).digest("hex")
+        : null;
       const appliedDate =
         param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
 
@@ -325,8 +338,8 @@ export class Glints {
 
       const candidateRowId = await sink.upsertCandidate({
         portal: param.portal,
-        portal_candidate_id: param.url_profile ? candidateId : null,
-        email: param.email,
+        portal_candidate_id: candidateId,
+        email: email !== "" ? email : null,
         name: param.name,
         cv_object_key: cvKey,
         photo_object_key: photoKey,
@@ -638,6 +651,7 @@ export class Glints {
     }
 
     const listVacancyPage = await this.ExtractListVacancyPage(page);
+    this.VACANCIES_SEEN = listVacancyPage.length;
     if (listVacancyPage.length === 0) {
       throw new Error("[GLINTS] Job cards were visible but none contained a manage-candidates link");
     }
@@ -693,6 +707,10 @@ export class Glints {
   /**
    * Extracts and processes applicant details from a table row.
    *
+   * Rows are processed newest-first within the currently rendered pagination
+   * page only; pages themselves are still visited in the portal's default
+   * order. That per-page scope is the accepted guarantee for this slice.
+   *
    * @param page - The Playwright page object representing the web page.
    * @param job - The job title for which the applicant is applying.
    * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
@@ -715,15 +733,17 @@ export class Glints {
       }
 
       const element = lv.nth(rows[i].index);
+      let photo = "";
+      let cv = "";
 
       try {
-        const photo = await this.extractPhoto(element);
+        photo = await this.extractPhoto(element);
         const dateOfBirth = await this.extractDateOfBirth(element);
         const name = await this.extractName(element);
         const gender = await this.extractGender(element);
         const location = await this.extractLocation(element);
         const salaryExpectation = await this.extractSalaryExpectation(element);
-        const appliedDate = await this.extractAppliedDate(element);
+        const appliedDate = rows[i].appliedDate;
 
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
@@ -738,7 +758,7 @@ export class Glints {
         const email = await this.extractEmail(page, modalDetail);
         const workExperience = await this.extractWorkExperience(modalDetail)
         const education = await this.extractEducation(modalDetail)
-        const cv = await this.extractCV(page);
+        cv = await this.extractCV(page);
 
         const applicant: Applicant = {
           portal: "glints",
@@ -762,8 +782,6 @@ export class Glints {
         }
 
         await this.sendToSink(applicant)
-        await this.RemoveTempFile(photo);
-        await this.RemoveTempFile(cv);
         await page.keyboard.press('Escape');
 
         console.info("collected :", this.COLLECTED);
@@ -771,6 +789,9 @@ export class Glints {
         await page.keyboard.press('Escape');
         console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
         if (axios.isAxiosError(error)) throw error;
+      } finally {
+        await this.RemoveTempFile(photo);
+        await this.RemoveTempFile(cv);
       }
     }
   }

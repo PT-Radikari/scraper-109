@@ -87,10 +87,24 @@ describe("SupabaseSink", () => {
       );
       expect(mockedAxios.patch).toHaveBeenCalledWith(
         `${URL}/rest/v1/portal_vacancies?id=eq.1`,
-        expect.objectContaining({ last_seen_at: expect.any(String), status: "new" }),
+        { last_seen_at: expect.any(String) },
         expect.objectContaining({
           headers: expect.objectContaining({ Prefer: "return=minimal" }),
         })
+      );
+    });
+
+    it("never patches status on a re-scrape, only last_seen_at", async () => {
+      mockedAxios.post.mockResolvedValueOnce({ data: [] } as never);
+      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 9 }] } as never);
+      const sink = buildSink();
+
+      await sink.upsertVacancy({ portal: "glints", portal_vacancy_id: "v-1", status: "new" });
+
+      expect(mockedAxios.patch).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_vacancies?id=eq.9`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
       );
     });
 
@@ -155,6 +169,23 @@ describe("SupabaseSink", () => {
         { Prefer: "resolution=ignore-duplicates, return=representation" },
         { on_conflict: "portal,email" },
         [{ portal: "glints", portal_candidate_id: null, email: "a@b.c", name: "Ada" }]
+      );
+    });
+
+    it("normalizes an empty-string email to null before insert", async () => {
+      const sink = buildSink();
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-2",
+        email: "",
+        name: "Ben",
+      });
+
+      expectPost(
+        `${URL}/rest/v1/portal_candidates`,
+        { Prefer: "resolution=ignore-duplicates, return=representation" },
+        { on_conflict: "portal,portal_candidate_id" },
+        [{ portal: "glints", portal_candidate_id: "c-2", email: null, name: "Ben" }]
       );
     });
 

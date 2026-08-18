@@ -13,6 +13,9 @@ ENV PATH /app/node_modules/.bin:$PATH
 # Copy the application files to the container
 COPY . ./
 
+# Install the application dependencies (node_modules is not committed)
+RUN npm install
+
 # Build the application using npm
 RUN npm run build
 
@@ -20,6 +23,3 @@ RUN npm run build
 RUN apt-get update && \
     apt-get -y install libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev \
     libgbm-dev libasound-dev libatspi2.0-0 libxshmfence-dev
-
-# Install the application dependencies
-RUN npm install

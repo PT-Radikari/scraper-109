@@ -6,7 +6,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 ## Sharp edges
 
-- `node_modules/` is committed, and its `sqlite3` native binding is built for **Linux x86-64** (the docker deployment in `README.md`). On any other host every module that reaches `require("sqlite3")` fails to load, so the scraper test suites (`tests/jooble.test.ts`, `tests/kitalulus.test.ts`, ...) cannot run there. Do not run `npm rebuild sqlite3`: it would replace the binding the container depends on.
+- `node_modules/` is **no longer committed** (ignored and untracked as of scraper-109): run `npm install` on a fresh checkout, and the Docker build installs dependencies itself before `npm run build`. A pre-existing checkout may still carry a `sqlite3` native binding built for a different platform (the docker deployment targets Linux x86-64); on such a host every module that reaches `require("sqlite3")` fails to load, so the scraper test suites (`tests/jooble.test.ts`, `tests/kitalulus.test.ts`, ...) cannot run there until the binding is rebuilt locally.
 - Because of the above, code that needs SQLite should load it lazily and sit behind an interface. `src/central/store.ts` is that interface; `LocalStore` is the SQLite implementation and `InMemoryStore` the portable one, and `tests/central/localStore.test.ts` runs the same contract against both (skipping the SQLite half when the binding will not load).
 - The scrapers build their SQL by string interpolation. Anything new should use bound parameters, as `src/central/localStore.ts` does.
 
@@ -24,6 +24,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 ## Direct scoring sink
 
 - Glints bypasses the legacy `api_destination` and native SQLite path through `src/supabaseSink.ts`. The self-hosted `scrape` and cloud-compatible `talent_scraping` schemas are managed under `atlas/`; follow `atlas/README.md` for generation, validation, baseline, and Storage setup.
+- The direct sink path deliberately does **not** mirror Glints rows into the central Supabase ingestion: `src/central/portalBridge.ts` stays wired only to the legacy SQLite insert path. Do not re-add `ingestPortalApplicant`/`ingestPortalVacancy` calls to the sink path.
 
 ## Maintaining this file
 
