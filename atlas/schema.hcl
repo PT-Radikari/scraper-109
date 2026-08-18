@@ -38,7 +38,7 @@ schema "public" {
 
 table "portal_vacancies" {
   schema  = schema.scrape
-  comment = "Deduplicated view of a vacancy seen on a job portal. Keyed by (portal, portal_vacancy_id); last_seen_at/status are the only columns anon may UPDATE."
+  comment = "Deduplicated view of a vacancy seen on a job portal. Keyed by (portal, portal_vacancy_id); last_seen_at is the only column anon may UPDATE."
 
   column "id" {
     type = bigserial

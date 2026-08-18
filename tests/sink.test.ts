@@ -2,7 +2,8 @@ import axios from "axios";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { SupabaseSink } from "../src/supabaseSink";
+import { SupabaseSink, SupabaseSinkError } from "../src/supabaseSink";
+import { Glints, GlintsConfigJson } from "../src/glints";
 
 jest.mock("axios");
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -329,7 +330,7 @@ describe("SupabaseSink", () => {
 
       await expect(
         sink.upsertCandidate({ portal: "glints", portal_candidate_id: "url-key", email: "" })
-      ).rejects.toMatchObject({ response: { status: 409 } });
+      ).rejects.toMatchObject({ name: "SupabaseSinkError", status: 409 });
       expect(mockedAxios.patch).not.toHaveBeenCalled();
     });
   });
@@ -438,5 +439,160 @@ describe("SupabaseSink", () => {
         })
       );
     });
+  });
+});
+
+const RAW_SINK_FAILURE = {
+  isAxiosError: true,
+  message: "Request failed with status code 409",
+  code: "ERR_BAD_REQUEST",
+  config: {
+    headers: { apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}` },
+    params: { select: "id", limit: 1, portal: "eq.glints", email: "eq.leaked@example.com" },
+    data: '[{"email":"leaked@example.com","phone":"+628123456789"}]',
+  },
+  request: { headers: { Authorization: `Bearer ${ANON_KEY}` } },
+  response: {
+    status: 409,
+    data: {
+      code: "23505",
+      message: 'duplicate key value violates unique constraint "portal_candidates_portal_email_key"',
+      details: "Key (email)=(leaked@example.com) already exists.",
+    },
+  },
+};
+
+function serializeError(error: unknown): string {
+  return JSON.stringify(error, Object.getOwnPropertyNames(error as object));
+}
+
+function expectNoPii(serialized: string): void {
+  expect(serialized).not.toContain(ANON_KEY);
+  expect(serialized).not.toContain("leaked@example.com");
+  expect(serialized).not.toContain("628123456789");
+  expect(serialized).not.toContain("8123456789");
+}
+
+describe("SupabaseSink error sanitization", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValue({ data: [] } as never);
+    mockedAxios.patch.mockResolvedValue({ data: [{ id: 1 }] } as never);
+  });
+
+  it("strips headers, params, request and response bodies from a failed request", async () => {
+    mockedAxios.post.mockRejectedValue(RAW_SINK_FAILURE);
+    const sink = buildSink();
+
+    let thrown: unknown;
+    await sink
+      .upsertVacancy({ portal: "glints", portal_vacancy_id: "v1" })
+      .catch((error) => {
+        thrown = error;
+      });
+
+    expect(thrown).toBeInstanceOf(SupabaseSinkError);
+    const sinkError = thrown as SupabaseSinkError;
+    expect(sinkError.status).toBe(409);
+    expect(sinkError.code).toBe("23505");
+    expect(sinkError.message).toContain("upsertVacancy failed");
+    expect((sinkError as unknown as Record<string, unknown>).config).toBeUndefined();
+    expect((sinkError as unknown as Record<string, unknown>).request).toBeUndefined();
+    expect((sinkError as unknown as Record<string, unknown>).response).toBeUndefined();
+    expect((sinkError as unknown as Record<string, unknown>).cause).toBeUndefined();
+    expectNoPii(serializeError(sinkError));
+  });
+
+  it("sanitizes an unresolvable candidate 409 instead of rethrowing the axios error", async () => {
+    mockedAxios.post.mockRejectedValue(RAW_SINK_FAILURE);
+    mockedAxios.isAxiosError.mockReturnValue(true as never);
+    const sink = buildSink();
+
+    let thrown: unknown;
+    await sink
+      .upsertCandidate({ portal: "glints", email: "leaked@example.com" })
+      .catch((error) => {
+        thrown = error;
+      });
+
+    expect(thrown).toBeInstanceOf(SupabaseSinkError);
+    expect((thrown as SupabaseSinkError).status).toBe(409);
+    expectNoPii(serializeError(thrown));
+  });
+});
+
+describe("Glints sendToSink error sanitization", () => {
+  let tempDir: string;
+  let errorSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "scraper-sink-test-"));
+    errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function buildScraper(): Glints {
+    const config: GlintsConfigJson = {
+      headless: true,
+      cookies: [],
+      local_storage: [],
+      limit: 0,
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: path.relative(path.join(process.cwd(), "src"), path.join(tempDir, "glints.db")),
+    };
+    return new Glints(config);
+  }
+
+  it("rethrows a sanitized error and logs no PII when the sink fails", async () => {
+    const scraper = buildScraper();
+    (scraper as unknown as { sink: unknown }).sink = {
+      upsertVacancy: jest.fn().mockRejectedValue(RAW_SINK_FAILURE),
+    };
+
+    const applicant = {
+      portal: "glints",
+      type: "applicant",
+      applied_for: "Contact Center Agent",
+      applied_date: "2026-08-18",
+      url_profile: "https://employers.glints.id/manage-candidates?jid=job-a",
+      name: "Leaked Name",
+      summary: "",
+      email: "leaked@example.com",
+      contact: { type: "whatsapp", contact_number: "08123456789" },
+      date_of_birth: "1990-01-01",
+      salary_expectation: "",
+      work_experience: [],
+      education: [],
+      skill: [],
+      location: "",
+      gender: "",
+      photo: "",
+      cv: "",
+    };
+
+    let thrown: unknown;
+    await scraper
+      .sendToSink(applicant as Parameters<Glints["sendToSink"]>[0])
+      .catch((error) => {
+        thrown = error;
+      });
+
+    expect(thrown).toBeInstanceOf(SupabaseSinkError);
+    const sinkError = thrown as SupabaseSinkError;
+    expect(sinkError.status).toBe(409);
+    expect(sinkError.portal).toBe("glints");
+    expect(sinkError.vacancyId).toEqual(expect.any(String));
+    expect(sinkError.candidateId).toEqual(expect.any(String));
+    expectNoPii(serializeError(sinkError));
+
+    expect(errorSpy).toHaveBeenCalled();
+    expectNoPii(JSON.stringify(errorSpy.mock.calls));
   });
 });

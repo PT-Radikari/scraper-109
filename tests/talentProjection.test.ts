@@ -3,10 +3,15 @@ import path from "path";
 
 const MIGRATION_FILE = "20260818090000_project_talent_scraping.sql";
 const TABLES_MIGRATION_FILE = "20260818042302_add_scrape_and_talent_tables.sql";
+const GRANTS_MIGRATION_FILE = "20260818110000_restrict_vacancy_status_grant.sql";
 const MIGRATIONS_DIR = path.join(__dirname, "../atlas/migrations");
 const migration = fs.readFileSync(path.join(MIGRATIONS_DIR, MIGRATION_FILE), "utf-8");
 const tablesMigration = fs.readFileSync(
   path.join(MIGRATIONS_DIR, TABLES_MIGRATION_FILE),
+  "utf-8"
+);
+const grantsMigration = fs.readFileSync(
+  path.join(MIGRATIONS_DIR, GRANTS_MIGRATION_FILE),
   "utf-8"
 );
 const sql = migration
@@ -148,5 +153,21 @@ describe("talent_scraping projection migration", () => {
   it("is registered in the atlas migration hash ledger", () => {
     const sum = fs.readFileSync(path.join(MIGRATIONS_DIR, "atlas.sum"), "utf-8");
     expect(sum).toContain(MIGRATION_FILE);
+  });
+});
+
+describe("anon vacancy grants", () => {
+  it("narrows anon's vacancy UPDATE grant to last_seen_at alone", () => {
+    expect(grantsMigration).toContain(
+      'REVOKE UPDATE ("status") ON "scrape"."portal_vacancies" FROM anon;'
+    );
+    expect(grantsMigration).toContain(
+      "last_seen_at is the only column anon may UPDATE"
+    );
+  });
+
+  it("is registered in the atlas migration hash ledger", () => {
+    const sum = fs.readFileSync(path.join(MIGRATIONS_DIR, "atlas.sum"), "utf-8");
+    expect(sum).toContain(GRANTS_MIGRATION_FILE);
   });
 });

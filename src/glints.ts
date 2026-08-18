@@ -7,7 +7,7 @@ import path from "path";
 import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
-import { SupabaseSink } from "./supabaseSink";
+import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { resolveCandidateIdentity } from "./candidateIdentity";
 
 /**
@@ -375,25 +375,19 @@ export class Glints {
       });
       this.COLLECTED++;
     } catch (error) {
-      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-      const message = axios.isAxiosError(error)
-        ? (error.response?.data as { message?: string } | undefined)?.message ?? error.message
-        : error instanceof Error
-          ? error.message
-          : String(error);
+      const sinkError = sanitizeSinkError(error, "sendToSink");
+      sinkError.portal = param.portal;
+      sinkError.vacancyId = vacancyId;
+      sinkError.candidateId = identity.portalCandidateId;
       console.error("Error writing to Supabase sink", {
         portal: param.portal,
         vacancy_id: vacancyId,
         candidate_id: identity.portalCandidateId,
         identity_source: identity.source,
-        status,
-        error: message,
+        status: sinkError.status,
+        error: sinkError.message,
       });
-      if (axios.isAxiosError(error)) {
-        if (error.config) delete error.config.data;
-        delete (error as { request?: unknown }).request;
-      }
-      throw error;
+      throw sinkError;
     }
   }
 
@@ -824,7 +818,7 @@ export class Glints {
       } catch (error) {
         await page.keyboard.press('Escape');
         console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
-        if (axios.isAxiosError(error)) throw error;
+        if (error instanceof SupabaseSinkError) throw error;
       } finally {
         await this.RemoveTempFile(photo);
         await this.RemoveTempFile(cv);
