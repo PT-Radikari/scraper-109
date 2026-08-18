@@ -2,8 +2,21 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 
-import { Glints, GlintsConfigJson } from "../src/glints";
-import { Seek, SeekConfigJson } from "../src/seek";
+import {
+  Glints,
+  GlintsConfigJson,
+  GLINTS_APPLICANT_ROW_SELECTOR,
+} from "../src/glints";
+import type { SeekConfigJson } from "../src/seek";
+
+const sqliteAvailable = (() => {
+  try {
+    require("sqlite3");
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 function dbPathForSource(tempDir: string, fileName: string): string {
   return path.relative(path.join(process.cwd(), "src"), path.join(tempDir, fileName));
@@ -77,7 +90,14 @@ describe("portal extraction helpers", () => {
     ]);
   });
 
-  it("extracts visible Seek applicants without moving phone numbers into email", async () => {
+  it("keeps a semantic fallback when the Glints Polaris row class drifts", () => {
+    expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain(".Polaris-IndexTable__TableRow");
+    expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain('[data-testid="candidate-row"]');
+    expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain("tbody tr");
+  });
+
+  (sqliteAvailable ? it : it.skip)("extracts visible Seek applicants without moving phone numbers into email", async () => {
+    const { Seek } = await import("../src/seek");
     const config: SeekConfigJson = {
       headless: true,
       cookies: [],

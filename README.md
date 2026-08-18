@@ -222,3 +222,46 @@ npm test
 ```
 
 Runs the Jest test suite.
+
+## Supabase sink
+
+Since the Supabase sink feature, scraped candidates are written straight into
+the scoring Supabase (`src/supabaseSink.ts`) instead of hopping through the
+legacy `api_destination` HTTP endpoint. The glints scraper is the first portal
+wired to it; the other 5 portals (jooble/seek/kitalulus/kitalulus-v2/pintarnya)
+still use `sendRequest` + `api_destination`, which is kept and marked
+deprecated until a follow-up migrates them.
+
+The sink reads its configuration from the environment (via dotenv). Copy
+`.env.sample` to `.env` and fill in:
+
+| Variable | Description |
+| --- | --- |
+| `SCORING_SUPABASE_URL` | PostgREST + Storage base URL of the scoring Supabase |
+| `SCORING_SUPABASE_ANON_KEY` | anon key for the scoring Supabase (RLS-guarded) |
+| `SCORING_SUPABASE_BUCKET` | storage bucket for CVs/photos (default `scrape-artifacts`) |
+
+The `scrape.*` tables and the `scrape-artifacts` bucket are managed under
+[`atlas/`](atlas/) — see [`atlas/README.md`](atlas/README.md) for the full
+migration runbook (Atlas migration + `storage.sql` companion). The same Atlas
+project mirrors the scoring service's `talent_scraping` schema on self-hosted
+Supabase.
+
+Run Glints continuously, newest candidates first, with an env-driven pause
+between idempotent cycles:
+
+```bash
+npm run dev:glints:continuous
+# Production container supervision:
+docker run -d --name scraper-glints --restart always --env-file .env playwright-runner:latest npm run start:glints:continuous
+```
+
+`SCRAPER_INTERVAL_MS` defaults to five minutes. Each cycle also uses the
+exponential retry policy above, so transient browser failures retry before the
+next scheduled cycle.
+
+Glints no longer loads SQLite on its direct Supabase path. Legacy portal paths
+still use the committed native `sqlite3` dependency; if its binary was installed
+for another OS/architecture, reinstall dependencies for the current platform or
+run `npm rebuild sqlite3`. Do not rebuild the checkout used by a differently
+architected deployment container.

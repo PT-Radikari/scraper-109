@@ -87,9 +87,40 @@ async function runPortal(command: string): Promise<void> {
   }
 }
 
+/**
+ * Runs a portal forever, waiting between complete cycles. Each cycle retains
+ * the normal attempt-level exponential backoff, and an exhausted cycle starts
+ * fresh after SCRAPER_INTERVAL_MS instead of terminating the service.
+ */
+async function runContinuousPortal(command: string): Promise<void> {
+  const rawInterval = Number(process.env.SCRAPER_INTERVAL_MS ?? 300000);
+  const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+    ? rawInterval
+    : 300000;
+
+  for (;;) {
+    const config = loadRetryConfig();
+    try {
+      await runWithRetry(command, portalRunners[command], {
+        config,
+        cleanup: closeTrackedBrowsers,
+      });
+    } catch (error) {
+      console.error(`${command} cycle exhausted its attempt budget`, error);
+    } finally {
+      await closeIngestionService();
+    }
+
+    console.info(`[scheduler] ${command}: next newest-first cycle in ${intervalMs}ms`);
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 const command = args[0];
 
-if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
+if (command === "glints-continuous") {
+  void runContinuousPortal("glints");
+} else if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
   void runPortal(command);
 } else {
   switch (command) {

@@ -91,8 +91,42 @@ function runPortal(command) {
         }
     });
 }
+/**
+ * Runs a portal forever, waiting between complete cycles. Each cycle retains
+ * the normal attempt-level exponential backoff, and an exhausted cycle starts
+ * fresh after SCRAPER_INTERVAL_MS instead of terminating the service.
+ */
+function runContinuousPortal(command) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        const rawInterval = Number((_a = process.env.SCRAPER_INTERVAL_MS) !== null && _a !== void 0 ? _a : 300000);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+            ? rawInterval
+            : 300000;
+        for (;;) {
+            const config = (0, retry_1.loadRetryConfig)();
+            try {
+                yield (0, retry_1.runWithRetry)(command, portalRunners[command], {
+                    config,
+                    cleanup: browserRegistry_1.closeTrackedBrowsers,
+                });
+            }
+            catch (error) {
+                console.error(`${command} cycle exhausted its attempt budget`, error);
+            }
+            finally {
+                yield (0, portalBridge_1.closeIngestionService)();
+            }
+            console.info(`[scheduler] ${command}: next newest-first cycle in ${intervalMs}ms`);
+            yield new Promise((resolve) => setTimeout(resolve, intervalMs));
+        }
+    });
+}
 const command = args[0];
-if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
+if (command === "glints-continuous") {
+    void runContinuousPortal("glints");
+}
+else if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
     void runPortal(command);
 }
 else {

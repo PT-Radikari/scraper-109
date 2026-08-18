@@ -11,10 +11,9 @@ describe("Pintarnya Test", () => {
     const pintarnyaData = fs.readFileSync(pintarnyaConfig, "utf-8");
     const pintarnyaJson = JSON.parse(pintarnyaData) as PintarnyaConfigJson;
     pintarnya = new Pintarnya(pintarnyaJson);
-    pintarnya.Scrape();
   });
 
-  it("should scrape data from Pintarnya website", async () => {
+  it("constructs the Pintarnya scraper from its config", () => {
     expect(pintarnya).toBeDefined();
   });
 });

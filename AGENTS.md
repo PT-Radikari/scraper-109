@@ -21,6 +21,10 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - Scrapers hook in through `src/central/portalBridge.ts`, called right after their existing local insert. The bridge swallows its own failures on purpose: a central problem must never abort a scraping run, since the local outbox already holds the row.
 - Candidates are the one entity that is **not** pushed synchronously: `src/central/talentStream.ts` batches them into `talent_scraping` and settles the outbox row afterwards, so `IngestResult.pushed_to_central` is false right after `ingestCandidate` and `queued_for_central` is what the caller sees. Anything that asserts on the central write must `await service.flushStream()` (or `flushIngestionStream()`) first; `src/server.ts` drains through `closeIngestionService()` when a portal run ends.
 
+## Direct scoring sink
+
+- Glints bypasses the legacy `api_destination` and native SQLite path through `src/supabaseSink.ts`. The self-hosted `scrape` and cloud-compatible `talent_scraping` schemas are managed under `atlas/`; follow `atlas/README.md` for generation, validation, baseline, and Storage setup.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
