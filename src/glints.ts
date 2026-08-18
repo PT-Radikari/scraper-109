@@ -1,11 +1,14 @@
 import playwright from "playwright";
 import fs from "fs";
 import axios from "axios";
+import crypto from "crypto";
 import FormData from "form-data";
 import path from "path";
-import sqlite3 from 'sqlite3';
+import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
+import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
+import { resolveCandidateIdentity } from "./candidateIdentity";
 
 /**
  * Represents a cookie.
@@ -37,6 +40,7 @@ export interface GlintsConfigJson {
   cookies: Cookie[];
   local_storage: LocalStorageItem[];
   limit: number;
+  /** @deprecated The other 5 portals still POST here. glints now writes to the scoring Supabase via SupabaseSink. */
   api_destination: string;
   timeout: number;
   slowmo: number;
@@ -113,6 +117,9 @@ type ApplicantDB = Pick<Applicant, "email"> & {
   id: number;
 }
 
+export const GLINTS_APPLICANT_ROW_SELECTOR =
+  '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
+
 export class Glints {
   private HEADLESS: boolean = true;
   private LIMIT: number = 0;
@@ -121,9 +128,11 @@ export class Glints {
   private APIDESTINATION: string = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
+  private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
   private DB_PATH: string = "";
-  private DB: sqlite3.Database;
+  private DB?: sqlite3.Database;
+  private sink: SupabaseSink | null;
 
   private CACHE_DIR: string = '';
   private TARGETCOMPANY: string = '';
@@ -142,8 +151,8 @@ export class Glints {
     this.TIMEOUT = config.timeout;
     this.SLOWMO = config.slowmo;
     this.DB_PATH = path.join(__dirname, config.db_path);
-    this.DB = new sqlite3.Database(this.DB_PATH);
     this.TARGETCOMPANY = config.target_company ?? '';
+    this.sink = null;
     console.info("CONFIG GLINTS LOADED");
   }
 
@@ -209,7 +218,36 @@ export class Glints {
   }
 
   /**
-   * Sends a request with the provided applicant data.
+   * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+   * Construction is lazy so importing Glints for another portal or a selector
+   * test does not require sink credentials.
+   */
+  private getSink(): SupabaseSink {
+    this.sink ??= new SupabaseSink();
+    return this.sink;
+  }
+
+  /** Number of vacancy links discovered by this run. */
+  getVacanciesSeen(): number {
+    return this.VACANCIES_SEEN;
+  }
+
+  /** Number of applicants successfully persisted by this run. */
+  getCollectedCount(): number {
+    return this.COLLECTED;
+  }
+
+  private async ensureLegacyDatabase(): Promise<void> {
+    if (this.DB) return;
+    this.DB = await this.createDatabaseConnection();
+    await this.createRequiredTables();
+  }
+
+  /**
+   * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so the
+   * other 5 portal scrapers (jooble/seek/kitalulus/kitalulus-v2/pintarnya) can
+   * keep using it. glints now lands candidates directly in the scoring
+   * Supabase via sendToSink().
    * @param param - The applicant data to be sent.
    * @returns A Promise that resolves when the request is successfully sent.
    */
@@ -247,12 +285,109 @@ export class Glints {
       });
 
       console.info("Success sending param", param);
+      await this.ensureLegacyDatabase();
       await this.insertApplicant(param);
       this.COLLECTED++;
     } catch (error) {
       console.info("Error sending param", param);
       console.error("Error sending request with error:", error);
       console.error("Error sending request with response:", (error as any).response?.data ?? (error as any).message);
+    }
+  }
+
+  /**
+   * Thin end-to-end slice that writes one applicant straight into the scoring
+   * Supabase (no api_destination hop):
+   *   1. Uploads CV + photo to the scrape-artifacts bucket (skips empty paths).
+   *   2. Upserts a synthesized vacancy row. glints carries no explicit
+   *      vacancy_id on every applicant, so the key falls back to
+   *      sha1(portal + applied_for).
+   *   3. Upserts the candidate, keyed through resolveCandidateIdentity():
+   *      normalized email, then normalized phone, then a low-confidence
+   *      fingerprint. url_profile here is the shared vacancy page URL, so it
+   *      is never used as a candidate identity.
+   *   4. Links the application to the vacancy/candidate pair.
+   * Re-scrapes are idempotent in Supabase, so this path does not require the
+   * legacy native SQLite module.
+   *
+   * @param param - The applicant data to be persisted.
+   */
+  async sendToSink(param: Applicant): Promise<void> {
+    const vacancyId = crypto
+      .createHash("sha1")
+      .update(`${param.portal}${param.applied_for}`)
+      .digest("hex");
+    const identity = resolveCandidateIdentity({
+      urlProfile: param.url_profile,
+      vacancyUrl: param.url_profile,
+      email: param.email,
+      phone: param.contact?.contact_number,
+      name: param.name,
+      dateOfBirth: param.date_of_birth,
+      education: param.education,
+      workExperience: param.work_experience,
+    });
+    try {
+      const sink = this.getSink();
+      const appliedDate =
+        param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
+
+      const cvKey = param.cv !== "" ? await sink.uploadArtifact(param.portal, "cv", param.cv) : null;
+      const photoKey = param.photo !== "" ? await sink.uploadArtifact(param.portal, "photo", param.photo) : null;
+
+      const vacancyRowId = await sink.upsertVacancy({
+        portal: param.portal,
+        portal_vacancy_id: vacancyId,
+        title: param.applied_for,
+        link: param.url_profile,
+        status: "new",
+        raw: { type: param.type },
+      });
+
+      const candidateRowId = await sink.upsertCandidate({
+        portal: param.portal,
+        portal_candidate_id: identity.portalCandidateId,
+        email: identity.email,
+        phone: identity.phone,
+        name: param.name,
+        cv_object_key: cvKey,
+        photo_object_key: photoKey,
+        data: {
+          ...param,
+          identity: {
+            source: identity.source,
+            low_confidence: identity.lowConfidence,
+            email: identity.email,
+            phone: identity.phone,
+          },
+        },
+      });
+
+      await sink.linkApplication(vacancyRowId, candidateRowId, {
+        applied_for: param.applied_for,
+        applied_date: appliedDate,
+      });
+
+      console.info("Success writing applicant to Supabase sink", {
+        portal: param.portal,
+        candidate_id: identity.portalCandidateId,
+        identity_source: identity.source,
+      });
+      this.COLLECTED++;
+    } catch (error) {
+      const sinkError = sanitizeSinkError(error, "sendToSink");
+      sinkError.portal = param.portal;
+      sinkError.vacancyId = vacancyId;
+      sinkError.candidateId = identity.portalCandidateId;
+      console.error("Error writing to Supabase sink", {
+        portal: param.portal,
+        vacancy_id: vacancyId,
+        candidate_id: identity.portalCandidateId,
+        identity_source: identity.source,
+        status: sinkError.status,
+        error: sinkError.message,
+      });
+      throw sinkError;
     }
   }
 
@@ -383,15 +518,7 @@ export class Glints {
    * @returns A Promise that resolves when the scraping is complete.
    */
   async Scrape(): Promise<void> {
-    try {
-      this.DB = await this.createDatabaseConnection();
-
-      console.info("Creating required tables...");
-      await this.createRequiredTables();
-    } catch (error) {
-      console.error(error);
-      console.log("Failed to create database connection. Exiting...");
-    }
+    this.getSink();
 
     const launchOptions: Parameters<typeof playwright.chromium.launch>[0] = {
       headless: this.HEADLESS,
@@ -510,6 +637,10 @@ export class Glints {
 
     await page.waitForTimeout(3000);
 
+    if (page.url().includes("/login")) {
+      throw new Error("[GLINTS] Session expired: dashboard redirected to login");
+    }
+
     // Switch to the correct company before scraping — wrong company returns empty results
     await this.selectTargetCompany(page);
 
@@ -546,13 +677,14 @@ export class Glints {
     if (!jobCardsFound) {
       const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
       console.warn(`[GLINTS] Dashboard text while looking for cards: ${pageText}`);
-      console.warn("[GLINTS] No active job cards found on dashboard. All jobs may be closed or account has no active listings.");
-      await browser.close();
-      console.log("DONE");
-      process.exit(0);
+      throw new Error("[GLINTS] No job cards found after checking all dashboard tabs");
     }
 
     const listVacancyPage = await this.ExtractListVacancyPage(page);
+    this.VACANCIES_SEEN = listVacancyPage.length;
+    if (listVacancyPage.length === 0) {
+      throw new Error("[GLINTS] Job cards were visible but none contained a manage-candidates link");
+    }
 
     for (const it of listVacancyPage) {
       if (this.COLLECTED == this.LIMIT) {
@@ -565,9 +697,12 @@ export class Glints {
 
       // Skip job if no candidates in this stage
       if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
+        console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
         continue;
       }
-      if (await page.locator('.Polaris-IndexTable__TableRow').count() === 0) {
+      if (await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
+        const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
+        console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
         continue;
       }
 
@@ -576,7 +711,7 @@ export class Glints {
         // wait 5 seconds before, avoid rendering list employees
         await page.waitForTimeout(5000);
         // Check for lazy-loaded elements before proceeding
-        await this.checkLazyLoadedElement(page, '.Polaris-IndexTable__TableRow');
+        await this.checkLazyLoadedElement(page, GLINTS_APPLICANT_ROW_SELECTOR);
 
         if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
           break;
@@ -585,21 +720,26 @@ export class Glints {
         await this.ExtractApplicantDetail(page, it.title);
 
         // Check if there is a next page
-        isNext = await page.locator('[data-testid="next-page"]').isDisabled();
+        const nextPage = page.locator('[data-testid="next-page"]');
+        isNext = await nextPage.count() === 0 || await nextPage.isDisabled();
         if (!isNext) {
           // Click on the "Next" button to move to the next page
-          await page.locator('[data-testid="next-page"]').click();
+          await nextPage.click();
         }
       } while (!isNext && this.COLLECTED < this.LIMIT);
 
     }
 
+    await browser.close();
     console.log("DONE");
-    process.exit();
   }
 
   /**
    * Extracts and processes applicant details from a table row.
+   *
+   * Rows are processed newest-first within the currently rendered pagination
+   * page only; pages themselves are still visited in the portal's default
+   * order. That per-page scope is the accepted guarantee for this slice.
    *
    * @param page - The Playwright page object representing the web page.
    * @param job - The job title for which the applicant is applying.
@@ -607,85 +747,81 @@ export class Glints {
    *                            If an error occurs during extraction or processing, the promise is rejected.
    */
   async ExtractApplicantDetail(page: any, job: string): Promise<void> {
-    const locatorListApplicant: string = '.Polaris-IndexTable__TableRow';
+    const locatorListApplicant = GLINTS_APPLICANT_ROW_SELECTOR;
     const lv = page.locator(locatorListApplicant);
+    const rows = await Promise.all(
+      Array.from({ length: await lv.count() }, async (_, index) => ({
+        index,
+        appliedDate: await this.extractAppliedDate(lv.nth(index)),
+      })),
+    );
+    rows.sort((a, b) => b.appliedDate.localeCompare(a.appliedDate));
 
-    for (let i = 0; i < await page.locator(locatorListApplicant).count(); i++) {
+    for (let i = 0; i < rows.length; i++) {
       if (this.COLLECTED == this.LIMIT) {
         break;
       }
 
-      const element = lv.nth(i);
+      const element = lv.nth(rows[i].index);
+      let photo = "";
+      let cv = "";
 
       try {
-        const photo = await this.extractPhoto(element);
+        photo = await this.extractPhoto(element);
         const dateOfBirth = await this.extractDateOfBirth(element);
         const name = await this.extractName(element);
         const gender = await this.extractGender(element);
         const location = await this.extractLocation(element);
         const salaryExpectation = await this.extractSalaryExpectation(element);
-        const appliedDate = await this.extractAppliedDate(element);
+        const appliedDate = rows[i].appliedDate;
 
         // cell row of applicant
-        await Promise.all([
-          element.locator('.Polaris-IndexTable__TableCell').nth(1).click(),
-          page.waitForNavigation()
-        ]);
+        await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
 
         const modalDetailButtonBelumSelesai = await page.getByText('Belum Sesuai', { exact: true });
+        await modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
         const modalDetail = await modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
 
         const skills = await this.extractSkills(modalDetail);
         const summary = await this.extractSummary(modalDetail);
         const wa = await this.extractWhatapps(page, modalDetail);
         const email = await this.extractEmail(page, modalDetail);
-        const applicantInDatabase = await this.getApplicantByEmail(email);
+        const workExperience = await this.extractWorkExperience(modalDetail)
+        const education = await this.extractEducation(modalDetail)
+        cv = await this.extractCV(page);
 
-        if (
-          applicantInDatabase !== undefined &&
-          applicantInDatabase.email === email
-        ) {
-          console.info("Applicant already exists in the database. Skipping...");
-          await page.keyboard.press('Escape');
-          continue;
-        }else{
-          const workExperience = await this.extractWorkExperience(modalDetail)
-          const education = await this.extractEducation(modalDetail)
-
-          const cv = await this.extractCV(page);
-
-          const applicant: Applicant = {
-            portal: "glints",
-            type: "applicant",
-            applied_for: job,
-            applied_date: appliedDate,
-            name: name,
-            email: email,
-            summary: summary,
-            contact: wa,
-            date_of_birth: dateOfBirth,
-            salary_expectation: salaryExpectation,
-            work_experience: workExperience,
-            education: education,
-            skill: skills,
-            location: location,
-            gender: gender,
-            photo: photo,
-            cv: cv,
-            url_profile: await page.url(),
-          }
-
-          await this.sendRequest(applicant)
-
-          await this.RemoveTempFile(photo);
-          await this.RemoveTempFile(cv);
-          await page.keyboard.press('Escape');
-
-          console.info("collected :", this.COLLECTED);
+        const applicant: Applicant = {
+          portal: "glints",
+          type: "applicant",
+          applied_for: job,
+          applied_date: appliedDate,
+          name: name,
+          email: email,
+          summary: summary,
+          contact: wa,
+          date_of_birth: dateOfBirth,
+          salary_expectation: salaryExpectation,
+          work_experience: workExperience,
+          education: education,
+          skill: skills,
+          location: location,
+          gender: gender,
+          photo: photo,
+          cv: cv,
+          url_profile: await page.url(),
         }
+
+        await this.sendToSink(applicant)
+        await page.keyboard.press('Escape');
+
+        console.info("collected :", this.COLLECTED);
       } catch (error) {
         await page.keyboard.press('Escape');
-        console.error(error);
+        console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
+        if (error instanceof SupabaseSinkError) throw error;
+      } finally {
+        await this.RemoveTempFile(photo);
+        await this.RemoveTempFile(cv);
       }
     }
   }
@@ -707,6 +843,10 @@ export class Glints {
     }
   }
 
+  private applicantCells(row: any): any {
+    return row.locator('.Polaris-IndexTable__TableCell, td');
+  }
+
   /**
    * Extracts and processes the photo URL from a table row.
    *
@@ -718,23 +858,23 @@ export class Glints {
     let photoPath = ""
 
     // Check if the photo element exists in the first table cell
-    if (await row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//div/span/img').count() > 0) {
+    if (await this.applicantCells(row).nth(1).locator('//div/span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//div/span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//div/span/img').getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
-      if (linkPhoto != "") {
+      if (linkPhoto) {
         photoPath = await this.fetchAndStore(linkPhoto);
       }
     }
 
     // Check if the photo element exists in the first table cell
-    if (await row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//span/img').count() > 0) {
+    if (await this.applicantCells(row).nth(1).locator('//span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//span/img').getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
-      if (linkPhoto != "") {
+      if (linkPhoto) {
         photoPath = await this.fetchAndStore(linkPhoto);
       }
     }
@@ -751,7 +891,7 @@ export class Glints {
    *          If the age element is empty or the input is invalid, it returns "0".
    */
   async extractDateOfBirth(row: any): Promise<string> {
-    const age = await row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[2]/span').textContent();
+    const age = (await this.applicantCells(row).nth(2).locator('//div[2]/span').textContent())?.trim() ?? "";
 
     // If the age element is empty, return '0'
     if (age == "") {
@@ -784,7 +924,7 @@ export class Glints {
    *          The name is trimmed of leading and trailing spaces.
    */
   async extractName(row: any): Promise<string> {
-    const elementName = await row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[1]/span');
+    const elementName = await this.applicantCells(row).nth(2).locator('//div[1]/span');
     const elementNameCount = await elementName.count();
     let name = "";
 
@@ -803,7 +943,7 @@ export class Glints {
    *          If the gender cannot be determined, it returns an empty string.
    */
   async extractGender(row: any): Promise<string> {
-    const genderText = await row.locator('.Polaris-IndexTable__TableCell').nth(5).textContent();
+    const genderText = (await this.applicantCells(row).nth(5).textContent())?.trim() ?? "";
 
     // Mapping Indonesian gender abbreviations to their corresponding values
     const genderType: Record<string, string> = {
@@ -823,9 +963,9 @@ export class Glints {
    *          The location is trimmed of leading and trailing spaces.
    */
   async extractLocation(row: any): Promise<string> {
-    const locationText = await row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[2]/div').textContent();
+    const locationText = (await this.applicantCells(row).nth(2).locator('//div[2]/div').textContent())?.trim() ?? "";
 
-    return locationText.trim();
+    return locationText;
   }
 
   /**
@@ -837,7 +977,7 @@ export class Glints {
    *          If the salary expectation cannot be determined, it returns an empty string.
    */
   async extractSalaryExpectation(row: any): Promise<string> {
-    const salaryExpectationText = await row.locator('.Polaris-IndexTable__TableCell').nth(6).textContent();
+    const salaryExpectationText = (await this.applicantCells(row).nth(6).textContent())?.trim() ?? "";
 
     // Handle million (jt) and billion (miliar) units
     if (salaryExpectationText.indexOf("jt") != -1) {
@@ -856,7 +996,7 @@ export class Glints {
    *          If the applied date is not found or is invalid, it returns an empty string.
    */
   async extractAppliedDate(row: any): Promise<string> {
-    const appliedDateTimeText = await row.locator('.Polaris-IndexTable__TableCell').nth(9).textContent();
+    const appliedDateTimeText = (await this.applicantCells(row).nth(9).textContent())?.trim() ?? "";
 
     // Check if dateStr is empty
     if (appliedDateTimeText == "") {
@@ -1372,6 +1512,8 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
    * @returns {sqlite3.Database} The database connection.
    */
   async createDatabaseConnection(): Promise<sqlite3.Database> {
+    const sqliteModule = await import("sqlite3");
+    const Sqlite = sqliteModule.default;
     /**
      * Create the database file if it does not exist.
      */
@@ -1384,13 +1526,14 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
      * Open the database connection.
      */
     return new Promise((resolve, reject) => {
-      this.DB = new sqlite3.Database(this.DB_PATH, (err) => {
+      const database = new Sqlite.Database(this.DB_PATH, (err) => {
         if (err) {
           console.error("Error opening database", err.message);
           reject(err);
         } else {
           console.log("Connected to the database.");
-          resolve(this.DB);
+          this.DB = database;
+          resolve(database);
         }
       });
     });
@@ -1409,7 +1552,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.run(createTableQuery, (err) => {
+      this.DB!.run(createTableQuery, (err) => {
         if (err) {
           console.error("Error creating applicants table", err.message);
           reject(err);
@@ -1428,7 +1571,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
 
     return new Promise((resolve, reject) => {
-      this.DB.get(query, (err, row) => {
+      this.DB!.get(query, (err, row) => {
         if (err) {
           console.error("Error checking table", err.message);
           reject(err);
@@ -1471,7 +1614,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
           reject(err);
@@ -1510,7 +1653,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
           reject(err);
@@ -1540,7 +1683,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.get<ApplicantDB>(selectQuery, (err, row) => {
+      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
         if (err) {
           console.error("Error getting applicant", err.message);
           reject(err);
@@ -1556,8 +1699,9 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
    * Closes the database connection.
    */
   async closeDatabaseConnection() {
+    if (!this.DB) return;
     return new Promise<void>((resolve, reject) => {
-      this.DB.close((err) => {
+      this.DB!.close((err) => {
         if (err) {
           console.error("Error closing database", err.message);
           reject(err);

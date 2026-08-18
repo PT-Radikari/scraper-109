@@ -20,10 +20,25 @@ const app = (0, express_1.default)();
 const PORT = 4000;
 app.use(express_1.default.json());
 // AI Proxy to hide API Key
+const AI_PROXY_ALLOWED_PATHS = new Set(["/chat/completions", "/completions", "/models", "/embeddings"]);
+function isLoopbackAddress(ip) {
+    if (!ip)
+        return false;
+    const normalized = ip.replace(/^::ffff:/, "");
+    return normalized === "127.0.0.1" || normalized === "::1";
+}
 app.post("/api/ai/*", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b;
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+        res.status(403).json({ error: "forbidden" });
+        return;
+    }
+    const path = req.path.replace("/api/ai", "");
+    if (!AI_PROXY_ALLOWED_PATHS.has(path)) {
+        res.status(404).json({ error: "not found" });
+        return;
+    }
     try {
-        const path = req.path.replace("/api/ai", "");
         const response = yield (0, axios_1.default)({
             method: "POST",
             url: `https://9router.aryahanif.xyz/v1${path}`,

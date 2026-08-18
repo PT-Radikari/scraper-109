@@ -1,4 +1,27 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -12,15 +35,18 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Glints = void 0;
+exports.Glints = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
+const crypto_1 = __importDefault(require("crypto"));
 const form_data_1 = __importDefault(require("form-data"));
 const path_1 = __importDefault(require("path"));
-const sqlite3_1 = __importDefault(require("sqlite3"));
 const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
+const supabaseSink_1 = require("./supabaseSink");
+const candidateIdentity_1 = require("./candidateIdentity");
+exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
 class Glints {
     /**
      * Represents a Glints object.
@@ -36,6 +62,7 @@ class Glints {
         this.APIDESTINATION = "";
         this.TIMEOUT = 30000;
         this.COLLECTED = 0;
+        this.VACANCIES_SEEN = 0;
         this.SLOWMO = 10000;
         this.DB_PATH = "";
         this.CACHE_DIR = '';
@@ -48,8 +75,8 @@ class Glints {
         this.TIMEOUT = config.timeout;
         this.SLOWMO = config.slowmo;
         this.DB_PATH = path_1.default.join(__dirname, config.db_path);
-        this.DB = new sqlite3_1.default.Database(this.DB_PATH);
         this.TARGETCOMPANY = (_a = config.target_company) !== null && _a !== void 0 ? _a : '';
+        this.sink = null;
         console.info("CONFIG GLINTS LOADED");
     }
     getBrowserFallbackExecutablePath() {
@@ -74,6 +101,7 @@ class Glints {
             if (!this.TARGETCOMPANY)
                 return;
             const TARGET = this.TARGETCOMPANY;
+            const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
             const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
             if ((yield ubahLocator.count()) === 0) {
@@ -83,7 +111,7 @@ class Glints {
             // The current company name is displayed in a paragraph adjacent to the combobox.
             // When the dropdown is closed there is no visible option list, so this paragraph is the only
             // occurrence of the company name on the page.
-            const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET}$`) });
+            const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
             if ((yield alreadySelected.count()) > 0) {
                 console.info(`[GLINTS] Company already set to: ${TARGET}`);
                 return;
@@ -98,7 +126,7 @@ class Glints {
                 yield optionByRole.click();
             }
             else {
-                yield page.locator('div').filter({ hasText: new RegExp(`^${TARGET}$`) }).last().click();
+                yield page.locator('div').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) }).last().click();
             }
             // Wait for the page to reload with the new company's data
             yield page.waitForTimeout(3000);
@@ -106,7 +134,36 @@ class Glints {
         });
     }
     /**
-     * Sends a request with the provided applicant data.
+     * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+     * Construction is lazy so importing Glints for another portal or a selector
+     * test does not require sink credentials.
+     */
+    getSink() {
+        var _a;
+        (_a = this.sink) !== null && _a !== void 0 ? _a : (this.sink = new supabaseSink_1.SupabaseSink());
+        return this.sink;
+    }
+    /** Number of vacancy links discovered by this run. */
+    getVacanciesSeen() {
+        return this.VACANCIES_SEEN;
+    }
+    /** Number of applicants successfully persisted by this run. */
+    getCollectedCount() {
+        return this.COLLECTED;
+    }
+    ensureLegacyDatabase() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.DB)
+                return;
+            this.DB = yield this.createDatabaseConnection();
+            yield this.createRequiredTables();
+        });
+    }
+    /**
+     * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so the
+     * other 5 portal scrapers (jooble/seek/kitalulus/kitalulus-v2/pintarnya) can
+     * keep using it. glints now lands candidates directly in the scoring
+     * Supabase via sendToSink().
      * @param param - The applicant data to be sent.
      * @returns A Promise that resolves when the request is successfully sent.
      */
@@ -144,6 +201,7 @@ class Glints {
                     headers: { "Content-Type": "multipart/form-data" },
                 });
                 console.info("Success sending param", param);
+                yield this.ensureLegacyDatabase();
                 yield this.insertApplicant(param);
                 this.COLLECTED++;
             }
@@ -151,6 +209,96 @@ class Glints {
                 console.info("Error sending param", param);
                 console.error("Error sending request with error:", error);
                 console.error("Error sending request with response:", (_b = (_a = error.response) === null || _a === void 0 ? void 0 : _a.data) !== null && _b !== void 0 ? _b : error.message);
+            }
+        });
+    }
+    /**
+     * Thin end-to-end slice that writes one applicant straight into the scoring
+     * Supabase (no api_destination hop):
+     *   1. Uploads CV + photo to the scrape-artifacts bucket (skips empty paths).
+     *   2. Upserts a synthesized vacancy row. glints carries no explicit
+     *      vacancy_id on every applicant, so the key falls back to
+     *      sha1(portal + applied_for).
+     *   3. Upserts the candidate, keyed through resolveCandidateIdentity():
+     *      normalized email, then normalized phone, then a low-confidence
+     *      fingerprint. url_profile here is the shared vacancy page URL, so it
+     *      is never used as a candidate identity.
+     *   4. Links the application to the vacancy/candidate pair.
+     * Re-scrapes are idempotent in Supabase, so this path does not require the
+     * legacy native SQLite module.
+     *
+     * @param param - The applicant data to be persisted.
+     */
+    sendToSink(param) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            const vacancyId = crypto_1.default
+                .createHash("sha1")
+                .update(`${param.portal}${param.applied_for}`)
+                .digest("hex");
+            const identity = (0, candidateIdentity_1.resolveCandidateIdentity)({
+                urlProfile: param.url_profile,
+                vacancyUrl: param.url_profile,
+                email: param.email,
+                phone: (_a = param.contact) === null || _a === void 0 ? void 0 : _a.contact_number,
+                name: param.name,
+                dateOfBirth: param.date_of_birth,
+                education: param.education,
+                workExperience: param.work_experience,
+            });
+            try {
+                const sink = this.getSink();
+                const appliedDate = param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
+                const cvKey = param.cv !== "" ? yield sink.uploadArtifact(param.portal, "cv", param.cv) : null;
+                const photoKey = param.photo !== "" ? yield sink.uploadArtifact(param.portal, "photo", param.photo) : null;
+                const vacancyRowId = yield sink.upsertVacancy({
+                    portal: param.portal,
+                    portal_vacancy_id: vacancyId,
+                    title: param.applied_for,
+                    link: param.url_profile,
+                    status: "new",
+                    raw: { type: param.type },
+                });
+                const candidateRowId = yield sink.upsertCandidate({
+                    portal: param.portal,
+                    portal_candidate_id: identity.portalCandidateId,
+                    email: identity.email,
+                    phone: identity.phone,
+                    name: param.name,
+                    cv_object_key: cvKey,
+                    photo_object_key: photoKey,
+                    data: Object.assign(Object.assign({}, param), { identity: {
+                            source: identity.source,
+                            low_confidence: identity.lowConfidence,
+                            email: identity.email,
+                            phone: identity.phone,
+                        } }),
+                });
+                yield sink.linkApplication(vacancyRowId, candidateRowId, {
+                    applied_for: param.applied_for,
+                    applied_date: appliedDate,
+                });
+                console.info("Success writing applicant to Supabase sink", {
+                    portal: param.portal,
+                    candidate_id: identity.portalCandidateId,
+                    identity_source: identity.source,
+                });
+                this.COLLECTED++;
+            }
+            catch (error) {
+                const sinkError = (0, supabaseSink_1.sanitizeSinkError)(error, "sendToSink");
+                sinkError.portal = param.portal;
+                sinkError.vacancyId = vacancyId;
+                sinkError.candidateId = identity.portalCandidateId;
+                console.error("Error writing to Supabase sink", {
+                    portal: param.portal,
+                    vacancy_id: vacancyId,
+                    candidate_id: identity.portalCandidateId,
+                    identity_source: identity.source,
+                    status: sinkError.status,
+                    error: sinkError.message,
+                });
+                throw sinkError;
             }
         });
     }
@@ -218,7 +366,7 @@ class Glints {
         return __awaiter(this, void 0, void 0, function* () {
             let elementFound = false;
             let startTime = Date.now();
-            const timeout = 30000;
+            const timeout = 300000;
             while (!elementFound && Date.now() - startTime < timeout) {
                 console.info("Checking for lazy-loaded element: %s", locator);
                 const element = page.locator(locator);
@@ -287,16 +435,8 @@ class Glints {
      */
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            try {
-                this.DB = yield this.createDatabaseConnection();
-                console.info("Creating required tables...");
-                yield this.createRequiredTables();
-            }
-            catch (error) {
-                console.error(error);
-                console.log("Failed to create database connection. Exiting...");
-            }
+            var _a, _b;
+            this.getSink();
             const launchOptions = {
                 headless: this.HEADLESS,
                 slowMo: this.SLOWMO,
@@ -402,6 +542,9 @@ class Glints {
                 timeout: this.TIMEOUT,
             });
             yield page.waitForTimeout(3000);
+            if (page.url().includes("/login")) {
+                throw new Error("[GLINTS] Session expired: dashboard redirected to login");
+            }
             // Switch to the correct company before scraping — wrong company returns empty results
             yield this.selectTargetCompany(page);
             // Suppress VIP expired modal via localStorage, then dismiss if already shown
@@ -436,12 +579,13 @@ class Glints {
             if (!jobCardsFound) {
                 const pageText = (_a = (yield page.locator("body").textContent())) === null || _a === void 0 ? void 0 : _a.replace(/\s+/g, " ").trim().slice(0, 500);
                 console.warn(`[GLINTS] Dashboard text while looking for cards: ${pageText}`);
-                console.warn("[GLINTS] No active job cards found on dashboard. All jobs may be closed or account has no active listings.");
-                yield browser.close();
-                console.log("DONE");
-                process.exit(0);
+                throw new Error("[GLINTS] No job cards found after checking all dashboard tabs");
             }
             const listVacancyPage = yield this.ExtractListVacancyPage(page);
+            this.VACANCIES_SEEN = listVacancyPage.length;
+            if (listVacancyPage.length === 0) {
+                throw new Error("[GLINTS] Job cards were visible but none contained a manage-candidates link");
+            }
             for (const it of listVacancyPage) {
                 if (this.COLLECTED == this.LIMIT) {
                     break;
@@ -450,9 +594,12 @@ class Glints {
                 yield page.waitForTimeout(2000);
                 // Skip job if no candidates in this stage
                 if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
+                    console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
                     continue;
                 }
-                if ((yield page.locator('.Polaris-IndexTable__TableRow').count()) === 0) {
+                if ((yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
+                    const pageText = (_b = (yield page.locator("body").textContent())) === null || _b === void 0 ? void 0 : _b.replace(/\s+/g, " ").trim().slice(0, 500);
+                    console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
                     continue;
                 }
                 let isNext = true;
@@ -460,25 +607,30 @@ class Glints {
                     // wait 5 seconds before, avoid rendering list employees
                     yield page.waitForTimeout(5000);
                     // Check for lazy-loaded elements before proceeding
-                    yield this.checkLazyLoadedElement(page, '.Polaris-IndexTable__TableRow');
+                    yield this.checkLazyLoadedElement(page, exports.GLINTS_APPLICANT_ROW_SELECTOR);
                     if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
                         break;
                     }
                     yield this.ExtractApplicantDetail(page, it.title);
                     // Check if there is a next page
-                    isNext = yield page.locator('[data-testid="next-page"]').isDisabled();
+                    const nextPage = page.locator('[data-testid="next-page"]');
+                    isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
                     if (!isNext) {
                         // Click on the "Next" button to move to the next page
-                        yield page.locator('[data-testid="next-page"]').click();
+                        yield nextPage.click();
                     }
                 } while (!isNext && this.COLLECTED < this.LIMIT);
             }
+            yield browser.close();
             console.log("DONE");
-            process.exit();
         });
     }
     /**
      * Extracts and processes applicant details from a table row.
+     *
+     * Rows are processed newest-first within the currently rendered pagination
+     * page only; pages themselves are still visited in the portal's default
+     * order. That per-page scope is the accepted guarantee for this slice.
      *
      * @param page - The Playwright page object representing the web page.
      * @param job - The job title for which the applicant is applying.
@@ -487,73 +639,75 @@ class Glints {
      */
     ExtractApplicantDetail(page, job) {
         return __awaiter(this, void 0, void 0, function* () {
-            const locatorListApplicant = '.Polaris-IndexTable__TableRow';
+            const locatorListApplicant = exports.GLINTS_APPLICANT_ROW_SELECTOR;
             const lv = page.locator(locatorListApplicant);
-            for (let i = 0; i < (yield page.locator(locatorListApplicant).count()); i++) {
+            const rows = yield Promise.all(Array.from({ length: yield lv.count() }, (_, index) => __awaiter(this, void 0, void 0, function* () {
+                return ({
+                    index,
+                    appliedDate: yield this.extractAppliedDate(lv.nth(index)),
+                });
+            })));
+            rows.sort((a, b) => b.appliedDate.localeCompare(a.appliedDate));
+            for (let i = 0; i < rows.length; i++) {
                 if (this.COLLECTED == this.LIMIT) {
                     break;
                 }
-                const element = lv.nth(i);
+                const element = lv.nth(rows[i].index);
+                let photo = "";
+                let cv = "";
                 try {
-                    const photo = yield this.extractPhoto(element);
+                    photo = yield this.extractPhoto(element);
                     const dateOfBirth = yield this.extractDateOfBirth(element);
                     const name = yield this.extractName(element);
                     const gender = yield this.extractGender(element);
                     const location = yield this.extractLocation(element);
                     const salaryExpectation = yield this.extractSalaryExpectation(element);
-                    const appliedDate = yield this.extractAppliedDate(element);
+                    const appliedDate = rows[i].appliedDate;
                     // cell row of applicant
-                    yield Promise.all([
-                        element.locator('.Polaris-IndexTable__TableCell').nth(1).click(),
-                        page.waitForNavigation()
-                    ]);
+                    yield element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
                     const modalDetailButtonBelumSelesai = yield page.getByText('Belum Sesuai', { exact: true });
+                    yield modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
                     const modalDetail = yield modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
                     const skills = yield this.extractSkills(modalDetail);
                     const summary = yield this.extractSummary(modalDetail);
                     const wa = yield this.extractWhatapps(page, modalDetail);
                     const email = yield this.extractEmail(page, modalDetail);
-                    const applicantInDatabase = yield this.getApplicantByEmail(email);
-                    if (applicantInDatabase !== undefined &&
-                        applicantInDatabase.email === email) {
-                        console.info("Applicant already exists in the database. Skipping...");
-                        yield page.keyboard.press('Escape');
-                        continue;
-                    }
-                    else {
-                        const workExperience = yield this.extractWorkExperience(modalDetail);
-                        const education = yield this.extractEducation(modalDetail);
-                        const cv = yield this.extractCV(page);
-                        const applicant = {
-                            portal: "glints",
-                            type: "applicant",
-                            applied_for: job,
-                            applied_date: appliedDate,
-                            name: name,
-                            email: email,
-                            summary: summary,
-                            contact: wa,
-                            date_of_birth: dateOfBirth,
-                            salary_expectation: salaryExpectation,
-                            work_experience: workExperience,
-                            education: education,
-                            skill: skills,
-                            location: location,
-                            gender: gender,
-                            photo: photo,
-                            cv: cv,
-                            url_profile: yield page.url(),
-                        };
-                        yield this.sendRequest(applicant);
-                        yield this.RemoveTempFile(photo);
-                        yield this.RemoveTempFile(cv);
-                        yield page.keyboard.press('Escape');
-                        console.info("collected :", this.COLLECTED);
-                    }
+                    const workExperience = yield this.extractWorkExperience(modalDetail);
+                    const education = yield this.extractEducation(modalDetail);
+                    cv = yield this.extractCV(page);
+                    const applicant = {
+                        portal: "glints",
+                        type: "applicant",
+                        applied_for: job,
+                        applied_date: appliedDate,
+                        name: name,
+                        email: email,
+                        summary: summary,
+                        contact: wa,
+                        date_of_birth: dateOfBirth,
+                        salary_expectation: salaryExpectation,
+                        work_experience: workExperience,
+                        education: education,
+                        skill: skills,
+                        location: location,
+                        gender: gender,
+                        photo: photo,
+                        cv: cv,
+                        url_profile: yield page.url(),
+                    };
+                    yield this.sendToSink(applicant);
+                    yield page.keyboard.press('Escape');
+                    console.info("collected :", this.COLLECTED);
                 }
                 catch (error) {
                     yield page.keyboard.press('Escape');
-                    console.error(error);
+                    console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
+                    if (error instanceof supabaseSink_1.SupabaseSinkError)
+                        throw error;
+                }
+                finally {
+                    yield this.RemoveTempFile(photo);
+                    yield this.RemoveTempFile(cv);
                 }
             }
         });
@@ -577,6 +731,9 @@ class Glints {
             }
         });
     }
+    applicantCells(row) {
+        return row.locator('.Polaris-IndexTable__TableCell, td');
+    }
     /**
      * Extracts and processes the photo URL from a table row.
      *
@@ -588,20 +745,20 @@ class Glints {
         return __awaiter(this, void 0, void 0, function* () {
             let photoPath = "";
             // Check if the photo element exists in the first table cell
-            if ((yield row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//div/span/img').count()) > 0) {
+            if ((yield this.applicantCells(row).nth(1).locator('//div/span/img').count()) > 0) {
                 // Extract the photo URL from the photo element
-                const linkPhoto = yield row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//div/span/img').getAttribute('src');
+                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//div/span/img').getAttribute('src');
                 // If the photo URL is not empty, fetch and store the photo
-                if (linkPhoto != "") {
+                if (linkPhoto) {
                     photoPath = yield this.fetchAndStore(linkPhoto);
                 }
             }
             // Check if the photo element exists in the first table cell
-            if ((yield row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//span/img').count()) > 0) {
+            if ((yield this.applicantCells(row).nth(1).locator('//span/img').count()) > 0) {
                 // Extract the photo URL from the photo element
-                const linkPhoto = yield row.locator('.Polaris-IndexTable__TableCell').nth(1).locator('//span/img').getAttribute('src');
+                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//span/img').getAttribute('src');
                 // If the photo URL is not empty, fetch and store the photo
-                if (linkPhoto != "") {
+                if (linkPhoto) {
                     photoPath = yield this.fetchAndStore(linkPhoto);
                 }
             }
@@ -618,7 +775,8 @@ class Glints {
      */
     extractDateOfBirth(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const age = yield row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[2]/span').textContent();
+            var _a, _b;
+            const age = (_b = (_a = (yield this.applicantCells(row).nth(2).locator('//div[2]/span').textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
             // If the age element is empty, return '0'
             if (age == "") {
                 return "0";
@@ -645,7 +803,7 @@ class Glints {
      */
     extractName(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const elementName = yield row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[1]/span');
+            const elementName = yield this.applicantCells(row).nth(2).locator('//div[1]/span');
             const elementNameCount = yield elementName.count();
             let name = "";
             for (let index = 0; index < elementNameCount; index++) {
@@ -664,7 +822,8 @@ class Glints {
      */
     extractGender(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const genderText = yield row.locator('.Polaris-IndexTable__TableCell').nth(5).textContent();
+            var _a, _b;
+            const genderText = (_b = (_a = (yield this.applicantCells(row).nth(5).textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
             // Mapping Indonesian gender abbreviations to their corresponding values
             const genderType = {
                 'Perempuan': 'FEMALE',
@@ -683,8 +842,9 @@ class Glints {
      */
     extractLocation(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const locationText = yield row.locator('.Polaris-IndexTable__TableCell').nth(2).locator('//div[2]/div').textContent();
-            return locationText.trim();
+            var _a, _b;
+            const locationText = (_b = (_a = (yield this.applicantCells(row).nth(2).locator('//div[2]/div').textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
+            return locationText;
         });
     }
     /**
@@ -697,7 +857,8 @@ class Glints {
      */
     extractSalaryExpectation(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const salaryExpectationText = yield row.locator('.Polaris-IndexTable__TableCell').nth(6).textContent();
+            var _a, _b;
+            const salaryExpectationText = (_b = (_a = (yield this.applicantCells(row).nth(6).textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
             // Handle million (jt) and billion (miliar) units
             if (salaryExpectationText.indexOf("jt") != -1) {
                 // Convert the text to a number and multiply by 1,000,000
@@ -715,7 +876,8 @@ class Glints {
      */
     extractAppliedDate(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const appliedDateTimeText = yield row.locator('.Polaris-IndexTable__TableCell').nth(9).textContent();
+            var _a, _b;
+            const appliedDateTimeText = (_b = (_a = (yield this.applicantCells(row).nth(9).textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
             // Check if dateStr is empty
             if (appliedDateTimeText == "") {
                 return "";
@@ -1172,6 +1334,8 @@ class Glints {
      */
     createDatabaseConnection() {
         return __awaiter(this, void 0, void 0, function* () {
+            const sqliteModule = yield Promise.resolve().then(() => __importStar(require("sqlite3")));
+            const Sqlite = sqliteModule.default;
             /**
              * Create the database file if it does not exist.
              */
@@ -1183,14 +1347,15 @@ class Glints {
              * Open the database connection.
              */
             return new Promise((resolve, reject) => {
-                this.DB = new sqlite3_1.default.Database(this.DB_PATH, (err) => {
+                const database = new Sqlite.Database(this.DB_PATH, (err) => {
                     if (err) {
                         console.error("Error opening database", err.message);
                         reject(err);
                     }
                     else {
                         console.log("Connected to the database.");
-                        resolve(this.DB);
+                        this.DB = database;
+                        resolve(database);
                     }
                 });
             });
@@ -1358,6 +1523,8 @@ class Glints {
      */
     closeDatabaseConnection() {
         return __awaiter(this, void 0, void 0, function* () {
+            if (!this.DB)
+                return;
             return new Promise((resolve, reject) => {
                 this.DB.close((err) => {
                     if (err) {

@@ -9,7 +9,7 @@ Stable internet connection: You'll need an internet connection to download requi
 Installation
 
 Open your terminal: Launch your command prompt (Windows) or terminal (macOS/Linux).
-Install dependencies: Run the following command to install the necessary dependencies for your project:
+Install dependencies: `node_modules/` is not committed to the repository, so this step is required on every fresh checkout (the Docker build below runs it for you):
 ```
 npm install
 ```
@@ -72,7 +72,7 @@ npm run build
 ```
 
 Run with docker: Assuming your have installed docker, run the following command to execute it:
-Build
+Build (the image runs `npm install` during the build, so a checkout without `node_modules/` is all it needs)
 ```
 docker build -t playwright-runner . 
 ```
@@ -97,7 +97,7 @@ Central Supabase Ingestion
 
 Scraped candidates, job vacancies and applications are mirrored into a central Supabase (Postgres) database, on top of the per-portal SQLite databases in `db/`.
 
-Dual-write: each scraper writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
+Dual-write: each scraper except Glints (which writes through the direct Supabase sink described below and is deliberately not mirrored here) writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
 
 IDRKOS cross-check: every candidate is checked against the IDRKOS candidate pool before it lands centrally. A candidate already in IDRKOS is linked through `idrkos_staf_id` and marked `idrkos_verified`; a new candidate (scraped or onboarded through QR) is marked `scraped_new` and prioritised at the top of the talent listings (`scraper.talent_listing`). The check runs against the `cross_check_idrkos_candidate` Postgres function, falling back to the IDRKOS `/talents` API.
 
@@ -222,3 +222,46 @@ npm test
 ```
 
 Runs the Jest test suite.
+
+## Supabase sink
+
+Since the Supabase sink feature, scraped candidates are written straight into
+the scoring Supabase (`src/supabaseSink.ts`) instead of hopping through the
+legacy `api_destination` HTTP endpoint. The glints scraper is the first portal
+wired to it; the other 5 portals (jooble/seek/kitalulus/kitalulus-v2/pintarnya)
+still use `sendRequest` + `api_destination`, which is kept and marked
+deprecated until a follow-up migrates them.
+
+The sink reads its configuration from the environment (via dotenv). Copy
+`.env.sample` to `.env` and fill in:
+
+| Variable | Description |
+| --- | --- |
+| `SCORING_SUPABASE_URL` | PostgREST + Storage base URL of the scoring Supabase |
+| `SCORING_SUPABASE_ANON_KEY` | anon key for the scoring Supabase (RLS-guarded) |
+| `SCORING_SUPABASE_BUCKET` | storage bucket for CVs/photos (default `scrape-artifacts`) |
+
+The `scrape.*` tables and the `scrape-artifacts` bucket are managed under
+[`atlas/`](atlas/) — see [`atlas/README.md`](atlas/README.md) for the full
+migration runbook (Atlas migration + `storage.sql` companion). The same Atlas
+project mirrors the scoring service's `talent_scraping` schema on self-hosted
+Supabase.
+
+Run Glints continuously, newest candidates first, with an env-driven pause
+between idempotent cycles:
+
+```bash
+npm run dev:glints:continuous
+# Production container supervision:
+docker run -d --name scraper-glints --restart always --env-file .env playwright-runner:latest npm run start:glints:continuous
+```
+
+`SCRAPER_INTERVAL_MS` defaults to five minutes. Each cycle also uses the
+exponential retry policy above, so transient browser failures retry before the
+next scheduled cycle.
+
+Glints no longer loads SQLite on its direct Supabase path. Legacy portal paths
+still use the native `sqlite3` dependency; if `node_modules/` was copied from a
+host with a different OS/architecture, reinstall dependencies for the current
+platform or run `npm rebuild sqlite3`. The Docker image installs its own
+dependencies during the build, so rebuilding locally cannot break the container.

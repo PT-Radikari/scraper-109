@@ -23,6 +23,7 @@ const syncRunner_1 = require("./central/syncRunner");
 const portalBridge_1 = require("./central/portalBridge");
 const retry_1 = require("./retry");
 const browserRegistry_1 = require("./browserRegistry");
+const supabaseSink_1 = require("./supabaseSink");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const args = process.argv.slice(2);
@@ -91,8 +92,100 @@ function runPortal(command) {
         }
     });
 }
+/**
+ * Lazily built sink used only to record scrape_runs rows. A missing or broken
+ * sink configuration must never take down the continuous loop, so failures
+ * here are logged and recording is skipped for the cycle.
+ */
+let runRecordingSink;
+function getRunRecordingSink() {
+    if (runRecordingSink === undefined) {
+        try {
+            runRecordingSink = new supabaseSink_1.SupabaseSink();
+        }
+        catch (error) {
+            console.warn("[scheduler] scrape_runs recording disabled:", error instanceof Error ? error.message : error);
+            runRecordingSink = null;
+        }
+    }
+    return runRecordingSink;
+}
+/**
+ * Runs a portal forever, waiting between complete cycles. Each cycle retains
+ * the normal attempt-level exponential backoff, and an exhausted cycle starts
+ * fresh after SCRAPER_INTERVAL_MS instead of terminating the service.
+ *
+ * Every cycle writes one row to scrape.scrape_runs: opened before the first
+ * attempt, closed with the final status, counts of the last attempt and the
+ * error that exhausted the budget (if any).
+ */
+function runContinuousPortal(command) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        const rawInterval = Number((_a = process.env.SCRAPER_INTERVAL_MS) !== null && _a !== void 0 ? _a : 300000);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+            ? rawInterval
+            : 300000;
+        for (;;) {
+            const config = (0, retry_1.loadRetryConfig)();
+            const cycle = { scraper: null };
+            const runner = command === "glints"
+                ? () => {
+                    cycle.scraper = new glints_1.Glints(glintsJson);
+                    return cycle.scraper.Scrape();
+                }
+                : portalRunners[command];
+            const sink = getRunRecordingSink();
+            let runId = null;
+            if (sink) {
+                try {
+                    runId = yield sink.recordRunStart(command, "continuous");
+                }
+                catch (error) {
+                    console.warn(`[scheduler] failed to record ${command} run start`, error);
+                }
+            }
+            let cycleError = null;
+            try {
+                yield (0, retry_1.runWithRetry)(command, runner, {
+                    config,
+                    cleanup: browserRegistry_1.closeTrackedBrowsers,
+                });
+            }
+            catch (error) {
+                cycleError = error;
+                console.error(`${command} cycle exhausted its attempt budget`, error);
+            }
+            finally {
+                yield (0, portalBridge_1.closeIngestionService)();
+            }
+            if (sink && runId !== null) {
+                try {
+                    yield sink.recordRunEnd(runId, {
+                        status: cycleError ? "failed" : "success",
+                        error: cycleError
+                            ? cycleError instanceof Error
+                                ? cycleError.message
+                                : String(cycleError)
+                            : null,
+                        vacancies_seen: cycle.scraper ? cycle.scraper.getVacanciesSeen() : null,
+                        candidates_seen: cycle.scraper ? cycle.scraper.getCollectedCount() : null,
+                    });
+                }
+                catch (error) {
+                    console.warn(`[scheduler] failed to record ${command} run end`, error);
+                }
+            }
+            console.info(`[scheduler] ${command}: next newest-first cycle in ${intervalMs}ms`);
+            yield new Promise((resolve) => setTimeout(resolve, intervalMs));
+        }
+    });
+}
 const command = args[0];
-if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
+if (command === "glints-continuous") {
+    void runContinuousPortal("glints");
+}
+else if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
     void runPortal(command);
 }
 else {

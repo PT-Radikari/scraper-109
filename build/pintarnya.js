@@ -838,7 +838,7 @@ class Pintarnya {
                 const name = (_a = d.fullname) !== null && _a !== void 0 ? _a : '';
                 const phone = ((_b = d.contact_phone) !== null && _b !== void 0 ? _b : '').replace(/^\+/, '');
                 const email = (_c = d.email) !== null && _c !== void 0 ? _c : '';
-                const dedupeKey = phone || email;
+                const dedupeKey = email || phone;
                 console.info(`[CANDIDATE] Name: ${name}, phone: ${phone}, email: ${email}`);
                 if (!dedupeKey) {
                     console.info(`[SKIP] No contact info for ${name}.`);

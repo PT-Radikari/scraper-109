@@ -9,6 +9,7 @@ import { CentralSyncRunner, startCentralSyncDaemon } from "./central/syncRunner"
 import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
+import { SupabaseSink } from "./supabaseSink";
 import fs from "fs";
 import path from "path";
 
@@ -87,9 +88,103 @@ async function runPortal(command: string): Promise<void> {
   }
 }
 
+/**
+ * Lazily built sink used only to record scrape_runs rows. A missing or broken
+ * sink configuration must never take down the continuous loop, so failures
+ * here are logged and recording is skipped for the cycle.
+ */
+let runRecordingSink: SupabaseSink | null | undefined;
+
+function getRunRecordingSink(): SupabaseSink | null {
+  if (runRecordingSink === undefined) {
+    try {
+      runRecordingSink = new SupabaseSink();
+    } catch (error) {
+      console.warn(
+        "[scheduler] scrape_runs recording disabled:",
+        error instanceof Error ? error.message : error,
+      );
+      runRecordingSink = null;
+    }
+  }
+  return runRecordingSink;
+}
+
+/**
+ * Runs a portal forever, waiting between complete cycles. Each cycle retains
+ * the normal attempt-level exponential backoff, and an exhausted cycle starts
+ * fresh after SCRAPER_INTERVAL_MS instead of terminating the service.
+ *
+ * Every cycle writes one row to scrape.scrape_runs: opened before the first
+ * attempt, closed with the final status, counts of the last attempt and the
+ * error that exhausted the budget (if any).
+ */
+async function runContinuousPortal(command: string): Promise<void> {
+  const rawInterval = Number(process.env.SCRAPER_INTERVAL_MS ?? 300000);
+  const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
+    ? rawInterval
+    : 300000;
+
+  for (;;) {
+    const config = loadRetryConfig();
+    const cycle: { scraper: Glints | null } = { scraper: null };
+    const runner = command === "glints"
+      ? () => {
+          cycle.scraper = new Glints(glintsJson);
+          return cycle.scraper.Scrape();
+        }
+      : portalRunners[command];
+
+    const sink = getRunRecordingSink();
+    let runId: number | null = null;
+    if (sink) {
+      try {
+        runId = await sink.recordRunStart(command, "continuous");
+      } catch (error) {
+        console.warn(`[scheduler] failed to record ${command} run start`, error);
+      }
+    }
+
+    let cycleError: unknown = null;
+    try {
+      await runWithRetry(command, runner, {
+        config,
+        cleanup: closeTrackedBrowsers,
+      });
+    } catch (error) {
+      cycleError = error;
+      console.error(`${command} cycle exhausted its attempt budget`, error);
+    } finally {
+      await closeIngestionService();
+    }
+
+    if (sink && runId !== null) {
+      try {
+        await sink.recordRunEnd(runId, {
+          status: cycleError ? "failed" : "success",
+          error: cycleError
+            ? cycleError instanceof Error
+              ? cycleError.message
+              : String(cycleError)
+            : null,
+          vacancies_seen: cycle.scraper ? cycle.scraper.getVacanciesSeen() : null,
+          candidates_seen: cycle.scraper ? cycle.scraper.getCollectedCount() : null,
+        });
+      } catch (error) {
+        console.warn(`[scheduler] failed to record ${command} run end`, error);
+      }
+    }
+
+    console.info(`[scheduler] ${command}: next newest-first cycle in ${intervalMs}ms`);
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 const command = args[0];
 
-if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
+if (command === "glints-continuous") {
+  void runContinuousPortal("glints");
+} else if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
   void runPortal(command);
 } else {
   switch (command) {

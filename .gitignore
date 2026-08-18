@@ -21,13 +21,15 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
-# Local SQLite outbox of the central ingestion
-db/central.db
-db/central.db-journal
+# Runtime-created local SQLite databases (Supabase upserts are the dedupe authority)
+db/*.db
+db/*.db-journal
 
 # Local environment
 .env
+.env.local
 
 .playwright-mcp/
 node-modules/
+node_modules/
 logs/
