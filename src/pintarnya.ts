@@ -1261,7 +1261,7 @@ export class Pintarnya {
       const name: string = d.fullname ?? '';
       const phone: string = (d.contact_phone ?? '').replace(/^\+/, '');
       const email: string = d.email ?? '';
-      const dedupeKey = phone || email;
+      const dedupeKey = email || phone;
 
       console.info(`[CANDIDATE] Name: ${name}, phone: ${phone}, email: ${email}`);
 

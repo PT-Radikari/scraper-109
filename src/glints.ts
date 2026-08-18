@@ -171,6 +171,7 @@ export class Glints {
     if (!this.TARGETCOMPANY) return;
 
     const TARGET = this.TARGETCOMPANY;
+    const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
     const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
@@ -182,7 +183,7 @@ export class Glints {
     // The current company name is displayed in a paragraph adjacent to the combobox.
     // When the dropdown is closed there is no visible option list, so this paragraph is the only
     // occurrence of the company name on the page.
-    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET}$`) });
+    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
     if (await alreadySelected.count() > 0) {
       console.info(`[GLINTS] Company already set to: ${TARGET}`);
       return;
@@ -199,7 +200,7 @@ export class Glints {
     if (await optionByRole.count() > 0) {
       await optionByRole.click();
     } else {
-      await page.locator('div').filter({ hasText: new RegExp(`^${TARGET}$`) }).last().click();
+      await page.locator('div').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) }).last().click();
     }
 
     // Wait for the page to reload with the new company's data
@@ -318,7 +319,7 @@ export class Glints {
   async checkLazyLoadedElement(page: any, locator: string): Promise<boolean> {
     let elementFound = false;
     let startTime = Date.now();
-    const timeout = 30000;
+    const timeout = 300000;
 
     while (!elementFound && Date.now() - startTime < timeout) {
       console.info("Checking for lazy-loaded element: %s", locator);
