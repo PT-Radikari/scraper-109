@@ -8,6 +8,7 @@ import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
+import { resolveCandidateIdentity } from "./candidateIdentity";
 
 /**
  * Represents a cookie.
@@ -301,8 +302,10 @@ export class Glints {
    *   2. Upserts a synthesized vacancy row. glints carries no explicit
    *      vacancy_id on every applicant, so the key falls back to
    *      sha1(portal + applied_for).
-   *   3. Upserts the candidate, keyed by sha1 of the email, falling back to
-   *      sha1 of the profile URL when the modal exposes no email.
+   *   3. Upserts the candidate, keyed through resolveCandidateIdentity():
+   *      normalized email, then normalized phone, then a low-confidence
+   *      fingerprint. url_profile here is the shared vacancy page URL, so it
+   *      is never used as a candidate identity.
    *   4. Links the application to the vacancy/candidate pair.
    * Re-scrapes are idempotent in Supabase, so this path does not require the
    * legacy native SQLite module.
@@ -310,17 +313,22 @@ export class Glints {
    * @param param - The applicant data to be persisted.
    */
   async sendToSink(param: Applicant): Promise<void> {
+    const vacancyId = crypto
+      .createHash("sha1")
+      .update(`${param.portal}${param.applied_for}`)
+      .digest("hex");
+    const identity = resolveCandidateIdentity({
+      urlProfile: param.url_profile,
+      vacancyUrl: param.url_profile,
+      email: param.email,
+      phone: param.contact?.contact_number,
+      name: param.name,
+      dateOfBirth: param.date_of_birth,
+      education: param.education,
+      workExperience: param.work_experience,
+    });
     try {
       const sink = this.getSink();
-      const vacancyId = crypto
-        .createHash("sha1")
-        .update(`${param.portal}${param.applied_for}`)
-        .digest("hex");
-      const email = (param.email ?? "").trim();
-      const candidateKeySource = email !== "" ? email : param.url_profile;
-      const candidateId = candidateKeySource
-        ? crypto.createHash("sha1").update(candidateKeySource).digest("hex")
-        : null;
       const appliedDate =
         param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
 
@@ -338,12 +346,21 @@ export class Glints {
 
       const candidateRowId = await sink.upsertCandidate({
         portal: param.portal,
-        portal_candidate_id: candidateId,
-        email: email !== "" ? email : null,
+        portal_candidate_id: identity.portalCandidateId,
+        email: identity.email,
+        phone: identity.phone,
         name: param.name,
         cv_object_key: cvKey,
         photo_object_key: photoKey,
-        data: { ...param },
+        data: {
+          ...param,
+          identity: {
+            source: identity.source,
+            low_confidence: identity.lowConfidence,
+            email: identity.email,
+            phone: identity.phone,
+          },
+        },
       });
 
       await sink.linkApplication(vacancyRowId, candidateRowId, {
@@ -351,12 +368,31 @@ export class Glints {
         applied_date: appliedDate,
       });
 
-      console.info("Success writing applicant to Supabase sink", param.email);
+      console.info("Success writing applicant to Supabase sink", {
+        portal: param.portal,
+        candidate_id: identity.portalCandidateId,
+        identity_source: identity.source,
+      });
       this.COLLECTED++;
     } catch (error) {
-      console.info("Error writing applicant to Supabase sink", param);
-      console.error("Error writing to Supabase sink with error:", error);
-      console.error("Error writing to Supabase sink with response:", (error as any).response?.data);
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      const message = axios.isAxiosError(error)
+        ? (error.response?.data as { message?: string } | undefined)?.message ?? error.message
+        : error instanceof Error
+          ? error.message
+          : String(error);
+      console.error("Error writing to Supabase sink", {
+        portal: param.portal,
+        vacancy_id: vacancyId,
+        candidate_id: identity.portalCandidateId,
+        identity_source: identity.source,
+        status,
+        error: message,
+      });
+      if (axios.isAxiosError(error)) {
+        if (error.config) delete error.config.data;
+        delete (error as { request?: unknown }).request;
+      }
       throw error;
     }
   }

@@ -35,6 +35,12 @@ export interface CandidateInput {
   portal: string;
   portal_candidate_id?: string | null;
   email?: string | null;
+  /**
+   * Normalized phone, used only to cross-check the dedupe lookup against
+   * `data->identity->>phone` of existing rows. Not a table column; stripped
+   * from the insert payload.
+   */
+  phone?: string | null;
   name?: string | null;
   cv_object_key?: string | null;
   photo_object_key?: string | null;
@@ -149,30 +155,78 @@ export class SupabaseSink {
   }
 
   /**
-   * Upserts one candidate, deduped on (portal, portal_candidate_id) with a
-   * fallback to (portal, email) when the portal candidate id is missing.
-   * A 409 raised by the sibling UNIQUE (portal, email) constraint — rows keyed
-   * by an older build under a different portal_candidate_id — resolves to the
-   * existing email row and refreshes only last_seen_at instead of failing.
+   * Looks for an existing candidate row by, in order, the selected portal
+   * candidate id, the normalized email, then the normalized phone recorded in
+   * the row's `data->identity` metadata. Cross-checking all three keeps one
+   * person on one row when re-scrapes surface different identifiers.
+   */
+  private async findExistingCandidateId(
+    portal: string,
+    portalCandidateId: string | null,
+    email: string | null,
+    phone: string | null,
+  ): Promise<number | null> {
+    const filterSets: Record<string, string>[] = [];
+    if (portalCandidateId) {
+      filterSets.push({ portal: `eq.${portal}`, portal_candidate_id: `eq.${portalCandidateId}` });
+    }
+    if (email) {
+      filterSets.push({ portal: `eq.${portal}`, email: `eq.${email}` });
+    }
+    if (phone) {
+      filterSets.push({ portal: `eq.${portal}`, "data->identity->>phone": `eq.${phone}` });
+    }
+    for (const filters of filterSets) {
+      const response = await axios.get(`${this.url}/rest/v1/portal_candidates`, {
+        headers: this.headers(),
+        params: { select: "id", limit: 1, ...filters },
+      });
+      if (response.data[0]) return Number(response.data[0].id);
+    }
+    return null;
+  }
+
+  /**
+   * Upserts one candidate. Before inserting, existing rows are looked up by
+   * portal candidate id, normalized email, and normalized phone so the same
+   * person neither 409s nor forks when identifiers vary between scrapes.
+   * Inserts dedupe on (portal, portal_candidate_id), falling back to
+   * (portal, email) when the portal candidate id is missing; a 409 raised by
+   * the sibling UNIQUE constraint resolves back through the same lookup.
+   * Existing rows only get a last_seen_at refresh, preserving write-once
+   * content.
    * @returns the numeric id of the (inserted or existing) row.
    */
   async upsertCandidate(c: CandidateInput): Promise<number> {
     const email = c.email || null;
-    if (!c.portal_candidate_id && !email) {
+    const phone = c.phone || null;
+    const portalCandidateId = c.portal_candidate_id || null;
+    if (!portalCandidateId && !email) {
       throw new Error("SupabaseSink: candidate requires portal_candidate_id or email");
     }
-    const onConflict =
-      c.portal_candidate_id && c.portal_candidate_id.length > 0
-        ? "portal,portal_candidate_id"
-        : "portal,email";
 
+    const touch = async (id: number): Promise<number> => {
+      await axios.patch(
+        `${this.url}/rest/v1/portal_candidates?id=eq.${id}`,
+        { last_seen_at: new Date().toISOString() },
+        { headers: this.headers({ Prefer: "return=minimal" }) },
+      );
+      return id;
+    };
+
+    const existingId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+    if (existingId !== null) {
+      return touch(existingId);
+    }
+
+    const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
+    const { phone: _phone, ...columns } = c;
     const candidate = {
-      ...c,
-      portal_candidate_id: c.portal_candidate_id || null,
+      ...columns,
+      portal_candidate_id: portalCandidateId,
       email,
     };
     let inserted: { id: number } | undefined;
-    let emailConflict = false;
     try {
       const response = await axios.post(
         `${this.url}/rest/v1/portal_candidates`,
@@ -187,23 +241,19 @@ export class SupabaseSink {
       inserted = response.data[0];
     } catch (error) {
       const status = axios.isAxiosError(error) ? error.response?.status : undefined;
-      if (status !== 409 || !email) throw error;
-      emailConflict = true;
+      if (status !== 409) throw error;
+      const conflictId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+      if (conflictId === null) throw error;
+      return touch(conflictId);
     }
-    const filters: Record<string, string> =
-      c.portal_candidate_id && !emailConflict
-        ? { portal: `eq.${c.portal}`, portal_candidate_id: `eq.${c.portal_candidate_id}` }
-        : { portal: `eq.${c.portal}`, email: `eq.${email}` };
-    const id = inserted
-      ? Number(inserted.id)
-      : await this.findId("portal_candidates", filters);
-
-    await axios.patch(
-      `${this.url}/rest/v1/portal_candidates?id=eq.${id}`,
-      { last_seen_at: new Date().toISOString() },
-      { headers: this.headers({ Prefer: "return=minimal" }) },
-    );
-    return id;
+    if (inserted) {
+      return touch(Number(inserted.id));
+    }
+    const raceId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+    if (raceId === null) {
+      throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
+    }
+    return touch(raceId);
   }
 
   /**

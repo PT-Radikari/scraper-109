@@ -30,7 +30,7 @@ describe("SupabaseSink", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockedAxios.post.mockResolvedValue({ data: [{ id: 1 }] } as never);
-    mockedAxios.get.mockResolvedValue({ data: [{ id: 1 }] } as never);
+    mockedAxios.get.mockResolvedValue({ data: [] } as never);
     mockedAxios.patch.mockResolvedValue({ data: [{ id: 1 }] } as never);
   });
 
@@ -196,6 +196,93 @@ describe("SupabaseSink", () => {
       ).rejects.toThrow(/portal_candidate_id or email/);
     });
 
+    it("reuses a row found by portal candidate id without re-posting content", async () => {
+      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 3 }] } as never);
+      const sink = buildSink();
+
+      const id = await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-1",
+        email: "a@b.c",
+        name: "Ada Updated",
+      });
+
+      expect(id).toBe(3);
+      expect(mockedAxios.post).not.toHaveBeenCalled();
+      expect(mockedAxios.patch).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.3`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
+    });
+
+    it("cross-checks the normalized email when the portal id lookup misses", async () => {
+      mockedAxios.get
+        .mockResolvedValueOnce({ data: [] } as never)
+        .mockResolvedValueOnce({ data: [{ id: 5 }] } as never);
+      const sink = buildSink();
+
+      const id = await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "new-key",
+        email: "a@b.c",
+      });
+
+      expect(id).toBe(5);
+      expect(mockedAxios.post).not.toHaveBeenCalled();
+      expect(mockedAxios.get).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_candidates`,
+        expect.objectContaining({
+          params: { select: "id", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
+        })
+      );
+    });
+
+    it("cross-checks the normalized phone via identity metadata", async () => {
+      mockedAxios.get
+        .mockResolvedValueOnce({ data: [] } as never)
+        .mockResolvedValueOnce({ data: [{ id: 6 }] } as never);
+      const sink = buildSink();
+
+      const id = await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "phone-key",
+        phone: "628123456789",
+      });
+
+      expect(id).toBe(6);
+      expect(mockedAxios.post).not.toHaveBeenCalled();
+      expect(mockedAxios.get).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_candidates`,
+        expect.objectContaining({
+          params: {
+            select: "id",
+            limit: 1,
+            portal: "eq.glints",
+            "data->identity->>phone": "eq.628123456789",
+          },
+        })
+      );
+    });
+
+    it("strips the lookup-only phone field from the insert payload", async () => {
+      const sink = buildSink();
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-7",
+        email: "a@b.c",
+        phone: "628123456789",
+        name: "Ada",
+      });
+
+      expectPost(
+        `${URL}/rest/v1/portal_candidates`,
+        { Prefer: "resolution=ignore-duplicates, return=representation" },
+        { on_conflict: "portal,portal_candidate_id" },
+        [{ portal: "glints", portal_candidate_id: "c-7", email: "a@b.c", name: "Ada" }]
+      );
+    });
+
     it("recovers from a legacy cross-constraint 409 via the (portal, email) row", async () => {
       mockedAxios.post.mockRejectedValueOnce({
         isAxiosError: true,
@@ -205,7 +292,11 @@ describe("SupabaseSink", () => {
         },
       });
       mockedAxios.isAxiosError.mockReturnValueOnce(true);
-      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 7 }] } as never);
+      mockedAxios.get
+        .mockResolvedValueOnce({ data: [] } as never)
+        .mockResolvedValueOnce({ data: [] } as never)
+        .mockResolvedValueOnce({ data: [] } as never)
+        .mockResolvedValueOnce({ data: [{ id: 7 }] } as never);
       const sink = buildSink();
 
       const id = await sink.upsertCandidate({
@@ -228,7 +319,7 @@ describe("SupabaseSink", () => {
       );
     });
 
-    it("rethrows a 409 when the candidate has no email to fall back to", async () => {
+    it("rethrows a 409 when no existing candidate row is resolvable", async () => {
       mockedAxios.post.mockRejectedValueOnce({
         isAxiosError: true,
         response: { status: 409, data: {} },

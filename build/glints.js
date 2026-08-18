@@ -45,6 +45,7 @@ const path_1 = __importDefault(require("path"));
 const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
 const supabaseSink_1 = require("./supabaseSink");
+const candidateIdentity_1 = require("./candidateIdentity");
 exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
 class Glints {
     /**
@@ -218,8 +219,10 @@ class Glints {
      *   2. Upserts a synthesized vacancy row. glints carries no explicit
      *      vacancy_id on every applicant, so the key falls back to
      *      sha1(portal + applied_for).
-     *   3. Upserts the candidate, keyed by sha1 of the email, falling back to
-     *      sha1 of the profile URL when the modal exposes no email.
+     *   3. Upserts the candidate, keyed through resolveCandidateIdentity():
+     *      normalized email, then normalized phone, then a low-confidence
+     *      fingerprint. url_profile here is the shared vacancy page URL, so it
+     *      is never used as a candidate identity.
      *   4. Links the application to the vacancy/candidate pair.
      * Re-scrapes are idempotent in Supabase, so this path does not require the
      * legacy native SQLite module.
@@ -228,18 +231,23 @@ class Glints {
      */
     sendToSink(param) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
+            var _a, _b, _c, _d, _e;
+            const vacancyId = crypto_1.default
+                .createHash("sha1")
+                .update(`${param.portal}${param.applied_for}`)
+                .digest("hex");
+            const identity = (0, candidateIdentity_1.resolveCandidateIdentity)({
+                urlProfile: param.url_profile,
+                vacancyUrl: param.url_profile,
+                email: param.email,
+                phone: (_a = param.contact) === null || _a === void 0 ? void 0 : _a.contact_number,
+                name: param.name,
+                dateOfBirth: param.date_of_birth,
+                education: param.education,
+                workExperience: param.work_experience,
+            });
             try {
                 const sink = this.getSink();
-                const vacancyId = crypto_1.default
-                    .createHash("sha1")
-                    .update(`${param.portal}${param.applied_for}`)
-                    .digest("hex");
-                const email = ((_a = param.email) !== null && _a !== void 0 ? _a : "").trim();
-                const candidateKeySource = email !== "" ? email : param.url_profile;
-                const candidateId = candidateKeySource
-                    ? crypto_1.default.createHash("sha1").update(candidateKeySource).digest("hex")
-                    : null;
                 const appliedDate = param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
                 const cvKey = param.cv !== "" ? yield sink.uploadArtifact(param.portal, "cv", param.cv) : null;
                 const photoKey = param.photo !== "" ? yield sink.uploadArtifact(param.portal, "photo", param.photo) : null;
@@ -253,24 +261,50 @@ class Glints {
                 });
                 const candidateRowId = yield sink.upsertCandidate({
                     portal: param.portal,
-                    portal_candidate_id: candidateId,
-                    email: email !== "" ? email : null,
+                    portal_candidate_id: identity.portalCandidateId,
+                    email: identity.email,
+                    phone: identity.phone,
                     name: param.name,
                     cv_object_key: cvKey,
                     photo_object_key: photoKey,
-                    data: Object.assign({}, param),
+                    data: Object.assign(Object.assign({}, param), { identity: {
+                            source: identity.source,
+                            low_confidence: identity.lowConfidence,
+                            email: identity.email,
+                            phone: identity.phone,
+                        } }),
                 });
                 yield sink.linkApplication(vacancyRowId, candidateRowId, {
                     applied_for: param.applied_for,
                     applied_date: appliedDate,
                 });
-                console.info("Success writing applicant to Supabase sink", param.email);
+                console.info("Success writing applicant to Supabase sink", {
+                    portal: param.portal,
+                    candidate_id: identity.portalCandidateId,
+                    identity_source: identity.source,
+                });
                 this.COLLECTED++;
             }
             catch (error) {
-                console.info("Error writing applicant to Supabase sink", param);
-                console.error("Error writing to Supabase sink with error:", error);
-                console.error("Error writing to Supabase sink with response:", (_b = error.response) === null || _b === void 0 ? void 0 : _b.data);
+                const status = axios_1.default.isAxiosError(error) ? (_b = error.response) === null || _b === void 0 ? void 0 : _b.status : undefined;
+                const message = axios_1.default.isAxiosError(error)
+                    ? (_e = (_d = (_c = error.response) === null || _c === void 0 ? void 0 : _c.data) === null || _d === void 0 ? void 0 : _d.message) !== null && _e !== void 0 ? _e : error.message
+                    : error instanceof Error
+                        ? error.message
+                        : String(error);
+                console.error("Error writing to Supabase sink", {
+                    portal: param.portal,
+                    vacancy_id: vacancyId,
+                    candidate_id: identity.portalCandidateId,
+                    identity_source: identity.source,
+                    status,
+                    error: message,
+                });
+                if (axios_1.default.isAxiosError(error)) {
+                    if (error.config)
+                        delete error.config.data;
+                    delete error.request;
+                }
                 throw error;
             }
         });
