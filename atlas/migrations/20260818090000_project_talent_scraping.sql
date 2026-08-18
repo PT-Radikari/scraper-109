@@ -115,6 +115,14 @@ BEGIN
 END;
 $$;
 
+-- The projection functions are trigger-only. Without these revokes the default
+-- PUBLIC EXECUTE grant would let any anon-key holder invoke the SECURITY
+-- DEFINER function through PostgREST RPC with a fabricated row and rewrite
+-- arbitrary talent_scraping rows. Triggers fire regardless of the caller's
+-- EXECUTE rights on the trigger function.
+REVOKE ALL ON FUNCTION "scrape"."project_candidate_to_talent"("scrape"."portal_candidates") FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION "scrape"."project_candidate_trigger"() FROM PUBLIC, anon;
+
 -- The refresh PATCH touches only last_seen_at, so re-scrapes of an existing
 -- candidate do not re-run the projection; new candidates and any future
 -- service-role data corrections do.

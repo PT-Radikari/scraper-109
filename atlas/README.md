@@ -29,6 +29,16 @@ are SQL additions that Atlas HCL does not model; after editing a generated
 migration, always run `atlas migrate hash` before validation. Migration lint is
 an Atlas Pro command in Atlas 0.38 and newer and requires `atlas login`.
 
+The talent_scraping projection objects (the `scrape.talent_work_experience_id_seq`
+sequence, both `project_candidate_*` functions, and the
+`portal_candidates_project_talent` trigger) are modeled in `schema.hcl` so the
+desired state stays the single source of truth and `migrate diff` can never
+propose dropping them. Because sequences/functions/triggers are logged-in Atlas
+features, `atlas migrate diff` on this project also requires `atlas login`; it
+fails loudly without it instead of silently omitting the projection objects.
+`atlas migrate hash` and `atlas migrate validate --dir file://migrations` work
+without login.
+
 ## Apply
 
 Set `DATABASE_URL` to the self-hosted Supabase Postgres service-role connection

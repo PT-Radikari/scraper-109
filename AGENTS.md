@@ -7,6 +7,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 ## Sharp edges
 
 - `node_modules/` is **no longer committed** (ignored and untracked as of scraper-109): run `npm install` on a fresh checkout, and the Docker build installs dependencies itself before `npm run build`. A pre-existing checkout may still carry a `sqlite3` native binding built for a different platform (the docker deployment targets Linux x86-64); on such a host every module that reaches `require("sqlite3")` fails to load, so the scraper test suites (`tests/jooble.test.ts`, `tests/kitalulus.test.ts`, ...) cannot run there until the binding is rebuilt locally.
+- The per-portal SQLite files under `db/` are likewise runtime-created, git-ignored, and excluded from Docker images: the scoring Supabase's unique-constraint upserts are the dedupe authority, and a legacy portal starting from an empty local database may re-POST previously seen applicants to `api_destination` once (see `db/README.md`).
 - Because of the above, code that needs SQLite should load it lazily and sit behind an interface. `src/central/store.ts` is that interface; `LocalStore` is the SQLite implementation and `InMemoryStore` the portable one, and `tests/central/localStore.test.ts` runs the same contract against both (skipping the SQLite half when the binding will not load).
 - The scrapers build their SQL by string interpolation. Anything new should use bound parameters, as `src/central/localStore.ts` does.
 

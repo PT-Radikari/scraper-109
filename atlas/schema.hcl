@@ -10,6 +10,13 @@
 //
 // The schema block below is intentionally limited to giving these four
 // modeled tables an explicit schema owner (`scrape`).
+//
+// The talent_scraping projection objects (sequence, SECURITY DEFINER
+// functions, trigger) are modeled at the bottom of this file so Atlas desired
+// state stays the single source of truth and `migrate diff` can never propose
+// dropping them. Sequences/functions/triggers are logged-in Atlas features:
+// `atlas migrate diff` on this project requires `atlas login` and fails
+// loudly without it rather than silently ignoring these objects.
 
 schema "scrape" {
 }
@@ -340,5 +347,129 @@ table "talent_work_experience" {
   foreign_key "talent_work_experience_talent_scraping_id_fkey" {
     columns     = [column.talent_scraping_id]
     ref_columns = [table.talent_scraping.column.talent_scraping_id]
+  }
+}
+
+sequence "talent_work_experience_id_seq" {
+  schema = schema.scrape
+  type   = integer
+}
+
+function "project_candidate_to_talent" {
+  schema = schema.scrape
+  lang   = PLpgSQL
+  arg "c" {
+    type = sql("scrape.portal_candidates")
+  }
+  return      = void
+  security    = DEFINER
+  as          = <<-SQL
+  DECLARE
+    d jsonb := COALESCE(c.data, '{}'::jsonb);
+    first_education jsonb := CASE
+      WHEN jsonb_typeof(d -> 'education') = 'array' THEN d -> 'education' -> 0
+      ELSE NULL
+    END;
+    skills text[] := CASE
+      WHEN jsonb_typeof(d -> 'skill') = 'array'
+        THEN ARRAY(SELECT jsonb_array_elements_text(d -> 'skill'))
+      ELSE '{}'::text[]
+    END;
+    birth date := CASE
+      WHEN d ->> 'date_of_birth' ~ '^\d{4}-\d{2}-\d{2}$'
+        THEN (d ->> 'date_of_birth')::date
+      ELSE NULL
+    END;
+    graduate smallint := CASE
+      WHEN first_education ->> 'period_end_year' ~ '^\d{4}$'
+        THEN (first_education ->> 'period_end_year')::smallint
+      ELSE NULL
+    END;
+    we jsonb;
+  BEGIN
+    INSERT INTO "talent_scraping"."talent_scraping" (
+      "talent_scraping_id", "name", "birth_date", "email", "phone_number",
+      "address", "education_level", "education_name", "major", "year_graduate",
+      "candidate_skills", "updated_at"
+    ) VALUES (
+      c.id::integer,
+      COALESCE(NULLIF(c.name, ''), c.email, ''),
+      birth,
+      c.email,
+      NULLIF(d #>> '{contact,contact_number}', ''),
+      NULLIF(d ->> 'location', ''),
+      NULLIF(first_education ->> 'education', ''),
+      NULLIF(first_education ->> 'institution', ''),
+      NULL,
+      graduate,
+      skills,
+      now()
+    )
+    ON CONFLICT ("talent_scraping_id") DO UPDATE SET
+      "name" = EXCLUDED."name",
+      "birth_date" = EXCLUDED."birth_date",
+      "email" = EXCLUDED."email",
+      "phone_number" = EXCLUDED."phone_number",
+      "address" = EXCLUDED."address",
+      "education_level" = EXCLUDED."education_level",
+      "education_name" = EXCLUDED."education_name",
+      "major" = EXCLUDED."major",
+      "year_graduate" = EXCLUDED."year_graduate",
+      "candidate_skills" = EXCLUDED."candidate_skills",
+      "updated_at" = now();
+
+    DELETE FROM "talent_scraping"."talent_work_experience"
+    WHERE "talent_scraping_id" = c.id::integer;
+
+    IF jsonb_typeof(d -> 'work_experience') = 'array' THEN
+      FOR we IN SELECT * FROM jsonb_array_elements(d -> 'work_experience') LOOP
+        INSERT INTO "talent_scraping"."talent_work_experience" (
+          "talent_work_experience_id", "talent_scraping_id", "company_name",
+          "position_title", "work_start_date", "work_end_date", "work_description"
+        ) VALUES (
+          nextval('scrape.talent_work_experience_id_seq')::integer,
+          c.id::integer,
+          NULLIF(we ->> 'organization', ''),
+          NULLIF(we ->> 'position', ''),
+          CASE
+            WHEN we ->> 'period_from' ~ '^\d{4}-\d{2}-\d{2}$'
+              THEN (we ->> 'period_from')::date
+            ELSE NULL
+          END,
+          CASE
+            WHEN we ->> 'period_to' ~ '^\d{4}-\d{2}-\d{2}$'
+              THEN (we ->> 'period_to')::date
+            ELSE NULL
+          END,
+          NULLIF(we ->> 'job_desc', '')
+        );
+      END LOOP;
+    END IF;
+  END;
+  SQL
+}
+
+function "project_candidate_trigger" {
+  schema = schema.scrape
+  lang   = PLpgSQL
+  return      = trigger
+  security    = DEFINER
+  as          = <<-SQL
+  BEGIN
+    PERFORM "scrape"."project_candidate_to_talent"(NEW);
+    RETURN NEW;
+  END;
+  SQL
+}
+
+trigger "portal_candidates_project_talent" {
+  on = table.portal_candidates
+  after {
+    insert    = true
+    update_of = [table.portal_candidates.column.data]
+  }
+  for = ROW
+  execute {
+    function = function.project_candidate_trigger
   }
 }
