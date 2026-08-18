@@ -23,13 +23,55 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.SupabaseSink = void 0;
+exports.SupabaseSink = exports.sanitizeSinkError = exports.SupabaseSinkError = void 0;
 const axios_1 = __importDefault(require("axios"));
 const crypto_1 = __importDefault(require("crypto"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 dotenv_1.default.config();
+/**
+ * The only error type the sink is allowed to surface. Raw Axios errors must
+ * never escape this module: config.params carry candidate email/phone filters,
+ * config/request headers carry the anon key, and response bodies can echo
+ * duplicate-key values. Only the HTTP status, the PostgREST/Storage error
+ * code, and the top-level (value-free) message survive.
+ */
+class SupabaseSinkError extends Error {
+    constructor(message, details = {}) {
+        super(message);
+        this.name = "SupabaseSinkError";
+        this.status = details.status;
+        this.code = details.code;
+    }
+}
+exports.SupabaseSinkError = SupabaseSinkError;
+function isAxiosLikeError(error) {
+    return (typeof error === "object" &&
+        error !== null &&
+        error.isAxiosError === true);
+}
+/**
+ * Converts any failure into a PII-free SupabaseSinkError, passing existing
+ * SupabaseSinkErrors through unchanged.
+ */
+function sanitizeSinkError(error, operation) {
+    var _a, _b, _c;
+    if (error instanceof SupabaseSinkError)
+        return error;
+    if (isAxiosLikeError(error)) {
+        const status = (_a = error.response) === null || _a === void 0 ? void 0 : _a.status;
+        const data = (_b = error.response) === null || _b === void 0 ? void 0 : _b.data;
+        const message = typeof (data === null || data === void 0 ? void 0 : data.message) === "string" && data.message !== ""
+            ? data.message
+            : (_c = error.message) !== null && _c !== void 0 ? _c : "request failed";
+        const code = typeof (data === null || data === void 0 ? void 0 : data.code) === "string" ? data.code : error.code;
+        return new SupabaseSinkError(`SupabaseSink: ${operation} failed${status !== undefined ? ` (status ${status})` : ""}: ${message}`, { status, code });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return new SupabaseSinkError(message.startsWith("SupabaseSink:") ? message : `SupabaseSink: ${operation} failed: ${message}`);
+}
+exports.sanitizeSinkError = sanitizeSinkError;
 const MIME_TYPES = {
     pdf: "application/pdf",
     jpg: "image/jpeg",
@@ -59,6 +101,16 @@ class SupabaseSink {
     headers(extra = {}) {
         return Object.assign({ apikey: this.anonKey, Authorization: `Bearer ${this.anonKey}`, "Content-Type": "application/json", "Accept-Profile": "scrape", "Content-Profile": "scrape" }, extra);
     }
+    guard(operation, run) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                return yield run();
+            }
+            catch (error) {
+                throw sanitizeSinkError(error, operation);
+            }
+        });
+    }
     findId(table, filters) {
         return __awaiter(this, void 0, void 0, function* () {
             const response = yield axios_1.default.get(`${this.url}/rest/v1/${table}`, {
@@ -80,20 +132,22 @@ class SupabaseSink {
      */
     upsertVacancy(v) {
         return __awaiter(this, void 0, void 0, function* () {
-            const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_vacancies`, [v], {
-                headers: this.headers({
-                    Prefer: "resolution=ignore-duplicates, return=representation",
-                }),
-                params: { on_conflict: "portal,portal_vacancy_id" },
-            });
-            const id = response.data[0]
-                ? Number(response.data[0].id)
-                : yield this.findId("portal_vacancies", {
-                    portal: `eq.${v.portal}`,
-                    portal_vacancy_id: `eq.${v.portal_vacancy_id}`,
+            return this.guard("upsertVacancy", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_vacancies`, [v], {
+                    headers: this.headers({
+                        Prefer: "resolution=ignore-duplicates, return=representation",
+                    }),
+                    params: { on_conflict: "portal,portal_vacancy_id" },
                 });
-            yield axios_1.default.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
-            return id;
+                const id = response.data[0]
+                    ? Number(response.data[0].id)
+                    : yield this.findId("portal_vacancies", {
+                        portal: `eq.${v.portal}`,
+                        portal_vacancy_id: `eq.${v.portal_vacancy_id}`,
+                    });
+                yield axios_1.default.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
+                return id;
+            }));
         });
     }
     /**
@@ -138,51 +192,53 @@ class SupabaseSink {
      */
     upsertCandidate(c) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            const email = c.email || null;
-            const phone = c.phone || null;
-            const portalCandidateId = c.portal_candidate_id || null;
-            if (!portalCandidateId && !email) {
-                throw new Error("SupabaseSink: candidate requires portal_candidate_id or email");
-            }
-            const touch = (id) => __awaiter(this, void 0, void 0, function* () {
-                yield axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
-                return id;
-            });
-            const existingId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-            if (existingId !== null) {
-                return touch(existingId);
-            }
-            const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
-            const { phone: _phone } = c, columns = __rest(c, ["phone"]);
-            const candidate = Object.assign(Object.assign({}, columns), { portal_candidate_id: portalCandidateId, email });
-            let inserted;
-            try {
-                const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_candidates`, [candidate], {
-                    headers: this.headers({
-                        Prefer: "resolution=ignore-duplicates, return=representation",
-                    }),
-                    params: { on_conflict: onConflict },
+            return this.guard("upsertCandidate", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                const email = c.email || null;
+                const phone = c.phone || null;
+                const portalCandidateId = c.portal_candidate_id || null;
+                if (!portalCandidateId && !email) {
+                    throw new Error("SupabaseSink: candidate requires portal_candidate_id or email");
+                }
+                const touch = (id) => __awaiter(this, void 0, void 0, function* () {
+                    yield axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
+                    return id;
                 });
-                inserted = response.data[0];
-            }
-            catch (error) {
-                const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
-                if (status !== 409)
-                    throw error;
-                const conflictId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                if (conflictId === null)
-                    throw error;
-                return touch(conflictId);
-            }
-            if (inserted) {
-                return touch(Number(inserted.id));
-            }
-            const raceId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-            if (raceId === null) {
-                throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
-            }
-            return touch(raceId);
+                const existingId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+                if (existingId !== null) {
+                    return touch(existingId);
+                }
+                const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
+                const { phone: _phone } = c, columns = __rest(c, ["phone"]);
+                const candidate = Object.assign(Object.assign({}, columns), { portal_candidate_id: portalCandidateId, email });
+                let inserted;
+                try {
+                    const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_candidates`, [candidate], {
+                        headers: this.headers({
+                            Prefer: "resolution=ignore-duplicates, return=representation",
+                        }),
+                        params: { on_conflict: onConflict },
+                    });
+                    inserted = response.data[0];
+                }
+                catch (error) {
+                    const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
+                    if (status !== 409)
+                        throw error;
+                    const conflictId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+                    if (conflictId === null)
+                        throw error;
+                    return touch(conflictId);
+                }
+                if (inserted) {
+                    return touch(Number(inserted.id));
+                }
+                const raceId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
+                if (raceId === null) {
+                    throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
+                }
+                return touch(raceId);
+            }));
         });
     }
     /**
@@ -191,20 +247,22 @@ class SupabaseSink {
      */
     linkApplication(vacancyId_1, candidateId_1) {
         return __awaiter(this, arguments, void 0, function* (vacancyId, candidateId, meta = {}) {
-            var _a, _b;
-            yield axios_1.default.post(`${this.url}/rest/v1/portal_applications`, [
-                {
-                    vacancy_id: vacancyId,
-                    candidate_id: candidateId,
-                    applied_for: (_a = meta.applied_for) !== null && _a !== void 0 ? _a : null,
-                    applied_date: (_b = meta.applied_date) !== null && _b !== void 0 ? _b : null,
-                },
-            ], {
-                headers: this.headers({
-                    Prefer: "resolution=ignore-duplicates, return=representation",
-                }),
-                params: { on_conflict: "vacancy_id,candidate_id" },
-            });
+            return this.guard("linkApplication", () => __awaiter(this, void 0, void 0, function* () {
+                var _a, _b;
+                yield axios_1.default.post(`${this.url}/rest/v1/portal_applications`, [
+                    {
+                        vacancy_id: vacancyId,
+                        candidate_id: candidateId,
+                        applied_for: (_a = meta.applied_for) !== null && _a !== void 0 ? _a : null,
+                        applied_date: (_b = meta.applied_date) !== null && _b !== void 0 ? _b : null,
+                    },
+                ], {
+                    headers: this.headers({
+                        Prefer: "resolution=ignore-duplicates, return=representation",
+                    }),
+                    params: { on_conflict: "vacancy_id,candidate_id" },
+                });
+            }));
         });
     }
     /**
@@ -215,29 +273,31 @@ class SupabaseSink {
      */
     uploadArtifact(portal, kind, localPath) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            const bytes = fs_1.default.readFileSync(localPath);
-            const digest = crypto_1.default.createHash("sha256").update(bytes).digest("hex");
-            const ext = path_1.default.extname(localPath).replace(/^\./, "").toLowerCase();
-            const month = new Date().toISOString().slice(0, 7).replace("-", "");
-            const key = `${portal}/${month}/${digest}.${ext}`;
-            try {
-                yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-                    headers: {
-                        apikey: this.anonKey,
-                        Authorization: `Bearer ${this.anonKey}`,
-                        "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
-                    },
-                });
-            }
-            catch (error) {
-                const response = axios_1.default.isAxiosError(error) ? error.response : undefined;
-                const duplicate = ((response === null || response === void 0 ? void 0 : response.status) === 400 || (response === null || response === void 0 ? void 0 : response.status) === 409) &&
-                    /already exists|duplicate/i.test(JSON.stringify(response.data));
-                if (!duplicate)
-                    throw error;
-            }
-            return key;
+            return this.guard("uploadArtifact", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                const bytes = fs_1.default.readFileSync(localPath);
+                const digest = crypto_1.default.createHash("sha256").update(bytes).digest("hex");
+                const ext = path_1.default.extname(localPath).replace(/^\./, "").toLowerCase();
+                const month = new Date().toISOString().slice(0, 7).replace("-", "");
+                const key = `${portal}/${month}/${digest}.${ext}`;
+                try {
+                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                        headers: {
+                            apikey: this.anonKey,
+                            Authorization: `Bearer ${this.anonKey}`,
+                            "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
+                        },
+                    });
+                }
+                catch (error) {
+                    const response = axios_1.default.isAxiosError(error) ? error.response : undefined;
+                    const duplicate = ((response === null || response === void 0 ? void 0 : response.status) === 400 || (response === null || response === void 0 ? void 0 : response.status) === 409) &&
+                        /already exists|duplicate/i.test(JSON.stringify(response.data));
+                    if (!duplicate)
+                        throw error;
+                }
+                return key;
+            }));
         });
     }
     /**
@@ -245,17 +305,19 @@ class SupabaseSink {
      */
     recordRunStart(portal, stage) {
         return __awaiter(this, void 0, void 0, function* () {
-            const response = yield axios_1.default.post(`${this.url}/rest/v1/scrape_runs`, [
-                {
-                    portal,
-                    stage,
-                    started_at: new Date().toISOString(),
-                    status: "running",
-                },
-            ], {
-                headers: this.headers({ Prefer: "return=representation" }),
-            });
-            return Number(response.data[0].id);
+            return this.guard("recordRunStart", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/scrape_runs`, [
+                    {
+                        portal,
+                        stage,
+                        started_at: new Date().toISOString(),
+                        status: "running",
+                    },
+                ], {
+                    headers: this.headers({ Prefer: "return=representation" }),
+                });
+                return Number(response.data[0].id);
+            }));
         });
     }
     /**
@@ -263,22 +325,24 @@ class SupabaseSink {
      */
     recordRunEnd(runId_1) {
         return __awaiter(this, arguments, void 0, function* (runId, meta = {}) {
-            var _a;
-            const patch = {};
-            if (meta.status !== undefined && meta.status !== null)
-                patch.status = meta.status;
-            if (meta.error !== undefined && meta.error !== null)
-                patch.error = meta.error;
-            if (meta.vacancies_seen !== undefined && meta.vacancies_seen !== null) {
-                patch.vacancies_seen = meta.vacancies_seen;
-            }
-            if (meta.candidates_seen !== undefined && meta.candidates_seen !== null) {
-                patch.candidates_seen = meta.candidates_seen;
-            }
-            patch.finished_at = (_a = meta.finished_at) !== null && _a !== void 0 ? _a : new Date().toISOString();
-            yield axios_1.default.patch(`${this.url}/rest/v1/scrape_runs?id=eq.${runId}`, patch, {
-                headers: this.headers({ Prefer: "return=representation" }),
-            });
+            return this.guard("recordRunEnd", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                const patch = {};
+                if (meta.status !== undefined && meta.status !== null)
+                    patch.status = meta.status;
+                if (meta.error !== undefined && meta.error !== null)
+                    patch.error = meta.error;
+                if (meta.vacancies_seen !== undefined && meta.vacancies_seen !== null) {
+                    patch.vacancies_seen = meta.vacancies_seen;
+                }
+                if (meta.candidates_seen !== undefined && meta.candidates_seen !== null) {
+                    patch.candidates_seen = meta.candidates_seen;
+                }
+                patch.finished_at = (_a = meta.finished_at) !== null && _a !== void 0 ? _a : new Date().toISOString();
+                yield axios_1.default.patch(`${this.url}/rest/v1/scrape_runs?id=eq.${runId}`, patch, {
+                    headers: this.headers({ Prefer: "return=representation" }),
+                });
+            }));
         });
     }
 }

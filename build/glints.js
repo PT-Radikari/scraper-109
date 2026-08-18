@@ -231,7 +231,7 @@ class Glints {
      */
     sendToSink(param) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b, _c, _d, _e;
+            var _a;
             const vacancyId = crypto_1.default
                 .createHash("sha1")
                 .update(`${param.portal}${param.applied_for}`)
@@ -286,26 +286,19 @@ class Glints {
                 this.COLLECTED++;
             }
             catch (error) {
-                const status = axios_1.default.isAxiosError(error) ? (_b = error.response) === null || _b === void 0 ? void 0 : _b.status : undefined;
-                const message = axios_1.default.isAxiosError(error)
-                    ? (_e = (_d = (_c = error.response) === null || _c === void 0 ? void 0 : _c.data) === null || _d === void 0 ? void 0 : _d.message) !== null && _e !== void 0 ? _e : error.message
-                    : error instanceof Error
-                        ? error.message
-                        : String(error);
+                const sinkError = (0, supabaseSink_1.sanitizeSinkError)(error, "sendToSink");
+                sinkError.portal = param.portal;
+                sinkError.vacancyId = vacancyId;
+                sinkError.candidateId = identity.portalCandidateId;
                 console.error("Error writing to Supabase sink", {
                     portal: param.portal,
                     vacancy_id: vacancyId,
                     candidate_id: identity.portalCandidateId,
                     identity_source: identity.source,
-                    status,
-                    error: message,
+                    status: sinkError.status,
+                    error: sinkError.message,
                 });
-                if (axios_1.default.isAxiosError(error)) {
-                    if (error.config)
-                        delete error.config.data;
-                    delete error.request;
-                }
-                throw error;
+                throw sinkError;
             }
         });
     }
@@ -709,7 +702,7 @@ class Glints {
                 catch (error) {
                     yield page.keyboard.press('Escape');
                     console.error(`[GLINTS] Failed candidate row ${i + 1} for vacancy "${job}"`, error);
-                    if (axios_1.default.isAxiosError(error))
+                    if (error instanceof supabaseSink_1.SupabaseSinkError)
                         throw error;
                 }
                 finally {
