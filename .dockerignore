@@ -1,0 +1,19 @@
+# The image must install its own Linux dependencies; a host-platform
+# node_modules (e.g. macOS arm64) would satisfy the lockfile and leave the
+# sqlite3 native binding built for the wrong platform.
+node_modules/
+
+# Real environment/credential files stay outside the image; only the
+# documented sample ships.
+.env
+.env.*
+!.env.sample
+
+# Local state and artifacts the container recreates or mounts itself.
+db/
+cache/
+logs/
+storage/
+build/
+.playwright-mcp/
+.git

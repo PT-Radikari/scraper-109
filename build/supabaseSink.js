@@ -88,10 +88,14 @@ class SupabaseSink {
     /**
      * Upserts one candidate, deduped on (portal, portal_candidate_id) with a
      * fallback to (portal, email) when the portal candidate id is missing.
+     * A 409 raised by the sibling UNIQUE (portal, email) constraint — rows keyed
+     * by an older build under a different portal_candidate_id — resolves to the
+     * existing email row and refreshes only last_seen_at instead of failing.
      * @returns the numeric id of the (inserted or existing) row.
      */
     upsertCandidate(c) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             const email = c.email || null;
             if (!c.portal_candidate_id && !email) {
                 throw new Error("SupabaseSink: candidate requires portal_candidate_id or email");
@@ -100,17 +104,28 @@ class SupabaseSink {
                 ? "portal,portal_candidate_id"
                 : "portal,email";
             const candidate = Object.assign(Object.assign({}, c), { portal_candidate_id: c.portal_candidate_id || null, email });
-            const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_candidates`, [candidate], {
-                headers: this.headers({
-                    Prefer: "resolution=ignore-duplicates, return=representation",
-                }),
-                params: { on_conflict: onConflict },
-            });
-            const filters = c.portal_candidate_id
+            let inserted;
+            let emailConflict = false;
+            try {
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_candidates`, [candidate], {
+                    headers: this.headers({
+                        Prefer: "resolution=ignore-duplicates, return=representation",
+                    }),
+                    params: { on_conflict: onConflict },
+                });
+                inserted = response.data[0];
+            }
+            catch (error) {
+                const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
+                if (status !== 409 || !email)
+                    throw error;
+                emailConflict = true;
+            }
+            const filters = c.portal_candidate_id && !emailConflict
                 ? { portal: `eq.${c.portal}`, portal_candidate_id: `eq.${c.portal_candidate_id}` }
                 : { portal: `eq.${c.portal}`, email: `eq.${email}` };
-            const id = response.data[0]
-                ? Number(response.data[0].id)
+            const id = inserted
+                ? Number(inserted.id)
                 : yield this.findId("portal_candidates", filters);
             yield axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
             return id;

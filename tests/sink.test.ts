@@ -195,6 +195,52 @@ describe("SupabaseSink", () => {
         sink.upsertCandidate({ portal: "glints", portal_candidate_id: null })
       ).rejects.toThrow(/portal_candidate_id or email/);
     });
+
+    it("recovers from a legacy cross-constraint 409 via the (portal, email) row", async () => {
+      mockedAxios.post.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: { message: 'duplicate key value violates unique constraint "portal_candidates_portal_email_key"' },
+        },
+      });
+      mockedAxios.isAxiosError.mockReturnValueOnce(true);
+      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 7 }] } as never);
+      const sink = buildSink();
+
+      const id = await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "sha-of-email",
+        email: "a@b.c",
+      });
+
+      expect(id).toBe(7);
+      expect(mockedAxios.get).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_candidates`,
+        expect.objectContaining({
+          params: { select: "id", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
+        })
+      );
+      expect(mockedAxios.patch).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.7`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
+    });
+
+    it("rethrows a 409 when the candidate has no email to fall back to", async () => {
+      mockedAxios.post.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 409, data: {} },
+      });
+      mockedAxios.isAxiosError.mockReturnValueOnce(true);
+      const sink = buildSink();
+
+      await expect(
+        sink.upsertCandidate({ portal: "glints", portal_candidate_id: "url-key", email: "" })
+      ).rejects.toMatchObject({ response: { status: 409 } });
+      expect(mockedAxios.patch).not.toHaveBeenCalled();
+    });
   });
 
   describe("linkApplication", () => {

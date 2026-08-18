@@ -151,6 +151,9 @@ export class SupabaseSink {
   /**
    * Upserts one candidate, deduped on (portal, portal_candidate_id) with a
    * fallback to (portal, email) when the portal candidate id is missing.
+   * A 409 raised by the sibling UNIQUE (portal, email) constraint — rows keyed
+   * by an older build under a different portal_candidate_id — resolves to the
+   * existing email row and refreshes only last_seen_at instead of failing.
    * @returns the numeric id of the (inserted or existing) row.
    */
   async upsertCandidate(c: CandidateInput): Promise<number> {
@@ -168,21 +171,31 @@ export class SupabaseSink {
       portal_candidate_id: c.portal_candidate_id || null,
       email,
     };
-    const response = await axios.post(
-      `${this.url}/rest/v1/portal_candidates`,
-      [candidate],
-      {
-        headers: this.headers({
-          Prefer: "resolution=ignore-duplicates, return=representation",
-        }),
-        params: { on_conflict: onConflict },
-      }
-    );
-    const filters: Record<string, string> = c.portal_candidate_id
-      ? { portal: `eq.${c.portal}`, portal_candidate_id: `eq.${c.portal_candidate_id}` }
-      : { portal: `eq.${c.portal}`, email: `eq.${email}` };
-    const id = response.data[0]
-      ? Number(response.data[0].id)
+    let inserted: { id: number } | undefined;
+    let emailConflict = false;
+    try {
+      const response = await axios.post(
+        `${this.url}/rest/v1/portal_candidates`,
+        [candidate],
+        {
+          headers: this.headers({
+            Prefer: "resolution=ignore-duplicates, return=representation",
+          }),
+          params: { on_conflict: onConflict },
+        }
+      );
+      inserted = response.data[0];
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status !== 409 || !email) throw error;
+      emailConflict = true;
+    }
+    const filters: Record<string, string> =
+      c.portal_candidate_id && !emailConflict
+        ? { portal: `eq.${c.portal}`, portal_candidate_id: `eq.${c.portal_candidate_id}` }
+        : { portal: `eq.${c.portal}`, email: `eq.${email}` };
+    const id = inserted
+      ? Number(inserted.id)
       : await this.findId("portal_candidates", filters);
 
     await axios.patch(

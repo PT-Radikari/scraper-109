@@ -2,9 +2,13 @@
 
 This Atlas project owns only the direct scoring sink schemas:
 
-- `scrape`: vacancies, candidates, applications, and scrape-run observability.
+- `scrape`: vacancies, candidates, applications, scrape-run observability, and
+  the SECURITY DEFINER projection (functions, trigger, and id sequence in
+  `20260818090000_project_talent_scraping.sql`) that mirrors every candidate
+  write into the `talent_scraping` tables.
 - `talent_scraping`: an exact structural mirror of the cloud scoring schema's
-  `talent_scraping` and `talent_work_experience` tables.
+  `talent_scraping` and `talent_work_experience` tables. It is populated only
+  by the projection trigger; anon has no grants on this schema.
 
 Existing Supabase schemas and the legacy SQLite databases are outside this
 project.
@@ -47,6 +51,12 @@ migration once a direct `DATABASE_URL` is available:
 atlas migrate apply --env dev --baseline 20260818042302
 atlas migrate status --env dev
 ```
+
+`20260818090000_project_talent_scraping.sql` follows the same live-upgrade
+path: run its SQL through the authenticated `POST /pg/query` route (it is
+self-contained — sequence, projection functions, trigger, and a backfill of
+already-scraped candidates), then baseline with the newest applied version
+instead of `20260818042302`.
 
 Never point `DATABASE_URL` at the shared cloud scoring project. The cloud
 credential is read-only and is used only to compare `talent_scraping` metadata.

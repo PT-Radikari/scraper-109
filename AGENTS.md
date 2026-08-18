@@ -25,6 +25,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 
 - Glints bypasses the legacy `api_destination` and native SQLite path through `src/supabaseSink.ts`. The self-hosted `scrape` and cloud-compatible `talent_scraping` schemas are managed under `atlas/`; follow `atlas/README.md` for generation, validation, baseline, and Storage setup.
 - The direct sink path deliberately does **not** mirror Glints rows into the central Supabase ingestion: `src/central/portalBridge.ts` stays wired only to the legacy SQLite insert path. Do not re-add `ingestPortalApplicant`/`ingestPortalVacancy` calls to the sink path.
+- The mirrored `talent_scraping` tables are populated database-side: a SECURITY DEFINER trigger on `scrape.portal_candidates` (`atlas/migrations/20260818090000_project_talent_scraping.sql`) projects each candidate write. Client code never touches the `talent_scraping` schema and anon has no grants there — do not add client-side writes to it.
 
 ## Maintaining this file
 
