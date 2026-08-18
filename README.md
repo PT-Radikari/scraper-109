@@ -45,6 +45,10 @@ npm run dev:seek
 ```
 If `seek.json` has `email` and `password`, the login form is prefilled but not submitted automatically.
 
+If a Glints account manages multiple companies, set `target_company` in `glints.json` to the exact company name shown in the dashboard's company switcher; the scraper selects it before scraping, since the wrong company returns empty results.
+
+Every scraper launches Playwright's bundled Chromium first and falls back to a system-installed Chrome/Chromium if that launch fails, so a host missing Playwright's browser cache still works.
+
 
 
 Scraper Retries
@@ -135,6 +139,10 @@ npm run dev:viewer
 ```
 
 Starts a local web dashboard on port **4000** that lets you start, stop, and monitor all scrapers from a browser UI. Also displays live logs and scraper status (idle / running / done / error) for each source.
+
+Toggle "Auto (hourly)" to have the viewer re-run every scraper once an hour instead of triggering runs by hand.
+
+The dashboard also embeds a PageAgent AI chat panel backed by `/api/ai/*`, a loopback-only proxy to `https://9router.aryahanif.xyz/v1` that keeps the upstream API key off the client. Set `NINE_ROUTER_KEY` (or `API_KEY`) in `.env` to enable it.
 
 ---
 
