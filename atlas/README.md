@@ -39,6 +39,14 @@ fails loudly without it instead of silently omitting the projection objects.
 `atlas migrate hash` and `atlas migrate validate --dir file://migrations` work
 without login.
 
+One representational gap: Atlas function blocks cannot express SET
+configuration parameters, so the `SET search_path = ''` hardening on both
+projection functions exists only in the migration SQL. Because the differ does
+not model that property it can never propose `ALTER FUNCTION ... RESET
+search_path`; the residual risk is a rewritten function DDL omitting the pin,
+which `tests/talentProjection.test.ts` catches. Re-declare
+`SET search_path = ''` whenever the projection function DDL is regenerated.
+
 ## Apply
 
 Set `DATABASE_URL` to the self-hosted Supabase Postgres service-role connection

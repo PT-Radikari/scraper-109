@@ -17,6 +17,13 @@
 // dropping them. Sequences/functions/triggers are logged-in Atlas features:
 // `atlas migrate diff` on this project requires `atlas login` and fails
 // loudly without it rather than silently ignoring these objects.
+//
+// Atlas function blocks cannot represent SET configuration parameters, so the
+// `SET search_path = ''` hardening on both projection functions lives only in
+// the migration SQL. The differ does not model that property (it can never
+// generate a RESET), and tests/talentProjection.test.ts fails if a future
+// migration drops the pin — re-declare it whenever the function DDL is
+// rewritten.
 
 schema "scrape" {
 }

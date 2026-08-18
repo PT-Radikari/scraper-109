@@ -102,6 +102,10 @@ describe("talent_scraping projection migration", () => {
     expect(sql).not.toMatch(/GRANT[^\n]*"talent_scraping"\./);
   });
 
+  it("pins an empty search_path on both definer functions", () => {
+    expect(sql.match(/SET search_path = ''/g)).toHaveLength(2);
+  });
+
   it("revokes EXECUTE from PUBLIC and anon so the definer functions are trigger-only", () => {
     expect(migration).toContain(
       'REVOKE ALL ON FUNCTION "scrape"."project_candidate_to_talent"("scrape"."portal_candidates") FROM PUBLIC, anon;'
