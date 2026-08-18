@@ -41,6 +41,7 @@ export interface GlintsConfigJson {
   timeout: number;
   slowmo: number;
   db_path: string;
+  target_company?: string;
 }
 
 /**
@@ -125,6 +126,7 @@ export class Glints {
   private DB: sqlite3.Database;
 
   private CACHE_DIR: string = '';
+  private TARGETCOMPANY: string = '';
 
   /**
    * Represents a Glints object.
@@ -141,7 +143,68 @@ export class Glints {
     this.SLOWMO = config.slowmo;
     this.DB_PATH = path.join(__dirname, config.db_path);
     this.DB = new sqlite3.Database(this.DB_PATH);
+    this.TARGETCOMPANY = config.target_company ?? '';
     console.info("CONFIG GLINTS LOADED");
+  }
+
+  getBrowserFallbackExecutablePath(): string | null {
+    const candidates = [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/opt/homebrew/bin/chromium",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Selects the target company from the Glints company switcher dropdown on the dashboard.
+   * Required when the account manages multiple companies — the wrong company will return empty results.
+   */
+  async selectTargetCompany(page: playwright.Page): Promise<void> {
+    if (!this.TARGETCOMPANY) return;
+
+    const TARGET = this.TARGETCOMPANY;
+
+    // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
+    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+    if (await ubahLocator.count() === 0) {
+      console.info('[GLINTS] No company switcher found, skipping company selection.');
+      return;
+    }
+
+    // The current company name is displayed in a paragraph adjacent to the combobox.
+    // When the dropdown is closed there is no visible option list, so this paragraph is the only
+    // occurrence of the company name on the page.
+    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET}$`) });
+    if (await alreadySelected.count() > 0) {
+      console.info(`[GLINTS] Company already set to: ${TARGET}`);
+      return;
+    }
+
+    console.info(`[GLINTS] Switching company to: ${TARGET}`);
+
+    // Click the "Ubah" button to open the dropdown
+    await ubahLocator.locator('..').click();
+    await page.waitForTimeout(1000);
+
+    // Try ARIA option role first (react-select exposes these), fall back to div text match
+    const optionByRole = page.getByRole('option', { name: TARGET, exact: true });
+    if (await optionByRole.count() > 0) {
+      await optionByRole.click();
+    } else {
+      await page.locator('div').filter({ hasText: new RegExp(`^${TARGET}$`) }).last().click();
+    }
+
+    // Wait for the page to reload with the new company's data
+    await page.waitForTimeout(3000);
+    console.info(`[GLINTS] Company switched to: ${TARGET}`);
   }
 
   /**
@@ -164,8 +227,8 @@ export class Glints {
       bodyFormData.append("date_of_birth", param.date_of_birth);
       bodyFormData.append("salary_expectation", param.salary_expectation);
       bodyFormData.append("work_experiences", JSON.stringify(param.work_experience));
-      bodyFormData.append("education", JSON.stringify(param.education));
-      bodyFormData.append("skill", JSON.stringify(param.skill));
+      bodyFormData.append("educations", JSON.stringify(param.education));
+      bodyFormData.append("skills", JSON.stringify(param.skill));
       bodyFormData.append("location", param.location);
       bodyFormData.append("gender", param.gender);
       if (param.photo !== "") {
@@ -188,7 +251,7 @@ export class Glints {
     } catch (error) {
       console.info("Error sending param", param);
       console.error("Error sending request with error:", error);
-      console.error("Error sending request with response:", (error as any).response.data);
+      console.error("Error sending request with response:", (error as any).response?.data ?? (error as any).message);
     }
   }
 
@@ -217,21 +280,32 @@ export class Glints {
    * @returns A promise that resolves to an array of VacancyPage objects.
    */
   async ExtractListVacancyPage(page: any): Promise<VacancyPage[]> {
-    const lv = page.locator(`[data-cy="job-card-listed"]`);
-    const listVacancyPage: { title: string, link: string }[] = [];
-    for (let i = 0; i < await lv.count(); i++) {
-      const element = lv.nth(i);
+    const vacancies = await page.evaluate(() => {
+      const byJobId = new Map<string, { title: string; link: string; isBaseLink: boolean }>();
+      const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/manage-candidates"]'));
 
-      const title = await this.ExtractTextContent(element, '[data-cy="job-title-text"]');
-      const link = element.getByText('Kelola Kandidat').locator('..').locator('..');
-      listVacancyPage.push(
-        {
-          title: title.toString(),
-          link: "https://employers.glints.id" + await link.getAttribute('href')
-        });
-    }
+      for (const link of links) {
+        const href = new URL(link.getAttribute("href") ?? "", "https://employers.glints.id");
+        const jobId = href.searchParams.get("jid") ?? href.href;
+        const card = link.closest('[data-cy="job-card-listed"]');
+        const title = card?.querySelector('[data-cy="job-title-text"]')?.textContent?.trim() ?? "";
+        const isBaseLink = !href.searchParams.has("status");
 
-    return listVacancyPage;
+        if (!title) {
+          continue;
+        }
+
+        const existing = byJobId.get(jobId);
+        if (!existing || isBaseLink) {
+          byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
+        }
+      }
+
+      return Array.from(byJobId.values()).map(({ title, link }) => ({ title, link }));
+    });
+
+    console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
+    return vacancies;
   }
 
   /**
@@ -241,16 +315,16 @@ export class Glints {
    * @param locator - The locator string used to identify the element.
    * @returns A promise that resolves once the element is found or the timeout is reached.
    */
-  async checkLazyLoadedElement(page: any, locator: string): Promise<void> {
+  async checkLazyLoadedElement(page: any, locator: string): Promise<boolean> {
     let elementFound = false;
     let startTime = Date.now();
-    const timeout = 300000;
+    const timeout = 30000;
 
     while (!elementFound && Date.now() - startTime < timeout) {
       console.info("Checking for lazy-loaded element: %s", locator);
       const element = page.locator(locator);
       elementFound = (await element.count()) > 0;
-      await page.waitForTimeout(1000);
+      if (!elementFound) await page.waitForTimeout(1000);
     }
 
     if (elementFound) {
@@ -258,6 +332,7 @@ export class Glints {
     } else {
       console.info("Element: %s not found within timeout!", locator);
     }
+    return elementFound;
   }
 
   /**
@@ -317,10 +392,28 @@ export class Glints {
       console.log("Failed to create database connection. Exiting...");
     }
 
-    const browser = trackBrowser(await playwright.chromium.launch({
+    const launchOptions: Parameters<typeof playwright.chromium.launch>[0] = {
       headless: this.HEADLESS,
-      slowMo: this.SLOWMO
-    }));
+      slowMo: this.SLOWMO,
+      args: ["--disable-crash-reporter", "--disable-crashpad"],
+    };
+    let browser: playwright.Browser;
+    try {
+      browser = await playwright.chromium.launch(launchOptions);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const fallbackExecutablePath = this.getBrowserFallbackExecutablePath();
+      if (!fallbackExecutablePath) {
+        throw error;
+      }
+
+      console.info(`[GLINTS] Playwright bundled Chromium failed (${message.split("\n")[0]}). Falling back to local browser: ${fallbackExecutablePath}`);
+      browser = await playwright.chromium.launch({
+        ...launchOptions,
+        executablePath: fallbackExecutablePath,
+      });
+    }
+    browser = trackBrowser(browser);
 
     this.CACHE_DIR = path.join(__dirname, "../cache");
     // Ensure the cache directory exists
@@ -328,7 +421,14 @@ export class Glints {
       fs.mkdirSync(this.CACHE_DIR);
     }
 
-    const page = await browser.newPage();
+    const context = browser.contexts()[0] || await browser.newContext({
+      viewport: { width: 1440, height: 900 }
+    });
+    await context.addCookies(this.COOKIES);
+    context.setDefaultTimeout(this.TIMEOUT);
+
+    const page = await context.newPage();
+    await page.setViewportSize({ width: 1440, height: 900 });
     page.setDefaultTimeout(this.TIMEOUT)
     await page.route('**/*', async (route, request) => {
       if (
@@ -360,19 +460,24 @@ export class Glints {
           });
         } else {
           // Fetch the response and cache it
-          const response = await page.request.fetch(request);
-          const body = await response.body();
-          const cacheEntry = {
-            status: response.status(),
-            contentType: response.headers()['content-type'],
-            body: body.toString('base64')
-          };
-          await this.saveToCache(url, cacheEntry);
-          await route.fulfill({
-            status: response.status(),
-            contentType: response.headers()['content-type'],
-            body: body
-          });
+          try {
+            const response = await page.request.fetch(request, { timeout: 30000 });
+            const body = await response.body();
+            const cacheEntry = {
+              status: response.status(),
+              contentType: response.headers()['content-type'],
+              body: body.toString('base64')
+            };
+            await this.saveToCache(url, cacheEntry);
+            await route.fulfill({
+              status: response.status(),
+              contentType: response.headers()['content-type'],
+              body: body
+            });
+          } catch (fetchErr) {
+            console.warn(`[GLINTS] Cache fetch timeout for ${url}, falling back to direct request`);
+            await route.continue();
+          }
         }
       } else {
         route.continue();
@@ -380,25 +485,71 @@ export class Glints {
     });
 
     const startTime = Date.now();
-    await page.goto("https://employers.glints.id");
+    await page.goto("https://employers.glints.id", {
+      waitUntil: "domcontentloaded",
+      timeout: this.TIMEOUT,
+    });
     const loadTime = Date.now() - startTime;
     console.info(`Page loaded in ${loadTime}ms`);
-
-    const context = await browser.newContext();
-    await context.addCookies(this.COOKIES);
-    context.setDefaultTimeout(this.TIMEOUT);
 
     await page.evaluate((localStorageData) => {
       for (const i of localStorageData) {
         localStorage.setItem(i.key, i.value);
       }
+      // Suppress mobile app promo page
+      localStorage.setItem('mobileAppPromptViewedDate', JSON.stringify(new Date().toISOString()));
     }, this.LOCALSTORAGE);
 
-    await page.waitForTimeout(10000);
+    await page.waitForTimeout(5000);
 
-    await page.goto("https://employers.glints.id/dashboard");
+    await page.goto("https://employers.glints.id/dashboard", {
+      waitUntil: "domcontentloaded",
+      timeout: this.TIMEOUT,
+    });
 
-    await this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]')
+    await page.waitForTimeout(3000);
+
+    // Switch to the correct company before scraping — wrong company returns empty results
+    await this.selectTargetCompany(page);
+
+    // Suppress VIP expired modal via localStorage, then dismiss if already shown
+    await page.evaluate(() => {
+      const app = JSON.parse(localStorage.getItem('glintsEmployersApp') || '{}');
+      const companyId = app?.session?.data?.company?.id;
+      if (companyId) {
+        localStorage.setItem('vipMembershipExpiredModalHasSeen', JSON.stringify({ [companyId]: true }));
+      }
+    });
+    if (await page.locator('[data-testid="modal-close-btn"]').count() > 0) {
+      await page.locator('[data-testid="modal-close-btn"]').click();
+      await page.waitForTimeout(500);
+    }
+
+    // Dashboard defaults to "Aktif" tab — switch to "Semua Loker" to see all jobs
+    if (await page.locator('button:has-text("Semua Loker")').count() > 0) {
+      await page.locator('button:has-text("Semua Loker")').first().click();
+      await page.waitForTimeout(1000);
+    }
+
+    let jobCardsFound = await this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
+    if (!jobCardsFound) {
+      console.info('[GLINTS] No cards in current tab. Switching to "Nonaktif" jobs.');
+      await page.evaluate(() => {
+        const nonActiveButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+          .find((button) => button.textContent?.includes("Nonaktif"));
+        nonActiveButton?.click();
+      });
+      await page.waitForTimeout(1500);
+      jobCardsFound = await this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
+    }
+    if (!jobCardsFound) {
+      const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
+      console.warn(`[GLINTS] Dashboard text while looking for cards: ${pageText}`);
+      console.warn("[GLINTS] No active job cards found on dashboard. All jobs may be closed or account has no active listings.");
+      await browser.close();
+      console.log("DONE");
+      process.exit(0);
+    }
 
     const listVacancyPage = await this.ExtractListVacancyPage(page);
 
@@ -409,15 +560,15 @@ export class Glints {
 
       await page.goto(it.link);
 
-      await this.checkLazyLoadedElement(page, '.Polaris-IndexTable__TableRow')
+      await page.waitForTimeout(2000);
 
-      await page.click('#IN_REVIEW');
-
-      if (await page.locator('.empty-state-title').count() > 0) {
+      // Skip job if no candidates in this stage
+      if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
         continue;
       }
-
-      await this.checkLazyLoadedElement(page, '.Polaris-IndexTable__TableRow')
+      if (await page.locator('.Polaris-IndexTable__TableRow').count() === 0) {
+        continue;
+      }
 
       let isNext = true;
       do {
@@ -426,7 +577,7 @@ export class Glints {
         // Check for lazy-loaded elements before proceeding
         await this.checkLazyLoadedElement(page, '.Polaris-IndexTable__TableRow');
 
-        if (await page.getByText("Belum ada pelamar di tahap dalam komunikasi", { exact: true }).count() > 0) {
+        if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
           break;
         }
 
@@ -730,7 +881,7 @@ export class Glints {
       "Sep": "Sep",
       "Okt": "Oct",
       "Nov": "Nov",
-      "Des": "Des"
+      "Des": "Dec"
     };
 
     let appliedDateSplit = appliedDateText.split(" ")
@@ -1196,7 +1347,7 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       };
 
       // Get the content type of the response
-      const contentType = response.headers['content-type'];
+      const contentType = String(response.headers['content-type'] ?? '');
 
       // Get the file extension based on the content type
       const extension = mimeTypes[contentType];
@@ -1350,9 +1501,11 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
   async insertApplicant(data: Applicant): Promise<void> {
     console.info(`Inserting applicant ${data.email} into the database...`);
 
+    const safeEmail = data.email.replace(/'/g, "''");
+    const safeData = JSON.stringify(data).replace(/'/g, "''");
     const insertQuery = `
       INSERT INTO applicants (email, data)
-      VALUES ('${data.email}', '${JSON.stringify(data)}')
+      VALUES ('${safeEmail}', '${safeData}')
     `;
 
     await new Promise<void>((resolve, reject) => {
@@ -1380,8 +1533,9 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
   async getApplicantByEmail(email: string): Promise<ApplicantDB> {
     console.info(`Getting applicant by email ${email}...`);
 
+    const safeEmail = email.replace(/'/g, "''");
     const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${email}'
+      SELECT * FROM applicants WHERE email = '${safeEmail}'
     `;
 
     return new Promise((resolve, reject) => {

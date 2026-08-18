@@ -27,3 +27,7 @@ db/central.db-journal
 
 # Local environment
 .env
+
+.playwright-mcp/
+node-modules/
+logs/
