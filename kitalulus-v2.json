@@ -3,7 +3,7 @@
     "base_url": "https://employer.kitalulus.com",
     "email": "aang.koesmanggala@radikari.co.id",
     "password": "YrRgEEcm!g6x7yf",
-    "api_destination": "http://103.163.175.105:9003/api/v1/candidate",
+    "api_destination": "http://localhost:8000/api/v1/scraper/ingest",
     "limit": 0,
     "timeout": 120000,
     "slowmo": 2000,

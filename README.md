@@ -35,6 +35,21 @@ npm run dev:glints
 npm run dev:jooble
 ```
 
+Refresh SEEK authentication when `seek.json` expires:
+```
+npm run dev:seek-auth
+```
+Complete the SEEK login in the browser window. After it reaches the candidates page, the script updates `seek.json` with fresh cookies and local/session storage. Then rerun:
+```
+npm run dev:seek
+```
+If `seek.json` has `email` and `password`, the login form is prefilled but not submitted automatically.
+
+If a Glints account manages multiple companies, set `target_company` in `glints.json` to the exact company name shown in the dashboard's company switcher; the scraper selects it before scraping, since the wrong company returns empty results.
+
+Every scraper launches Playwright's bundled Chromium first and falls back to a system-installed Chrome/Chromium if that launch fails, so a host missing Playwright's browser cache still works.
+
+
 
 Scraper Retries
 
@@ -112,3 +127,98 @@ Or from cron, replacing the daemon:
 ```
 */5 * * * * cd /app && npm run start:central-sync-once >> /var/log/central-sync.log 2>&1
 ```
+
+---
+
+## Available Scripts
+
+### Viewer
+
+```
+npm run dev:viewer
+```
+
+Starts a local web dashboard on port **4000** that lets you start, stop, and monitor all scrapers from a browser UI. Also displays live logs and scraper status (idle / running / done / error) for each source.
+
+Toggle "Auto (hourly)" to have the viewer re-run every scraper once an hour instead of triggering runs by hand.
+
+The dashboard also embeds a PageAgent AI chat panel backed by `/api/ai/*`, a loopback-only proxy to `https://9router.aryahanif.xyz/v1` that keeps the upstream API key off the client. Set `NINE_ROUTER_KEY` (or `API_KEY`) in `.env` to enable it.
+
+---
+
+### Individual Scrapers (development mode)
+
+Run a single scraper with ts-node (no build required):
+
+| Command | Source |
+|---|---|
+| `npm run dev:kitalulus` | Kitalulus (v1) |
+| `npm run dev:kitalulus-v2-vacancies` | Kitalulus v2 — vacancies |
+| `npm run dev:kitalulus-v2-applicants` | Kitalulus v2 — applicants |
+| `npm run dev:kitalulus-v2-process-applicants` | Kitalulus v2 — process applicants |
+| `npm run dev:jooble` | Jooble |
+| `npm run dev:seek` | Seek |
+| `npm run dev:pintarnya` | Pintarnya |
+| `npm run dev:glints` | Glints |
+| `npm run dev` | Generic (no source selected) |
+
+---
+
+### Run All Scrapers
+
+```
+npm run dev:all
+```
+
+Runs `scrape-all.sh`, which launches all scrapers sequentially in a single shell session.
+
+---
+
+### xvfb variants (Linux / headless servers)
+
+Prefix any scraper command with `xvfb:` to wrap it in `xvfb-run -a`, which provides a virtual display. Use these when running on a server without a physical display.
+
+```
+npm run xvfb:kitalulus
+npm run xvfb:kitalulus-v2-vacancies
+npm run xvfb:kitalulus-v2-applicants
+npm run xvfb:kitalulus-v2-process-applicants
+npm run xvfb:jooble
+npm run xvfb:seek
+npm run xvfb:pintarnya
+npm run xvfb:glints
+npm run xvfb          # generic, no source selected
+```
+
+---
+
+### Production (compiled)
+
+First build the project:
+
+```
+npm run build
+```
+
+Then run using the compiled output in `build/`:
+
+| Command | Source |
+|---|---|
+| `npm run start:kitalulus` | Kitalulus |
+| `npm run start:jooble` | Jooble |
+| `npm run start:seek` | Seek |
+| `npm run start:pintarnya` | Pintarnya |
+| `npm run start:glints` | Glints |
+| `npm run start` | Generic |
+
+All `start:*` commands automatically use `xvfb-run` for headless compatibility.
+
+---
+
+### Tests
+
+```
+npm test
+```
+
+Runs the Jest test suite.

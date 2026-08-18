@@ -2,12 +2,13 @@
   "headless": false,
   "email": "auliaindrahel@radikari.id",
   "password": "P@ssw0rd",
-  "limit": 1000000,
+  "limit": 0,
   "job_vacancies": [
   ],
-  "api_destination": "http://103.163.175.105:9003/api/v1/candidate",
+  "api_destination": "http://localhost:8000/api/v1/scraper/ingest",
   "db_path": "../db/pintarnya.db",
   "delay": 100000,
   "delay_after": 100,
-  "timeout": 16000
+  "timeout": 60000,
+  "max_retry": 3
 }

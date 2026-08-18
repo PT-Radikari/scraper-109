@@ -1,216 +1,27 @@
 {
-  "headless": false,
-  "cookies": [
-    {
-      "name": "sajssdk_2015_cross_new_user",
-      "value": "1",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1716829199,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_gcl_au",
-      "value": "1.1.50996466.1716800548",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1724576548,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_ga_FQ75P4PXDH",
-      "value": "deleted",
-      "domain": ".employers.glints.id",
-      "path": "/",
-      "expires": 1780576766,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_hjSessionUser_1700101",
-      "value": "eyJpZCI6ImM0Nzc5OTg4LWZkMGMtNWY2Ni05NTA3LWRiN2NlOWViY2NhMyIsImNyZWF0ZWQiOjE3MTY4MDA1NTE1NDcsImV4aXN0aW5nIjp0cnVlfQ==",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1749736136,
-      "httpOnly": false,
-      "secure": true
-    },
-    {
-      "name": "_hjSession_1700101",
-      "value": "eyJpZCI6ImE0NzM2N2FlLTY1MmUtNDhmYi1iNzVkLWY0YWRmYTU3Yjg1NiIsImMiOjE3MTgyMDAxMzYyMDgsInMiOjAsInIiOjAsInNiIjowLCJzciI6MCwic2UiOjAsImZzIjowfQ==",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1718201936,
-      "httpOnly": false,
-      "secure": true
-    },
-    {
-      "name": "_gat_UA-45385415-17",
-      "value": "1",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1718841053,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_gat_UA-45385415-43",
-      "value": "1",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1718841053,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "amplitude_id_26bdf4b56b304d7bfc6275ea77f2310cglints.id",
-      "value": "eyJkZXZpY2VJZCI6IjIzY2NlNjg5LTM4NDUtNDBiMy04OGI2LWY3ZjQ4MjcyY2VhN1IiLCJ1c2VySWQiOm51bGwsIm9wdE91dCI6ZmFsc2UsInNlc3Npb25JZCI6MTcxODg0MDk5Mzg1NywibGFzdEV2ZW50VGltZSI6MTcxODg0MDk5Mzg1NywiZXZlbnRJZCI6MCwiaWRlbnRpZnlJZCI6MSwic2VxdWVuY2VOdW1iZXIiOjF9",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 2034200993,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_gid",
-      "value": "GA1.2.1457637014.1718790532",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1718927396,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "dicbo_id",
-      "value": "%7B%22dicbo_fetch%22%3A1718841001034%7D",
-      "domain": "employers.glints.id",
-      "path": "/",
-      "expires": 1718841301,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "traceInfo",
-      "value": "%7B%22expInfo%22%3A%22mgtDstExperimentEmployerTalentRecommendation%3Aexp1_0530%2CapiVersion%3Av2%22%2C%22requestId%22%3A%222cf62a8dcf8fa78bc38d9ea1abf821eb%22%7D",
-      "domain": "employers.glints.id",
-      "path": "/",
-      "expires": -1,
-      "httpOnly": false,
-      "secure": true
-    },
-    {
-      "name": "sensorsdata2015jssdkcross",
-      "value": "%7B%22distinct_id%22%3A%227bd7d8d4-f136-4ad0-918d-2b3c35a9de76%22%2C%22first_id%22%3A%2218fb9496cec850-07285058c656ab-e525627-5308416-18fb9496ced4ce%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMThmYjk0OTZjZWM4NTAtMDcyODUwNThjNjU2YWItZTUyNTYyNy01MzA4NDE2LTE4ZmI5NDk2Y2VkNGNlIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiN2JkN2Q4ZDQtZjEzNi00YWQwLTkxOGQtMmIzYzM1YTlkZTc2IiwiJGlkZW50aXR5X2VtYWlsIjoiZmFqYXIubmFuYW5nQHJhZGlrYXJpLmNvLmlkIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%227bd7d8d4-f136-4ad0-918d-2b3c35a9de76%22%7D%2C%22%24device_id%22%3A%2218fb9496cec850-07285058c656ab-e525627-5308416-18fb9496ced4ce%22%7D",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1784681759,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_ga",
-      "value": "GA1.1.1922855223.1716800549",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1784681760,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "builderSessionId",
-      "value": "dd81ccc76bfc4f33ab6a2150bdbe4490",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1721611560,
-      "httpOnly": false,
-      "secure": true
-    },
-    {
-      "name": "_ga_FQ75P4PXDH",
-      "value": "GS1.1.1721609760.95.0.1721609760.60.0.0",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1784681760,
-      "httpOnly": false,
-      "secure": false
-    },
-    {
-      "name": "_ga_LV66VD2E0G",
-      "value": "GS1.1.1721609760.95.0.1721609760.0.0.0",
-      "domain": ".glints.id",
-      "path": "/",
-      "expires": 1784681760,
-      "httpOnly": false,
-      "secure": false
-    }
-  ],
-  "local_storage": [
-    {
-      "store": "Local",
-      "key": "boostJobButtonHint",
-      "value": "false"
-    },
-    {
-      "store": "Local",
-      "key": "monetisationBannersClosed:",
-      "value": "{}"
-    },
-    {
-      "store": "Local",
-      "key": "monetisationBannersClosed",
-      "value": "{}"
-    },
-    {
-      "store": "Local",
-      "key": "chatButtonHint",
-      "value": "true"
-    },
-    {
-      "store": "Local",
-      "key": "vipMembershipExpiredFirstSeen",
-      "value": "{}"
-    },
-    {
-      "store": "Local",
-      "key": "builderVisitorId",
-      "value": "f3bac96c65494d89ac251cb960bf6d14"
-    },
-    {
-      "store": "Local",
-      "key": "amplitude_unsent_26bdf4b56b304d7bfc6275ea77f2310c",
-      "value": "[]"
-    },
-    {
-      "store": "Local",
-      "key": "monetisationBannersClosed:9f41804d-410f-40fc-be0d-2faea63a1a89",
-      "value": "{}"
-    },
-    {
-      "store": "Local",
-      "key": "vipMembershipExpiredModalHasSeen",
-      "value": "{}"
-    },
-    {
-      "store": "Local",
-      "key": "amplitude_unsent_identify_26bdf4b56b304d7bfc6275ea77f2310c",
-      "value": "[]"
-    },
-    {
-      "store": "Local",
-      "key": "applicationTableRowHint",
-      "value": "true"
-    },
-    {
-      "store": "Local",
-      "key": "glintsEmployersApp",
-      "value": "{\n \"session\": {\n  \"token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0aW1lIjoiMjAyNC0wNy0xNVQwNzozMzo1OS4yMzVaIiwiaWF0IjoxNzIxMDI4ODM5LCJleHAiOjE3MjM2MjA4MzksImF1ZCI6IjJmNThjNjY3MDJjMjliODIxZWZlYzU4Yjg0ZTFhYTg0ZWUyZDJhMDNhM2JkMmRmOGFlYTYxZmNkNWU1Y2E1MGQiLCJpc3MiOiJnbGludHMiLCJzdWIiOiI3YmQ3ZDhkNC1mMTM2LTRhZDAtOTE4ZC0yYjNjMzVhOWRlNzYifQ.LsKtXRX2gjoVmCF7d0wh7shcdrbz70JF7eNqqyMXCOU\",\n  \"data\": {\n   \"company\": {\n    \"name\": \"PT Rajawali Berdikari Indonesia\",\n    \"logo\": \"b0adc9867a93757274504f1ad0f4e362.png\",\n    \"bannerPic\": \"a5fa9b15e2f4da8df8ecd1b527b66fc3.jpg\",\n    \"tagline\": \"PT RAJAWALI BERDIKARI INDONESIA (Radikari) is a Digital channel customer experience management Company specialize in the areas of Contact Center, Customer Care, Business Support and Software Development & Maintenance.\",\n    \"video\": null,\n    \"website\": \"https://radikari.id\",\n    \"hubspotLink\": null,\n    \"recruitmentLink\": null,\n    \"houstonMediaLink\": null,\n    \"socialMediaSites\": {\n     \"twitter\": null,\n     \"facebook\": null,\n     \"linkedin\": null,\n     \"instagram\": \"radikari.official\"\n    },\n    \"registrationCode\": null,\n    \"id\": \"9f41804d-410f-40fc-be0d-2faea63a1a89\",\n    \"address\": \"Ruko Great Saladdin Square Jl Margonda Raya Blok C-10 NO. 39 RT. 002 RW.011, Pancoran Mas, Kota Depok, Jawa Barat. 16432.\",\n    \"size\": \"BETWEEN_51_AND_200\",\n    \"chatTranscripts\": null,\n    \"companyPICSelfies\": null,\n    \"lastVerificationSubmitted\": null,\n    \"isVerified\": false,\n    \"isHiring\": false,\n    \"localOffice\": true,\n    \"customAttributes\": {\n     \"companyUser\": [\n      {\n       \"role\": \"COMPANY\",\n       \"UserId\": \"ebbba4f0-75e1-43e5-b6b8-92629003ccad\"\n      }\n     ]\n    },\n    \"photos\": [],\n    \"descriptionRaw\": {\n     \"blocks\": [\n      {\n       \"key\": \"84l69\",\n       \"data\": {},\n       \"text\": \"Establish from 2014, PT RAJAWALI BERDIKARI INDONESIA continuously strive and invest on service research,  development and improvement and focus to manage services on Business Process (BPO), labor supply service and Man Power Outsourcing (MPO), and Transactional Process Outsourcing (TPO) for potential clients with difference business core.\",\n       \"type\": \"unstyled\",\n       \"depth\": 0,\n       \"entityRanges\": [],\n       \"inlineStyleRanges\": [\n        {\n         \"style\": \"BOLD\",\n         \"length\": 340,\n         \"offset\": 0\n        }\n       ]\n      },\n      {\n       \"key\": \"bnrv3\",\n       \"data\": {},\n       \"text\": \"We ignite our spirit to give the excellent service to our existing client and also expand the business become service provider for small, medium and  large enterprise with the different segment industries, channels and also businesses as well.\",\n       \"type\": \"unstyled\",\n       \"depth\": 0,\n       \"entityRanges\": [],\n       \"inlineStyleRanges\": [\n        {\n         \"style\": \"BOLD\",\n         \"length\": 243,\n         \"offset\": 0\n        }\n       ]\n      },\n      {\n       \"key\": \"du1mj\",\n       \"data\": {},\n       \"text\": \"Vision\\nTo be a global leader of managed service provider and a BRAVE market leader.\",\n       \"type\": \"unstyled\",\n       \"depth\": 0,\n       \"entityRanges\": [],\n       \"inlineStyleRanges\": [\n        {\n         \"style\": \"BOLD\",\n         \"length\": 6,\n         \"offset\": 0\n        }\n       ]\n      },\n      {\n       \"key\": \"dbcs3\",\n       \"data\": {},\n       \"text\": \"Mission\\nDelivering excellent services on the following solutions : Business Process Outsourcing HR Solution and Transaction Process Outsourcing\",\n       \"type\": \"unstyled\",\n       \"depth\": 0,\n       \"entityRanges\": [],\n       \"inlineStyleRanges\": [\n        {\n         \"style\": \"BOLD\",\n         \"length\": 7,\n         \"offset\": 0\n        }\n       ]\n      }\n     ],\n     \"entityMap\": {}\n    },\n    \"cultureRaw\": {\n     \"blocks\": [\n      {\n       \"key\": \"58v9s\",\n       \"data\": {},\n       \"text\": \"\",\n       \"type\": \"unstyled\",\n       \"depth\": 0,\n       \"entityRanges\": [],\n       \"inlineStyleRanges\": []\n      }\n     ],\n     \"entityMap\": {}\n    },\n    \"legalDocumentCreatedAt\": null,\n    \"legalDocumentUpdatedAt\": null,\n    \"status\": \"UNVERIFIED\",\n    \"ReviewerId\": \"3e1933c4-0e9c-404c-a116-017bdaa64699\",\n    \"reviewedAt\": \"2024-07-08T02:50:43.074Z\",\n    \"CityId\": 29029,\n    \"CountryCode\": \"ID\",\n    \"IndustryId\": 123,\n    \"LocationId\": \"f5817918-7ce1-436d-9478-c438b3466adb\",\n    \"EmployerServiceRepId\": null,\n    \"employerServiceRepEndDate\": null,\n    \"createdAt\": \"2022-08-15T09:36:35.233Z\",\n    \"updatedAt\": \"2024-07-08T02:50:43.078Z\",\n    \"contactMethod\": null,\n    \"acquiredByTeam\": null,\n    \"freeSubscriptionPlanGroupId\": null,\n    \"links\": {},\n    \"isApprovedToTalentHunt\": false,\n    \"legalDocument\": \"adcdc5cf61a1f0c4436b1f006161a8ca.pdf\",\n    \"legalRegistrationNumber\": \"\",\n    \"monetisationMode\": \"SUBSCRIPTION_MODE\",\n    \"currentCompanyJobSlotsSubscription\": {\n     \"totalConcurrentJobSlots\": 5,\n     \"activeConcurrentJobs\": 0,\n     \"expiryDateTime\": null,\n     \"isConcurrentJobsHardLimitReached\": false,\n     \"hasUnlimitedConcurrentJobSlots\": false,\n     \"planType\": \"FREE\",\n     \"translatedPlanName\": \"Standard\",\n     \"createdAt\": \"2023-09-06T17:30:22.710Z\",\n     \"talentSearchChats\": null,\n     \"hasCSVDownload\": false,\n     \"hasVIPMembershipAccess\": false\n    },\n    \"hotJobBalances\": [\n     {\n      \"variant\": \"VARIANT_A\",\n      \"balance\": 0\n     },\n     {\n      \"variant\": \"VARIANT_B\",\n      \"balance\": 0\n     }\n    ],\n    \"recommendedTalentBalance\": 0,\n    \"creditBalance\": 0,\n    \"isVIP\": false\n   },\n   \"group\": null,\n   \"customFeatures\": []\n  }\n },\n \"user\": {\n  \"me\": {\n   \"value\": \"7bd7d8d4-f136-4ad0-918d-2b3c35a9de76\"\n  }\n }\n}"
-    }
-  ],
-  "api_destination": "http://103.163.175.105:9003/api/v1/candidate",
-  "limit": 1000,
-  "timeout": 160000,
-  "slowmo": 1000,
-  "db_path": "../db/glints.db"
+    "headless": false,
+    "cookies": [
+        {"name": "sensorsdata2015jssdkcross", "value": "%7B%22distinct_id%22%3A%227bd7d8d4-f136-4ad0-918d-2b3c35a9de76%22%2C%22first_id%22%3A%2219e208a4a89cfa-04f7c860143a274-452e2934-1484784-19e208a4a8a1e83%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTllMjA4YTRhODljZmEtMDRmN2M4NjAxNDNhMjc0LTQ1MmUyOTM0LTE0ODQ3ODQtMTllMjA4YTRhOGExZTgzIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiN2JkN2Q4ZDQtZjEzNi00YWQwLTkxOGQtMmIzYzM1YTlkZTc2IiwiJGlkZW50aXR5X2VtYWlsIjoiZmFqYXIubmFuYW5nQHJhZGlrYXJpLmNvLmlkIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%227bd7d8d4-f136-4ad0-918d-2b3c35a9de76%22%7D%7D", "domain": ".glints.id", "path": "/", "expires": 1809772341, "httpOnly": false, "secure": false},
+        {"name": "ab180ClientId", "value": "a9a5592c-a7f5-4e82-b6ea-753ed87d3f56", "domain": ".glints.id", "path": "/", "expires": 1813228344, "httpOnly": false, "secure": false},
+        {"name": "_gcl_au", "value": "1.1.1816325066.1778662395", "domain": ".glints.id", "path": "/", "expires": 1786438395, "httpOnly": false, "secure": false},
+        {"name": "airbridge_session__taplokerbyglints", "value": "%7B%22id%22%3A%223850724b-3908-494d-b731-4491110ec28e%22%2C%22timeout%22%3A1800000%2C%22start%22%3A1778668344767%2C%22end%22%3A1778668344767%7D", "domain": ".glints.id", "path": "/", "expires": 1813228344, "httpOnly": false, "secure": false},
+        {"name": "airbridge_touchpoint__taplokerbyglints", "value": "%7B%22channel%22%3A%22glints.com%22%2C%22parameter%22%3A%7B%7D%2C%22generationType%22%3A1224%2C%22url%22%3A%22https%3A//employers.glints.id/login%22%2C%22timestamp%22%3A1778664276480%7D", "domain": ".glints.id", "path": "/", "expires": 1778923476, "httpOnly": false, "secure": false},
+        {"name": "_fbp", "value": "fb.1.1778662416424.59048124394053847", "domain": ".glints.id", "path": "/", "expires": 1786444344, "httpOnly": false, "secure": false},
+        {"name": "_ga", "value": "GA1.2.417399983.1778662395", "domain": ".glints.id", "path": "/", "expires": 1813228343, "httpOnly": false, "secure": false},
+        {"name": "_ga_FQ75P4PXDH", "value": "GS2.1.s1778668341$o3$g0$t1778668341$j60$l0$h0", "domain": ".glints.id", "path": "/", "expires": 1813228341, "httpOnly": false, "secure": false},
+        {"name": "_ga_LV66VD2E0G", "value": "GS2.1.s1778668341$o3$g0$t1778668341$j60$l0$h0", "domain": ".glints.id", "path": "/", "expires": 1813228341, "httpOnly": false, "secure": false},
+        {"name": "_gid", "value": "GA1.2.2109138129.1778662396", "domain": ".glints.id", "path": "/", "expires": 1778754743, "httpOnly": false, "secure": false},
+        {"name": "airbridge_migration_metadata__taplokerbyglints", "value": "%7B%22version%22%3A%221.11.8%22%7D", "domain": ".glints.id", "path": "/", "expires": 1813228344, "httpOnly": false, "secure": false},
+        {"name": "g_state", "value": "{\"i_l\":0,\"i_ll\":1778664244990,\"i_b\":\"3Q/C1NiRt0hfwE1STKDx1/dXdCj18zWpj+Zgu3Zg8uQ\",\"i_e\":{\"enable_itp_optimization\":0},\"i_et\":1778664244990}", "domain": "employers.glints.id", "path": "/", "expires": 1794216244, "httpOnly": false, "secure": false},
+        {"name": "glints_device_id", "value": "fa4efc0c-d324-4884-8dad-d36ccde6ae26", "domain": "employers.glints.id", "path": "/", "expires": -1, "httpOnly": false, "secure": false}
+    ],
+    "local_storage": [
+        {"store": "employers.glints.id", "key": "glintsEmployersApp", "value": "{\"session\":{\"token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0aW1lIjoiMjAyNi0wNS0xM1QwOToyNToxNC43NzFaIiwiaWF0IjoxNzc4NjY0MzE0LCJleHAiOjE3ODEyNTYzMTQsImF1ZCI6IjJmNThjNjY3MDJjMjliODIxZWZlYzU4Yjg0ZTFhYTg0ZWUyZDJhMDNhM2JkMmRmOGFlYTYxZmNkNWU1Y2E1MGQiLCJpc3MiOiJnbGludHMiLCJzdWIiOiI3YmQ3ZDhkNC1mMTM2LTRhZDAtOTE4ZC0yYjNjMzVhOWRlNzYifQ.31dwczzPbc1pd7HlLVTIzn9_6MDOtwYRlcp2bPoO2XQ\",\"data\":{\"company\":{\"name\":\"PT RADIKARI\",\"brandName\":null,\"displayName\":\"PT RADIKARI\",\"logo\":\"accfdb6957df386608a8762d1e938d32.jpeg\",\"bannerPic\":null,\"tagline\":\"BRAVE (Beyond, Reliable, Accurate, Visionary, Emphaty)\",\"video\":null,\"website\":\"http://radikari.id\",\"hubspotLink\":null,\"recruitmentLink\":null,\"houstonMediaLink\":null,\"socialMediaSites\":null,\"registrationCode\":null,\"id\":\"964389ca-8c52-41ae-8240-fdad21257609\",\"address\":\"39 Jl Raya Margonda 16433 Pancoran Mas Jawa Barat\",\"size\":\"BETWEEN_201_AND_500\",\"chatTranscripts\":[\"cd1e52b43206d0c5d098dc5344800e0d.png\",\"3e494b7f40a76db86b773931bd256a6e.png\"],\"companyPICSelfies\":null,\"lastVerificationSubmitted\":null,\"isVerified\":false,\"isHiring\":false,\"localOffice\":true,\"customAttributes\":{\"companyUser\":[{\"role\":\"COMPANY\",\"UserId\":\"aa38e02b-76a0-406a-b4af-976094f9094b\"}]},\"photos\":null,\"descriptionRaw\":{\"blocks\":[{\"key\":\"rqk9\",\"data\":{},\"text\":\"PT Rajawali Berdikari Indonesia (dikenal sebagai Radikari) adalah sebuah perusahaan jasa penyediaan dan manajemen fungsi sumber daya manusia (SDM) yang didirikan oleh Vertebra Lumbalis pada tahun 2014. Radikari berbasis di Kota Depok, kemudian seiring berjalannya perusahaan ini, maka perusahaan ini melebarkan bisnisnya dibeberapa kota seperti Jakarta, dua kantor di Semarang, dan Yogyakarta\",\"type\":\"unstyled\",\"depth\":0,\"entityRanges\":[],\"inlineStyleRanges\":[]}],\"entityMap\":{}},\"cultureRaw\":null,\"legalDocumentCreatedAt\":\"2024-11-26T09:25:07.688Z\",\"legalDocumentUpdatedAt\":\"2024-11-26T09:25:07.688Z\",\"status\":\"VERIFIED\",\"ReviewerId\":\"20792110-e60e-4e64-8e58-61868e8cf88c\",\"reviewedAt\":\"2024-11-28T10:45:31.267Z\",\"CityId\":29029,\"CountryCode\":\"ID\",\"IndustryId\":91,\"LocationId\":\"f5817918-7ce1-436d-9478-c438b3466adb\",\"EmployerServiceRepId\":\"7542e504-e522-414c-b738-71dab016f493\",\"employerServiceRepEndDate\":\"2025-08-19T03:09:30.878Z\",\"createdAt\":\"2024-11-26T09:13:50.411Z\",\"updatedAt\":\"2026-01-12T09:24:27.443Z\",\"contactMethod\":null,\"acquiredByTeam\":null,\"freeSubscriptionPlanGroupId\":\"686d8b01-7257-4d7e-bcaa-384f532fa30c\",\"links\":{},\"isApprovedToTalentHunt\":false,\"legalDocument\":\"82b664e304cb6b8b10dcad490b369c80.pdf\",\"legalRegistrationNumber\":null,\"monetisationMode\":\"SUBSCRIPTION_MODE\",\"currentCompanyJobSlotsSubscription\":{\"totalConcurrentJobSlots\":5,\"activeConcurrentJobs\":0,\"expiryDateTime\":null,\"isConcurrentJobsHardLimitReached\":false,\"hasUnlimitedConcurrentJobSlots\":false,\"planType\":\"FREE\",\"translatedPlanName\":\"Standard\",\"createdAt\":\"2025-10-17T06:11:21.965Z\",\"talentSearchChats\":{\"talentSearchChatsBalance\":0,\"hasUsageLogs\":false},\"hasCSVDownload\":false,\"hasAutomatedCSVExport\":false,\"automatedCSVExportFrequency\":null,\"hasVIPMembershipAccess\":false,\"hasJobExternalUrl\":false,\"activeInventory\":null,\"pendingPurchase\":null,\"hasApplicationHistory\":false},\"hotJobBalances\":[{\"variant\":\"VARIANT_C\",\"balance\":0},{\"variant\":\"VARIANT_A\",\"balance\":0},{\"variant\":\"VARIANT_B\",\"balance\":0}],\"recommendedTalentBalance\":0,\"talentSearchBalance\":0,\"creditBalance\":150,\"isVIP\":false},\"group\":null,\"customFeatures\":[]}},\"user\":{\"me\":{\"value\":\"7bd7d8d4-f136-4ad0-918d-2b3c35a9de76\"}}}"}
+    ],
+    "api_destination": "http://localhost:3000/upload",
+    "limit": 2,
+    "timeout": 60000,
+    "slowmo": 500,
+    "db_path": "../db/glints.db",
+    "target_company": "PT Rajawali Berdikari Indonesia"
 }
