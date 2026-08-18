@@ -96,6 +96,41 @@ describe("portal extraction helpers", () => {
     expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain("tbody tr");
   });
 
+  it("processes rendered Glints applicant rows newest-first", async () => {
+    const config: GlintsConfigJson = {
+      headless: true,
+      cookies: [],
+      local_storage: [],
+      limit: 10,
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: dbPathForSource(tempDir, "glints.db"),
+    };
+    const scraper = new Glints(config);
+    const appliedDates = ["2026-08-01", "2026-08-15", "2026-08-07"];
+    const processedOrder: number[] = [];
+
+    const lv = {
+      count: async () => appliedDates.length,
+      nth: (index: number) => ({ rowIndex: index }),
+    };
+    const page = {
+      locator: () => lv,
+      keyboard: { press: async () => undefined },
+    };
+    scraper.extractAppliedDate = async (row: { rowIndex: number }) =>
+      appliedDates[row.rowIndex];
+    scraper.extractPhoto = async (row: { rowIndex: number }) => {
+      processedOrder.push(row.rowIndex);
+      throw new Error("stop row after recording processing order");
+    };
+
+    await scraper.ExtractApplicantDetail(page, "Software Engineer");
+
+    expect(processedOrder).toEqual([1, 2, 0]);
+  });
+
   (sqliteAvailable ? it : it.skip)("extracts visible Seek applicants without moving phone numbers into email", async () => {
     const { Seek } = await import("../src/seek");
     const config: SeekConfigJson = {

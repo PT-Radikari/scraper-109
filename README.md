@@ -261,7 +261,7 @@ exponential retry policy above, so transient browser failures retry before the
 next scheduled cycle.
 
 Glints no longer loads SQLite on its direct Supabase path. Legacy portal paths
-still use the committed native `sqlite3` dependency; if its binary was installed
-for another OS/architecture, reinstall dependencies for the current platform or
-run `npm rebuild sqlite3`. Do not rebuild the checkout used by a differently
-architected deployment container.
+still use the native `sqlite3` dependency; if `node_modules/` was copied from a
+host with a different OS/architecture, reinstall dependencies for the current
+platform or run `npm rebuild sqlite3`. The Docker image installs its own
+dependencies during the build, so rebuilding locally cannot break the container.

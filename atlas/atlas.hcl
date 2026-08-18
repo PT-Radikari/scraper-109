@@ -1,15 +1,12 @@
-// Atlas config for scraper-109.
-//
-// Newly introduced in this change (no atlas.hcl existed before). Scope: manages
-// ONLY the scrape ingestion tables and the cloud-compatible talent_scraping
-// scoring tables introduced by this feature.
+// Atlas config for the direct scoring sink. Scope: manages ONLY the scrape
+// ingestion tables and the cloud-compatible talent_scraping scoring tables.
 //
 // IMPORTANT: `url` below points at the SAME shared Supabase database the app
 // writes to at runtime (via SCORING_SUPABASE_URL / SCORING_SUPABASE_ANON_KEY,
-// exposed to Atlas as DATABASE_URL). Nothing in this change runs
-// `atlas migrate apply` against it — the migration is generated, linted, and
-// hash-checked locally only; applying it to the live Supabase is a captain
-// follow-up with a service-role connection string.
+// exposed to Atlas as DATABASE_URL). See README.md in this directory for the
+// apply/baseline runbook — the live migrations were applied through the
+// authenticated pg/query route, so a first `atlas migrate apply` must
+// baseline, never re-apply.
 //
 // All relative paths below (schema.hcl, migrations/) are resolved relative to
 // this file's directory, so run atlas commands from inside atlas/:
