@@ -4,7 +4,7 @@ This document outlines the steps to set up a Playwright project on your local ma
 Prerequisites
 
 Operating System: Windows, macOS, or Linux
-NodeJS LTS 20: Make sure you have Node version 16.x or later installed. You can check your version by running node -v in your terminal. If you don't have it installed, download the appropriate installer from the official Node.js website https://nodejs.org/en
+NodeJS 22 LTS: some dependencies (`pdf-parse`/`pdfjs-dist`, used by the Kitalulus scrapers) require Node >= 20.16 or >= 22.3, and the Docker image pins the exact version (`ARG NODE_VERSION` in the `dockerfile` header). You can check your version by running node -v in your terminal. If you don't have it installed, download the appropriate installer from the official Node.js website https://nodejs.org/en
 Stable internet connection: You'll need an internet connection to download required packages.
 Installation
 
