@@ -72,7 +72,7 @@ npm run build
 ```
 
 Run with docker: Assuming your have installed docker, run the following command to execute it:
-Build (the image runs `npm install` during the build, so a checkout without `node_modules/` is all it needs)
+Build (the image runs `npm ci` during the build, so a checkout without `node_modules/` is all it needs)
 ```
 docker build -t playwright-runner . 
 ```
