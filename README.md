@@ -186,7 +186,8 @@ npm run xvfb:kitalulus-v2-process-applicants
 npm run xvfb:jooble
 npm run xvfb:seek
 npm run xvfb:pintarnya
-npm run xvfb:glints
+npm run xvfb:glints        # continuous newest-first loop (production entrypoint)
+npm run xvfb:glints:once   # single Glints run, exits when done
 npm run xvfb          # generic, no source selected
 ```
 
@@ -252,6 +253,8 @@ between idempotent cycles:
 
 ```bash
 npm run dev:glints:continuous
+# ts-node under xvfb (the Dokploy container entrypoint):
+npm run xvfb:glints
 # Production container supervision:
 docker run -d --name scraper-glints --restart always --env-file .env playwright-runner:latest npm run start:glints:continuous
 ```

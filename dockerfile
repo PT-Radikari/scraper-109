@@ -1,8 +1,13 @@
 # This Dockerfile sets up a container environment for running a Node.js application with Playwright.
-FROM node:20
-
-# Use the Playwright image from Microsoft's container registry
-FROM mcr.microsoft.com/playwright:jammy
+#
+# PAIRING RULE: the image tag version MUST equal the `playwright` version pinned
+# in package-lock.json. The image ships browsers only for its own Playwright
+# release, so a floating tag (e.g. `:jammy`) eventually resolves to a newer
+# image whose browsers the npm-installed library cannot find, and every
+# `chromium.launch()` fails with "Executable doesn't exist". When bumping
+# `playwright` in package.json, bump this tag in the same commit —
+# tests/dockerfile-playwright.test.ts enforces the match.
+FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
 # Set the working directory inside the container
 WORKDIR /app
