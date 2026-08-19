@@ -19,7 +19,7 @@ ENV PATH /app/node_modules/.bin:$PATH
 COPY . ./
 
 # Install the application dependencies (node_modules is not committed)
-RUN npm install
+RUN npm ci
 
 # Build the application using npm
 RUN npm run build
