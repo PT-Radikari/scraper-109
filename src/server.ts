@@ -1,11 +1,3 @@
-import { KitaLulus, KitaLulusConfigJson } from "./kitalulus";
-import { KitaLulusV2, KitaLulusConfigJsonV2 } from "./kitalulus-v2";
-import { Jooble, JoobleConfigJson } from "./jooble";
-import { Seek, SeekConfigJson } from "./seek";
-import { Glints, GlintsConfigJson } from "./glints";
-import { Pintarnya, PintarnyaConfigJson } from "./pintarnya";
-import { CentralIngestionService } from "./central/ingestion";
-import { CentralSyncRunner, startCentralSyncDaemon } from "./central/syncRunner";
 import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
@@ -15,48 +7,94 @@ import path from "path";
 
 const args = process.argv.slice(2);
 
-const kitaLulusConfig = path.join(__dirname, "../", "kitalulus.json");
-const kitaLulusData = fs.readFileSync(kitaLulusConfig, "utf-8");
-const kitaLulusJson = JSON.parse(kitaLulusData) as KitaLulusConfigJson;
-
-const kitaLulusConfigV2 = path.join(__dirname, "../", "kitalulus-v2.json");
-const kitaLulusDataV2 = fs.readFileSync(kitaLulusConfigV2, "utf-8");
-const kitaLulusJsonV2 = JSON.parse(kitaLulusDataV2) as KitaLulusConfigJsonV2;
-
-const joobleConfig = path.join(__dirname, "../", "jooble.json");
-const joobleData = fs.readFileSync(joobleConfig, "utf-8");
-const joobleJson = JSON.parse(joobleData) as JoobleConfigJson;
-
-const seekConfig = path.join(__dirname, "../", "seek.json");
-const seekData = fs.readFileSync(seekConfig, "utf-8");
-const seekJson = JSON.parse(seekData) as SeekConfigJson;
-
-const glintsConfig = path.join(__dirname, "../", "glints.json");
-const glintsData = fs.readFileSync(glintsConfig, "utf-8");
-const glintsJson = JSON.parse(glintsData) as GlintsConfigJson;
-
-const pintarnyaConfig = path.join(__dirname, "../", "pintarnya.json");
-const pintarnyaData = fs.readFileSync(pintarnyaConfig, "utf-8");
-const pintarnyaJson = JSON.parse(pintarnyaData) as PintarnyaConfigJson;
+/**
+ * Reads and parses a portal's JSON config from the repo root.
+ * @param fileName Config file name, e.g. `glints.json`.
+ * @returns The parsed config.
+ */
+function loadPortalConfig<T>(fileName: string): T {
+  const configPath = path.join(__dirname, "../", fileName);
+  return JSON.parse(fs.readFileSync(configPath, "utf-8")) as T;
+}
 
 /**
- * The Playwright portal runs, keyed by their CLI command.
+ * Lazy factories for the Playwright portal runs, keyed by their CLI command.
  *
- * Each entry builds a fresh scraper instance: a retried attempt must not
- * inherit the browser handle, database connection or collected-counter left
- * behind by the attempt that failed.
+ * Each factory `require`s its portal module and reads its config only when its
+ * command is dispatched. The portals must stay decoupled at import time: one
+ * portal's dependency needing a newer runtime than the image ships (kitalulus'
+ * pdf-parse crashing at load on the bundled Node) must never take down another
+ * portal's container. tests/serverLazyPortals.test.ts guards this.
+ *
+ * Each built runner constructs a fresh scraper instance per call: a retried
+ * attempt must not inherit the browser handle, database connection or
+ * collected-counter left behind by the attempt that failed.
  */
-const portalRunners: Record<string, () => Promise<void>> = {
-  kitalulus: () => new KitaLulus(kitaLulusJson).Scrape(),
-  "kitalulus-v2-vacancies": () => new KitaLulusV2(kitaLulusJsonV2).ScrapeVacancy(),
-  "kitalulus-v2-applicants": () => new KitaLulusV2(kitaLulusJsonV2).ScrapeApplicant(),
-  "kitalulus-v2-process-applicants": () =>
-    new KitaLulusV2(kitaLulusJsonV2).ProcessApplicant(),
-  jooble: () => new Jooble(joobleJson).Scrape(),
-  seek: () => new Seek(seekJson).Scrape(),
-  glints: () => new Glints(glintsJson).Scrape(),
-  pintarnya: () => new Pintarnya(pintarnyaJson).Scrape(),
+const portalRunnerFactories: Record<string, () => () => Promise<void>> = {
+  kitalulus: () => {
+    const { KitaLulus } = require("./kitalulus") as typeof import("./kitalulus");
+    const config =
+      loadPortalConfig<import("./kitalulus").KitaLulusConfigJson>("kitalulus.json");
+    return () => new KitaLulus(config).Scrape();
+  },
+  "kitalulus-v2-vacancies": () => {
+    const { KitaLulusV2 } =
+      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
+    const config =
+      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
+    return () => new KitaLulusV2(config).ScrapeVacancy();
+  },
+  "kitalulus-v2-applicants": () => {
+    const { KitaLulusV2 } =
+      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
+    const config =
+      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
+    return () => new KitaLulusV2(config).ScrapeApplicant();
+  },
+  "kitalulus-v2-process-applicants": () => {
+    const { KitaLulusV2 } =
+      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
+    const config =
+      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
+    return () => new KitaLulusV2(config).ProcessApplicant();
+  },
+  jooble: () => {
+    const { Jooble } = require("./jooble") as typeof import("./jooble");
+    const config =
+      loadPortalConfig<import("./jooble").JoobleConfigJson>("jooble.json");
+    return () => new Jooble(config).Scrape();
+  },
+  seek: () => {
+    const { Seek } = require("./seek") as typeof import("./seek");
+    const config = loadPortalConfig<import("./seek").SeekConfigJson>("seek.json");
+    return () => new Seek(config).Scrape();
+  },
+  glints: () => {
+    const { Glints } = require("./glints") as typeof import("./glints");
+    const config =
+      loadPortalConfig<import("./glints").GlintsConfigJson>("glints.json");
+    return () => new Glints(config).Scrape();
+  },
+  pintarnya: () => {
+    const { Pintarnya } = require("./pintarnya") as typeof import("./pintarnya");
+    const config =
+      loadPortalConfig<import("./pintarnya").PintarnyaConfigJson>("pintarnya.json");
+    return () => new Pintarnya(config).Scrape();
+  },
 };
+
+/**
+ * Loads the requested portal's module and config, and builds its runner.
+ * @param command CLI command naming the portal run.
+ * @returns A runner creating a fresh scraper instance per call.
+ */
+export function buildPortalRunner(command: string): () => Promise<void> {
+  const factory = portalRunnerFactories[command];
+  if (!factory) {
+    throw new Error(`unknown portal command: ${command}`);
+  }
+  return factory();
+}
 
 /**
  * Runs one portal scrape under the exponential-backoff retry policy.
@@ -73,7 +111,7 @@ async function runPortal(command: string): Promise<void> {
   );
 
   try {
-    await runWithRetry(command, portalRunners[command], {
+    await runWithRetry(command, buildPortalRunner(command), {
       config,
       cleanup: closeTrackedBrowsers,
     });
@@ -134,15 +172,29 @@ async function runContinuousPortal(command: string): Promise<void> {
     ? rawInterval
     : 300000;
 
+  // Loaded once up front: the continuous loop only ever drives one portal, and
+  // a broken portal module or config should fail the service loudly at boot
+  // rather than on every cycle.
+  const glintsModule =
+    command === "glints"
+      ? (require("./glints") as typeof import("./glints"))
+      : null;
+  const glintsJson =
+    command === "glints"
+      ? loadPortalConfig<import("./glints").GlintsConfigJson>("glints.json")
+      : null;
+
   for (;;) {
     const config = loadRetryConfig();
-    const cycle: { scraper: Glints | null } = { scraper: null };
-    const runner = command === "glints"
+    const cycle: { scraper: import("./glints").Glints | null } = {
+      scraper: null,
+    };
+    const runner = glintsModule && glintsJson
       ? () => {
-          cycle.scraper = new Glints(glintsJson);
+          cycle.scraper = new glintsModule.Glints(glintsJson);
           return cycle.scraper.Scrape();
         }
-      : portalRunners[command];
+      : buildPortalRunner(command);
 
     const sink = getRunRecordingSink();
     let runId: number | null = null;
@@ -189,40 +241,74 @@ async function runContinuousPortal(command: string): Promise<void> {
   }
 }
 
-const command = args[0];
+/**
+ * Names the runtime pairing in one log line so the next mismatch between the
+ * image's Node, the npm-installed Playwright and the portal being run is
+ * diagnosable straight from the container log. Requiring only Playwright's
+ * package.json keeps the library itself unloaded.
+ */
+function logBootBanner(command: string | undefined): void {
+  const playwrightVersion = (
+    require("playwright/package.json") as { version: string }
+  ).version;
+  console.info(
+    `[boot] node ${process.version} | playwright v${playwrightVersion} | command ${command ?? "(all)"}`,
+  );
+}
 
-if (command === "glints-continuous") {
-  void runContinuousPortal("glints");
-} else if (command && Object.prototype.hasOwnProperty.call(portalRunners, command)) {
-  void runPortal(command);
-} else {
-  switch (command) {
-    case "central-sync":
-      console.log("Will run central Supabase sync daemon");
-      void startCentralSyncDaemon();
-      break;
+function main(): void {
+  const command = args[0];
+  logBootBanner(command);
 
-    case "central-sync-once":
-      console.log("Will run a single central Supabase sync pass");
-      void (async () => {
-        const runner = new CentralSyncRunner();
-        await runner.runOnce();
-        await runner.stop();
-      })();
-      break;
+  if (command === "glints-continuous") {
+    void runContinuousPortal("glints");
+  } else if (
+    command &&
+    Object.prototype.hasOwnProperty.call(portalRunnerFactories, command)
+  ) {
+    void runPortal(command);
+  } else {
+    switch (command) {
+      case "central-sync": {
+        console.log("Will run central Supabase sync daemon");
+        const { startCentralSyncDaemon } =
+          require("./central/syncRunner") as typeof import("./central/syncRunner");
+        void startCentralSyncDaemon();
+        break;
+      }
 
-    case "central-stats":
-      console.log("Will report central ingestion outbox stats");
-      void (async () => {
-        const service = new CentralIngestionService();
-        await service.init();
-        console.log(await service.stats());
-        await service.close();
-      })();
-      break;
+      case "central-sync-once": {
+        console.log("Will run a single central Supabase sync pass");
+        const { CentralSyncRunner } =
+          require("./central/syncRunner") as typeof import("./central/syncRunner");
+        void (async () => {
+          const runner = new CentralSyncRunner();
+          await runner.runOnce();
+          await runner.stop();
+        })();
+        break;
+      }
 
-    default:
-      console.log("Will run all scrapers");
-      break;
+      case "central-stats": {
+        console.log("Will report central ingestion outbox stats");
+        const { CentralIngestionService } =
+          require("./central/ingestion") as typeof import("./central/ingestion");
+        void (async () => {
+          const service = new CentralIngestionService();
+          await service.init();
+          console.log(await service.stats());
+          await service.close();
+        })();
+        break;
+      }
+
+      default:
+        console.log("Will run all scrapers");
+        break;
+    }
   }
+}
+
+if (require.main === module) {
+  main();
 }
