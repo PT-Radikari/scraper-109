@@ -31,6 +31,17 @@ RUN ARCH="$(dpkg --print-architecture)" && \
     rm /tmp/node.tar.gz && \
     [ "$(node --version)" = "v${NODE_VERSION}" ]
 
+# The overlaid Node has no prebuilt sqlite3 binding (its prebuild-install
+# resolves no binary for this runtime), so `npm ci` must compile sqlite3 from
+# source — build-essential provides the make/g++ toolchain the base image
+# lacks. Installed before `npm ci`, together with the runtime libraries
+# Playwright's browsers need, in one lean apt layer.
+RUN apt-get update && \
+    apt-get -y install --no-install-recommends build-essential \
+    libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev \
+    libgbm-dev libasound-dev libatspi2.0-0 libxshmfence-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 # Set the working directory inside the container
 WORKDIR /app
 
@@ -45,8 +56,3 @@ RUN npm ci
 
 # Build the application using npm
 RUN npm run build
-
-# Install additional dependencies required by Playwright
-RUN apt-get update && \
-    apt-get -y install libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev \
-    libgbm-dev libasound-dev libatspi2.0-0 libxshmfence-dev
