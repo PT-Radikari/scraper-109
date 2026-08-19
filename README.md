@@ -72,7 +72,7 @@ npm run build
 ```
 
 Run with docker: Assuming your have installed docker, run the following command to execute it:
-Build (the image runs `npm install` during the build, so a checkout without `node_modules/` is all it needs)
+Build (the image runs `npm ci` during the build, so a checkout without `node_modules/` is all it needs)
 ```
 docker build -t playwright-runner . 
 ```
@@ -81,14 +81,14 @@ Run background mode
 docker run -d --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble
 docker run -d --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus
 docker run -d --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya
-docker run -d --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints
+docker run -d --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints:once
 ```
 Run foreground mode
 ```
 docker run -it --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble
 docker run -it --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus
 docker run -it --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya
-docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints
+docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints:once
 ```
 This command will create and run a Docker container named "playwright-runner-pintarnya" using the "playwright-runner:latest" image. It will also mount the "./db" directory from your local machine to the "/app/db" directory inside the container.
 
@@ -186,7 +186,8 @@ npm run xvfb:kitalulus-v2-process-applicants
 npm run xvfb:jooble
 npm run xvfb:seek
 npm run xvfb:pintarnya
-npm run xvfb:glints
+npm run xvfb:glints        # continuous newest-first loop (production entrypoint)
+npm run xvfb:glints:once   # single Glints run, exits when done
 npm run xvfb          # generic, no source selected
 ```
 
@@ -252,6 +253,8 @@ between idempotent cycles:
 
 ```bash
 npm run dev:glints:continuous
+# ts-node under xvfb (the Dokploy container entrypoint):
+npm run xvfb:glints
 # Production container supervision:
 docker run -d --name scraper-glints --restart always --env-file .env playwright-runner:latest npm run start:glints:continuous
 ```

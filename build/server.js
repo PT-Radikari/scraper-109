@@ -82,6 +82,11 @@ function runPortal(command) {
         }
         catch (error) {
             console.error(`${command} scraper failed on every attempt`, error);
+            const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+            const firstLine = error instanceof Error
+                ? error.message.split("\n")[0]
+                : String(error).split("\n")[0];
+            console.error(`[fatal] ${command}: exiting 1 - retry budget exhausted, last error ${errorClass}: ${firstLine}`);
             process.exitCode = 1;
         }
         finally {

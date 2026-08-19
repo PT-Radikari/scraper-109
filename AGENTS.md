@@ -10,6 +10,7 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - The per-portal SQLite files under `db/` are likewise runtime-created, git-ignored, and excluded from Docker images: the scoring Supabase's unique-constraint upserts are the dedupe authority, and a legacy portal starting from an empty local database may re-POST previously seen applicants to `api_destination` once (see `db/README.md`).
 - Because of the above, code that needs SQLite should load it lazily and sit behind an interface. `src/central/store.ts` is that interface; `LocalStore` is the SQLite implementation and `InMemoryStore` the portable one, and `tests/central/localStore.test.ts` runs the same contract against both (skipping the SQLite half when the binding will not load).
 - The scrapers build their SQL by string interpolation. Anything new should use bound parameters, as `src/central/localStore.ts` does.
+- The `dockerfile` base image tag must stay pinned to the exact `playwright` version in `package-lock.json` (pairing rule in the dockerfile header, enforced by `tests/dockerfile-playwright.test.ts`); a floating tag put production in a launch-fail crash loop. `npm run xvfb:glints` is the production (Dokploy) container entrypoint and runs the **continuous** loop; `xvfb:glints:once` is the single-run variant.
 
 ## Portal scraper retries
 
