@@ -62,7 +62,10 @@ export interface SinkApplicant {
   photo_path?: string | null;
   cv_bytes?: SinkArtifactBytes | null;
   photo_bytes?: SinkArtifactBytes | null;
-  /** Everything else the portal scraped, kept verbatim inside data.raw. */
+  /**
+   * Everything else the portal scraped, spread into the top level of `data`
+   * (glints' shape); the canonical keys win on collision.
+   */
   raw?: Record<string, unknown> | null;
 }
 
@@ -91,7 +94,7 @@ async function uploadOptionalArtifact(
  * Errors are sanitized (no PII, no keys) before they are logged and rethrown,
  * so a failing cycle surfaces one loud, safe line per applicant.
  *
- * @returns the sanitized identity actually used, for the caller's logging.
+ * @returns the scrape.* row ids of the upserted vacancy and candidate.
  */
 export async function sendApplicantToSink(
   sink: SupabaseSink,

@@ -168,6 +168,7 @@ describe("Pintarnya.sendToSink", () => {
       type: "applicant",
       applied_for: "Kasir",
       applied_for_id: "283020",
+      portal_candidate_id: "987654",
       applied_date: "2026-08-19",
       email: "ada@example.com",
       fullname: "Ada",
@@ -203,6 +204,9 @@ describe("Pintarnya.sendToSink", () => {
     );
     const candidate = sink.upsertCandidate.mock.calls[0][0];
     expect(candidate.portal).toBe("pintarnya");
+    // The intercepted candidate API id is the top rung of the identity ladder.
+    expect(candidate.portal_candidate_id).toBe("987654");
+    expect(candidate.data.identity.source).toBe("portal");
     expect(candidate.data.work_experience).toEqual([
       expect.objectContaining({ organization: "Toko" }),
     ]);

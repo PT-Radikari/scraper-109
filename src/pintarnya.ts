@@ -209,6 +209,14 @@ type Applicant = {
   applied_for_id: string;
 
   /**
+   * The portal-native id of the applicant, taken from the intercepted
+   * GET /api/pr/candidate/{id} response. Absent on flows that only see the DOM.
+   * @type {string}
+   * @example "987654"
+   */
+  portal_candidate_id?: string;
+
+  /**
    * The date the applicant applied for the jobVacancy.
    * @type {string}
    * @example "2024-05-24"
@@ -467,6 +475,7 @@ export class Pintarnya {
     await sendApplicantToSink(this.getSink(), {
       portal: param.channel,
       vacancy_id: param.applied_for_id,
+      portal_candidate_id: param.portal_candidate_id,
       applied_for: param.applied_for,
       applied_date: param.applied_date,
       name: param.fullname,
@@ -623,6 +632,11 @@ export class Pintarnya {
      * Open all the jobVacancy detail.
      */
     for (const jobVacancy of jobVacancyList) {
+      if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
+        console.info("Scrape limit reached. Stopping.");
+        break;
+      }
+
       console.info("=======================================================");
       console.info(`[VACANCY] Processing: "${jobVacancy.position}" @ ${jobVacancy.location}`);
 
@@ -1337,6 +1351,9 @@ export class Pintarnya {
         return false;
       }
 
+      const portalCandidateId = String(
+        d.id ?? response.url().match(/\/api\/pr\/candidate\/(\d+)$/)?.[1] ?? '',
+      );
       const name: string = d.fullname ?? '';
       const phone: string = (d.contact_phone ?? '').replace(/^\+/, '');
       const email: string = d.email ?? '';
@@ -1386,6 +1403,7 @@ export class Pintarnya {
         type: this.TYPE,
         applied_for: vacancyTitle,
         applied_for_id: appliedForId,
+        portal_candidate_id: portalCandidateId,
         applied_date: d.applied_at ?? '',
         email: email,
         fullname: name,

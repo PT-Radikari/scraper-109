@@ -792,12 +792,14 @@ export class KitaLulus {
           console.info(`[CANDIDATE] Opening row ${rowIndex + 1}/${rowCount}${appliedFor ? ` for "${appliedFor}"` : ""}...`);
 
           let detailHandle: ApplicantDetailHandle | null = null;
+          let photoTempPath = "";
           try {
             detailHandle = await this.openApplicantDetailPage(page, rowIndex);
             console.info("[CANDIDATE] Detail page opened.");
 
             await this.dismissMarketingOverlay(detailHandle.page);
             const applicant = await this.scrapeApplicantDetails("applicant", detailHandle.page, appliedFor);
+            photoTempPath = applicant.photo;
 
             if (applicant.whatapps.contact_number === "" && applicant.email === "") {
               console.info("[SKIP] No phone number and no email. Skipping send.");
@@ -810,13 +812,12 @@ export class KitaLulus {
             if (this.COLLECTED > collectedBefore) {
               newOnPage++;
             }
-
-            // Keep CV files on disk so the viewer can link directly to the saved document.
-            await this.RemoveTempFile(applicant.photo);
           } catch (error) {
             console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
             if (error instanceof SupabaseSinkError) throw error;
           } finally {
+            // Keep CV files on disk so the viewer can link directly to the saved document.
+            await this.RemoveTempFile(photoTempPath);
             if (detailHandle) {
               await detailHandle.cleanup();
             }
