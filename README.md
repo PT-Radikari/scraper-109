@@ -262,7 +262,8 @@ Run any sink-routed portal continuously, newest candidates first, with an
 env-driven pause between idempotent cycles (`SCRAPER_INTERVAL_MS`, default
 5 minutes). One Dokploy container per portal; each cycle writes one row to
 `scrape.scrape_runs`, and an expired portal session fails that cycle with one
-loud `[PORTAL] Session expired ...` log line while the loop keeps cycling:
+loud `[PORTAL] Session expired ...` log line while the loop keeps cycling
+(Glints first tries the credential self-login described above):
 
 ```bash
 npm run dev:glints:continuous     # also: dev:jooble:continuous, dev:seek:continuous,
