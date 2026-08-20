@@ -9,6 +9,13 @@ import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./c
 import { trackBrowser } from "./browserRegistry";
 import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { resolveCandidateIdentity } from "./candidateIdentity";
+import {
+  InMemorySessionStore,
+  LoginAttemptGuard,
+  PortalCredentials,
+  loadPortalCredentials,
+  maskSecrets,
+} from "./portalLogin";
 
 /**
  * Represents a cookie.
@@ -119,6 +126,64 @@ type ApplicantDB = Pick<Applicant, "email"> & {
 
 export const GLINTS_APPLICANT_ROW_SELECTOR =
   '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
+
+const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
+const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
+const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
+const GLINTS_LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]';
+
+/**
+ * Per-process login attempt cap. Module-level on purpose: the continuous loop
+ * constructs a fresh Glints instance per attempt/cycle, and the cap must
+ * survive those instances so a wrong password fails twice, loudly, and then
+ * backs off instead of retrying every cycle into an account lockout.
+ */
+const glintsLoginGuard = new LoginAttemptGuard({ maxConsecutiveFailures: 2 });
+
+/**
+ * The refreshed session captured after a successful credential login, held in
+ * memory only (never written to disk or the repo). Subsequent cycles in the
+ * same process replay it instead of the committed glints.json warm-start.
+ */
+export const glintsSessionStore = new InMemorySessionStore();
+
+/** Clears the login guard and session store. Test-only. */
+export function resetGlintsLoginState(): void {
+  glintsLoginGuard.reset();
+  glintsSessionStore.clear();
+}
+
+/** What the login page shows after (or while) a credential submit settles. */
+export type GlintsLoginOutcome =
+  | "success"
+  | "invalid_credentials"
+  | "challenge"
+  | "pending";
+
+const GLINTS_CHALLENGE_PATTERN =
+  /captcha|geetest|hcaptcha|cloudflare|two[\s-]?factor|\b2fa\b|one[\s-]?time password|\botp\b|kode (otp|verifikasi)|verification code|too many (login )?attempts|terlalu banyak/i;
+
+const GLINTS_INVALID_CREDENTIALS_PATTERN =
+  /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
+
+/**
+ * Classifies the state of the Glints login page from its URL and body text.
+ * Pure so the detection logic is unit-testable without a browser: leaving
+ * /login means the portal accepted the login; otherwise the body text is
+ * matched for a captcha/2FA/rate-limit wall first (retrying will not help, a
+ * human has to look) and a rejected-credentials banner second.
+ */
+export function classifyGlintsLoginResult(observation: {
+  url: string;
+  bodyText: string;
+}): GlintsLoginOutcome {
+  if (!observation.url.includes("/login")) return "success";
+  if (GLINTS_CHALLENGE_PATTERN.test(observation.bodyText)) return "challenge";
+  if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.bodyText)) {
+    return "invalid_credentials";
+  }
+  return "pending";
+}
 
 export class Glints {
   private HEADLESS: boolean = true;
@@ -235,6 +300,145 @@ export class Glints {
   /** Number of applicants successfully persisted by this run. */
   getCollectedCount(): number {
     return this.COLLECTED;
+  }
+
+  /**
+   * Recovers from an expired/absent session by logging in with the
+   * GLINTS_EMAIL / GLINTS_PASSWORD env credentials. Called when the dashboard
+   * redirected to /login. On success the refreshed cookies + localStorage are
+   * held in memory (glintsSessionStore) for the following cycles; on failure
+   * this throws one loud, credential-free error and lets the cycle fail — the
+   * continuous loop keeps cycling on its normal schedule.
+   *
+   * Every failure path is throttled by the module-level attempt guard so a
+   * wrong password or a captcha wall never becomes a login retry storm.
+   *
+   * @param page The page currently sitting on the login redirect.
+   * @param context The browser context, used to snapshot the fresh cookies.
+   */
+  async ensureAuthenticated(
+    page: any,
+    context: { cookies(): Promise<any[]> },
+  ): Promise<void> {
+    const credentials = loadPortalCredentials("GLINTS");
+    if (!credentials) {
+      throw new Error(
+        "[GLINTS] Session expired: dashboard redirected to login and GLINTS_EMAIL/GLINTS_PASSWORD are not set — configure the credentials or export a fresh session into glints.json",
+      );
+    }
+
+    const gate = glintsLoginGuard.canAttempt();
+    if (!gate.allowed) {
+      throw new Error(
+        `[GLINTS] Session expired and credential login skipped: ${gate.reason}`,
+      );
+    }
+
+    console.info("[GLINTS] Session expired — attempting credential login");
+    let outcome: GlintsLoginOutcome;
+    try {
+      outcome = await this.attemptCredentialLogin(page, credentials);
+    } catch (error) {
+      glintsLoginGuard.recordFailure("error");
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[GLINTS] GLINTS_LOGIN_FAILED: credential login errored: ${maskSecrets(message, [credentials.password, credentials.email])}`,
+      );
+    }
+
+    switch (outcome) {
+      case "success": {
+        glintsLoginGuard.recordSuccess();
+        glintsSessionStore.set({
+          cookies: await context.cookies(),
+          localStorage: await this.readLocalStorageSnapshot(page),
+          capturedAt: Date.now(),
+        });
+        console.info(
+          "[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles",
+        );
+        return;
+      }
+      case "challenge": {
+        glintsLoginGuard.recordFailure("challenge");
+        throw new Error(
+          "[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/2FA/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule",
+        );
+      }
+      case "invalid_credentials": {
+        glintsLoginGuard.recordFailure("invalid_credentials");
+        throw new Error(
+          "[GLINTS] GLINTS_LOGIN_FAILED: the portal rejected the configured credentials — fix GLINTS_EMAIL/GLINTS_PASSWORD",
+        );
+      }
+      default: {
+        glintsLoginGuard.recordFailure("error");
+        throw new Error(
+          `[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Fills and submits the employer login form, then polls until the portal
+   * either leaves /login, shows an error banner, or raises a challenge.
+   * @param page The page to drive; navigated to the login URL if not there.
+   * @param credentials The env credentials to submit.
+   * @returns The observed outcome; "pending" means the timeout elapsed first.
+   */
+  async attemptCredentialLogin(
+    page: any,
+    credentials: PortalCredentials,
+  ): Promise<GlintsLoginOutcome> {
+    if (!page.url().includes("/login")) {
+      await page.goto(GLINTS_LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+    }
+
+    await page.fill(GLINTS_LOGIN_EMAIL_SELECTOR, credentials.email);
+    await page.fill(GLINTS_LOGIN_PASSWORD_SELECTOR, credentials.password);
+    await page.click(GLINTS_LOGIN_SUBMIT_SELECTOR);
+
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+    let outcome: GlintsLoginOutcome = "pending";
+    for (let i = 0; i < attempts; i++) {
+      await page.waitForTimeout(pollIntervalMs);
+      outcome = classifyGlintsLoginResult({
+        url: page.url(),
+        bodyText: await this.readLoginBodyText(page),
+      });
+      if (outcome !== "pending") break;
+    }
+    return outcome;
+  }
+
+  /** Reads the page's visible text for login-outcome classification. */
+  private async readLoginBodyText(page: any): Promise<string> {
+    try {
+      return (await page.locator("body").textContent()) ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  /** Snapshots the page's localStorage for in-memory session reuse. */
+  private async readLocalStorageSnapshot(
+    page: any,
+  ): Promise<{ key: string; value: string }[]> {
+    try {
+      return await page.evaluate(() =>
+        Object.entries(localStorage).map(([key, value]) => ({
+          key,
+          value: String(value),
+        })),
+      );
+    } catch {
+      return [];
+    }
   }
 
   private async ensureLegacyDatabase(): Promise<void> {
@@ -552,7 +756,13 @@ export class Glints {
     const context = browser.contexts()[0] || await browser.newContext({
       viewport: { width: 1440, height: 900 }
     });
-    await context.addCookies(this.COOKIES);
+    // A session refreshed by a credential login earlier in this process beats
+    // the committed glints.json export, which is only an optional warm-start.
+    const storedSession = glintsSessionStore.get();
+    const sessionCookies = (storedSession?.cookies as Cookie[] | undefined) ?? this.COOKIES;
+    if (sessionCookies.length > 0) {
+      await context.addCookies(sessionCookies);
+    }
     context.setDefaultTimeout(this.TIMEOUT);
 
     const page = await context.newPage();
@@ -626,7 +836,7 @@ export class Glints {
       }
       // Suppress mobile app promo page
       localStorage.setItem('mobileAppPromptViewedDate', JSON.stringify(new Date().toISOString()));
-    }, this.LOCALSTORAGE);
+    }, storedSession?.localStorage ?? this.LOCALSTORAGE);
 
     await page.waitForTimeout(5000);
 
@@ -638,7 +848,20 @@ export class Glints {
     await page.waitForTimeout(3000);
 
     if (page.url().includes("/login")) {
-      throw new Error("[GLINTS] Session expired: dashboard redirected to login");
+      // Self-renew: log in with the env credentials, then retry the dashboard.
+      await this.ensureAuthenticated(page, context);
+
+      await page.goto("https://employers.glints.id/dashboard", {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+      await page.waitForTimeout(3000);
+
+      if (page.url().includes("/login")) {
+        throw new Error(
+          "[GLINTS] Session expired: dashboard still redirected to login after a successful credential login",
+        );
+      }
     }
 
     // Switch to the correct company before scraping — wrong company returns empty results
