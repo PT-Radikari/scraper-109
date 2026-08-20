@@ -155,21 +155,25 @@ describe("Glints.waitForCompanyControls", () => {
     expect(page.waits).toBeGreaterThanOrEqual(3);
   });
 
-  it("detects the live uppercase UBAH switcher control", async () => {
-    const scraper = new Glints(makeConfig());
-    const page = new FakeDashboardPage([0], [0]);
-    page.locator = (_selector: string) => ({
-      filter({ hasText }: { hasText: RegExp }) {
-        return {
-          // The live dashboard renders "UBAH"; the old /^Ubah$/ missed it.
-          count: async () => (hasText.test("UBAH") ? 1 : 0),
-          first: () => ({ click: async () => {} }),
-        };
-      },
-    }) as any;
+  it.each(["UBAH", "Ubah", "Change"])(
+    "detects the live switcher control rendered as %s",
+    async (label) => {
+      // The dashboard renders "UBAH" (id locale, uppercase), "Ubah" (older
+      // sessions) or "Change" (en locale); the old /^Ubah$/ missed two of them.
+      const scraper = new Glints(makeConfig());
+      const page = new FakeDashboardPage([0], [0]);
+      page.locator = (_selector: string) => ({
+        filter({ hasText }: { hasText: RegExp }) {
+          return {
+            count: async () => (hasText.test(label) ? 1 : 0),
+            first: () => ({ click: async () => {} }),
+          };
+        },
+      }) as any;
 
-    await expect(scraper.waitForCompanyControls(page as any)).resolves.toBe("switcher");
-  });
+      await expect(scraper.waitForCompanyControls(page as any)).resolves.toBe("switcher");
+    },
+  );
 });
 
 describe("Glints.selectTargetCompany", () => {

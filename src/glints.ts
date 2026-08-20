@@ -165,9 +165,10 @@ export function normalizeCompanyName(name: string): string {
 
 /**
  * The company switcher's change control. The live dashboard renders it as
- * "UBAH" (uppercase); older sessions rendered "Ubah" — match either.
+ * "UBAH" (uppercase), older sessions rendered "Ubah", and the dashboard
+ * sometimes serves the English locale, where it reads "Change" — match all.
  */
-const GLINTS_UBAH_REGEX = /^\s*ubah\s*$/i;
+const GLINTS_UBAH_REGEX = /^\s*(ubah|change)\s*$/i;
 
 /** What the login page shows after (or while) a credential submit settles. */
 export type GlintsLoginOutcome =
@@ -954,7 +955,11 @@ export class Glints {
     }
 
     const context = browser.contexts()[0] || await browser.newContext({
-      viewport: { width: 1440, height: 900 }
+      viewport: { width: 1440, height: 900 },
+      // The dashboard localizes from Accept-Language and Playwright defaults
+      // to en-US; the scraper's text anchors ("Belum Sesuai", "Semua Loker",
+      // gender labels, month names) assume the Indonesian locale.
+      locale: "id-ID",
     });
     // A session refreshed by a credential login earlier in this process beats
     // the committed glints.json export, which is only an optional warm-start.
