@@ -154,6 +154,21 @@ export function resetGlintsLoginState(): void {
   glintsSessionStore.clear();
 }
 
+/**
+ * Normalizes a company display name for comparison: trims, collapses inner
+ * whitespace, and lowercases. The switcher renders names like "PT RADIKARI"
+ * whose casing and padding must not defeat the target_company match.
+ */
+export function normalizeCompanyName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * The company switcher's change control. The live dashboard renders it as
+ * "UBAH" (uppercase); older sessions rendered "Ubah" — match either.
+ */
+const GLINTS_UBAH_REGEX = /^\s*ubah\s*$/i;
+
 /** What the login page shows after (or while) a credential submit settles. */
 export type GlintsLoginOutcome =
   | "success"
@@ -275,9 +290,8 @@ export class Glints {
   async waitForCompanyControls(
     page: playwright.Page,
   ): Promise<"target-selected" | "switcher" | "absent"> {
-    const TARGET_REGEX_ESCAPED = escapeRegExp(this.TARGETCOMPANY);
-    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+    const alreadySelected = page.locator('p').filter({ hasText: this.targetCompanyRegExp() });
+    const ubahLocator = page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX });
 
     const pollIntervalMs = 1000;
     const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 15000) / pollIntervalMs));
@@ -295,14 +309,41 @@ export class Glints {
   }
 
   /**
+   * A whole-string, case- and whitespace-insensitive regex for the configured
+   * target company's display name. Never matches when no target is configured.
+   */
+  private targetCompanyRegExp(): RegExp {
+    const tokens = this.TARGETCOMPANY.trim().split(/\s+/).filter(Boolean).map(escapeRegExp);
+    if (tokens.length === 0) return /(?!)/;
+    return new RegExp(`^\\s*${tokens.join("\\s+")}\\s*$`, "i");
+  }
+
+  /**
+   * Closes any modal sitting over the dashboard (the VIP-expired promo renders
+   * on load and swallows clicks aimed at the sidebar's UBAH switcher).
+   */
+  private async dismissBlockingModal(page: playwright.Page): Promise<void> {
+    const close = page.locator('[data-testid="modal-close-btn"]');
+    try {
+      for (let i = 0; i < 3 && (await close.count()) > 0; i++) {
+        await close.first().click();
+        await page.waitForTimeout(500);
+      }
+    } catch {
+      // The modal can unmount between count() and click(); it is gone either way.
+    }
+  }
+
+  /**
    * Selects the target company from the Glints company switcher dropdown on the dashboard.
-   * Required when the account manages multiple companies — the wrong company will return empty results.
+   * Required when the account manages multiple companies — the wrong company will return
+   * empty results. Matching is against the switcher's *display* strings (trimmed,
+   * case-insensitive); a non-match throws naming every entry seen, never a silent skip.
    */
   async selectTargetCompany(page: playwright.Page): Promise<void> {
     if (!this.TARGETCOMPANY) return;
 
     const TARGET = this.TARGETCOMPANY;
-    const TARGET_REGEX_ESCAPED = escapeRegExp(TARGET);
 
     const controls = await this.waitForCompanyControls(page);
     if (controls === "target-selected") {
@@ -313,30 +354,41 @@ export class Glints {
       return;
     }
     if (controls === "absent") {
-      console.warn(
-        `[GLINTS] target_company "${TARGET}" is configured but no company switcher rendered and the target is not the active company — continuing with the session's current company`,
+      throw new Error(
+        `[GLINTS] target_company "${TARGET}" is configured but the dashboard rendered neither the target as the active company nor the UBAH company switcher — cannot confirm which company this session would scrape`,
       );
-      return;
     }
 
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
-    console.info(`[GLINTS] Switching company to: ${TARGET}`);
+    // The VIP-expired modal renders over the sidebar and swallows the UBAH click.
+    await this.dismissBlockingModal(page);
 
-    // Click the "Ubah" button to open the dropdown
-    await ubahLocator.locator('..').click();
+    console.info(`[GLINTS] Switching company to: ${TARGET}`);
+    await page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX }).first().click();
     await page.waitForTimeout(1000);
 
-    // Try ARIA option role first (react-select exposes these), fall back to div text match
-    const optionByRole = page.getByRole('option', { name: TARGET, exact: true });
-    if (await optionByRole.count() > 0) {
-      await optionByRole.click();
-    } else {
-      await page.locator('div').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) }).last().click();
+    // react-select exposes the menu either as ARIA options or (live dashboard,
+    // 2026-08) as plain divs carrying the select__option class.
+    let optionLocator = page.getByRole('option');
+    if ((await optionLocator.count()) === 0) {
+      optionLocator = page.locator('[class*="select__option"]');
     }
+    const entries = (await optionLocator.allInnerTexts()).map((t: string) => t.trim());
+    console.info(`[GLINTS] Company switcher entries: ${JSON.stringify(entries)}`);
+
+    const wanted = normalizeCompanyName(TARGET);
+    const index = entries.findIndex((entry: string) => normalizeCompanyName(entry) === wanted);
+    if (index === -1) {
+      throw new Error(
+        `[GLINTS] target_company "${TARGET}" matched none of the company switcher entries ${JSON.stringify(entries)} — set target_company to one of those display strings`,
+      );
+    }
+
+    console.info(`[GLINTS] Choosing switcher entry ${index}: "${entries[index]}"`);
+    await optionLocator.nth(index).click();
 
     // Wait for the page to reload with the new company's data
     await page.waitForTimeout(3000);
-    console.info(`[GLINTS] Company switched to: ${TARGET}`);
+    console.info(`[GLINTS] Company switched to: ${entries[index]}`);
   }
 
   /**

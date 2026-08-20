@@ -7,5 +7,5 @@
     "timeout": 60000,
     "slowmo": 10000,
     "db_path": "../db/glints.db",
-    "target_company": "PT Rajawali Berdikari Indonesia"
+    "target_company": "PT RADIKARI"
 }
