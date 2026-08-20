@@ -260,21 +260,35 @@ export function parseGlintsApplicationDetail(payload: unknown): GlintsApplicatio
   const applicant = (typeof d.Applicant === "object" && d.Applicant !== null ? d.Applicant : {}) as Record<string, any>;
 
   const str = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+  // Un-progressed ("BARU") applications carry Glints' masked placeholders
+  // ("+62****", "****@****") instead of real contact values; a placeholder is
+  // absent data, and storing it would dedupe unrelated candidates onto one row.
+  const contact = (value: unknown): string => stripGlintsContactMask(str(value));
   // Applicant.phone can be a bare country code ("+62"); too short to be a
   // number, so it never wins over the real WhatsApp fields.
-  const phone = str(d.phone).replace(/\D/g, "").length >= 7 ? str(d.phone) : "";
+  const phone = contact(d.phone).replace(/\D/g, "").length >= 7 ? contact(d.phone) : "";
 
   return {
     applicantId: str(d.ApplicantId) || str(applicant.id),
-    email: str(applicant.email),
+    email: contact(applicant.email),
     whatsappNumber:
-      str((d.whatsAppDetails as Record<string, unknown> | undefined)?.whatsAppNumber) ||
-      str(applicant.whatsappNumber) ||
+      contact((d.whatsAppDetails as Record<string, unknown> | undefined)?.whatsAppNumber) ||
+      contact(applicant.whatsappNumber) ||
       phone,
     resumeKey: str(d.resume),
     birthDate: str(applicant.birthDate).slice(0, 10),
     gender: str(applicant.gender),
   };
+}
+
+/**
+ * Collapses Glints' masked contact placeholders to "". Contact info is gated
+ * until an application is moved past the "BARU" stage; both the modal and the
+ * application-detail API then render mask literals like "+62****" and
+ * "****@****" — never real data, so any starred value is treated as absent.
+ */
+export function stripGlintsContactMask(value: string): string {
+  return value.includes("*") ? "" : value;
 }
 
 export class Glints {
@@ -1750,10 +1764,10 @@ export class Glints {
       const row = labelLocator.locator("..");
       const anchor = row.locator("a").first();
       if ((await anchor.count()) > 0) {
-        return ((await anchor.textContent()) ?? "").trim();
+        return stripGlintsContactMask(((await anchor.textContent()) ?? "").trim());
       }
       // Anchor drift fallback: the row's text minus the label itself.
-      return ((await row.innerText()) ?? "").replace(label, "").trim();
+      return stripGlintsContactMask(((await row.innerText()) ?? "").replace(label, "").trim());
     } catch {
       return "";
     }

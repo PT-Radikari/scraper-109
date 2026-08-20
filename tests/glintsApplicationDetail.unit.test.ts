@@ -338,3 +338,32 @@ describe("Glints application-detail capture and resume download", () => {
     await expect(scraper.fetchResumeViaApi(fakePage, "abc.pdf", "Ada")).resolves.toBe("");
   });
 });
+
+describe("Glints masked-placeholder gating", () => {
+  it("treats Glints' masked contact placeholders in the API payload as absent", () => {
+    const detail = parseGlintsApplicationDetail({
+      data: {
+        ApplicantId: "5f22b32a-7290-4172-8936-fb670a1f0d1e",
+        resume: "",
+        whatsAppDetails: { whatsAppNumber: "+62****", isAvailable: true },
+        Applicant: { id: "5f22b32a-7290-4172-8936-fb670a1f0d1e", email: "****@****" },
+      },
+    });
+    expect(detail?.whatsappNumber).toBe("");
+    expect(detail?.email).toBe("");
+    expect(detail?.applicantId).toBe("5f22b32a-7290-4172-8936-fb670a1f0d1e");
+  });
+
+  it("treats the modal's masked contact placeholders as absent in the DOM fallback", async () => {
+    const scraper = new Glints(makeConfig());
+    const modal = new FakeContactModal({
+      "WhatsApp:": { anchorText: "+62****" },
+      "Email:": { anchorText: "****@****" },
+    });
+    expect(await scraper.extractWhatapps({}, modal)).toEqual({
+      type: "WhatsApp",
+      contact_number: "",
+    });
+    expect(await scraper.extractEmail({}, modal)).toBe("");
+  });
+});
