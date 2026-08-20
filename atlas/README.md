@@ -2,10 +2,14 @@
 
 This Atlas project owns only the direct scoring sink schemas:
 
-- `scrape`: vacancies, candidates, applications, scrape-run observability, and
-  the SECURITY DEFINER projection (functions, trigger, and id sequence in
+- `scrape`: vacancies, candidates, applications, scrape-run observability, the
+  SECURITY DEFINER projection (functions, trigger, and id sequence in
   `20260818090000_project_talent_scraping.sql`) that mirrors every candidate
-  write into the `talent_scraping` tables.
+  write into the `talent_scraping` tables, and the `glints_verification`
+  device-verification code hand-off table
+  (`20260820150000_glints_verification.sql`) — service-role only, no anon
+  grants, RLS enabled with no policies (Supabase's `service_role` bypasses
+  RLS).
 - `talent_scraping`: an exact structural mirror of the cloud scoring schema's
   `talent_scraping` and `talent_work_experience` tables. It is populated only
   by the projection trigger; anon has no grants on this schema.
@@ -90,3 +94,9 @@ psql "$DATABASE_URL" -f storage.sql
 
 `scrape-artifacts` permits anon inserts and deliberately has no anon select or
 delete policy.
+
+The persisted Glints session object (`glints/session/current.json`) lives in
+the same bucket but is read and overwritten only with the service-role key
+(`SCORING_SUPABASE_SERVICE_KEY`), which bypasses storage RLS — no additional
+storage policy is needed for it, and none should be added: an anon select
+policy would expose every CV in the bucket.

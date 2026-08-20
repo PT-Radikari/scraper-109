@@ -16,6 +16,13 @@ export interface SupabaseSinkConfig {
   url: string;
   anonKey: string;
   bucket: string;
+  /**
+   * Optional service-role key (SCORING_SUPABASE_SERVICE_KEY). Required only
+   * for the service-only surfaces: the glints_verification hand-off table and
+   * private session-object reads/overwrites in the bucket. Everything the
+   * sink always did keeps running on the anon key alone.
+   */
+  serviceKey?: string;
 }
 
 /** Payload for scrape.portal_vacancies. */
@@ -139,11 +146,14 @@ export class SupabaseSink {
   private readonly url: string;
   private readonly anonKey: string;
   private readonly bucket: string;
+  private readonly serviceKey: string | null;
 
   constructor(config?: Partial<SupabaseSinkConfig>) {
     this.url = (config?.url ?? process.env.SCORING_SUPABASE_URL ?? "").replace(/\/+$/, "");
     this.anonKey = config?.anonKey ?? process.env.SCORING_SUPABASE_ANON_KEY ?? "";
     this.bucket = config?.bucket ?? process.env.SCORING_SUPABASE_BUCKET ?? "scrape-artifacts";
+    this.serviceKey = config?.serviceKey ?? process.env.SCORING_SUPABASE_SERVICE_KEY ?? null;
+    if (this.serviceKey === "") this.serviceKey = null;
 
     if (!this.url) {
       throw new Error("SupabaseSink: SCORING_SUPABASE_URL is required");
@@ -157,6 +167,36 @@ export class SupabaseSink {
     return {
       apikey: this.anonKey,
       Authorization: `Bearer ${this.anonKey}`,
+      "Content-Type": "application/json",
+      "Accept-Profile": "scrape",
+      "Content-Profile": "scrape",
+      ...extra,
+    };
+  }
+
+  /**
+   * Whether the service-only surfaces (verification hand-off, session-object
+   * persistence) are usable. Callers must check this instead of letting a
+   * missing key surface as a request failure mid-flow.
+   */
+  hasServiceAccess(): boolean {
+    return this.serviceKey !== null;
+  }
+
+  /**
+   * Headers for the service-only surfaces. The service key bypasses RLS, so
+   * nothing here may ever be reachable from scraped-content code paths;
+   * keep its use confined to the verification table and the session object.
+   */
+  private serviceHeaders(extra: Record<string, string> = {}): Record<string, string> {
+    if (!this.serviceKey) {
+      throw new SupabaseSinkError(
+        "SupabaseSink: SCORING_SUPABASE_SERVICE_KEY is required for this operation"
+      );
+    }
+    return {
+      apikey: this.serviceKey,
+      Authorization: `Bearer ${this.serviceKey}`,
       "Content-Type": "application/json",
       "Accept-Profile": "scrape",
       "Content-Profile": "scrape",
@@ -474,6 +514,133 @@ export class SupabaseSink {
 
       await axios.patch(`${this.url}/rest/v1/scrape_runs?id=eq.${runId}`, patch, {
         headers: this.headers({ Prefer: "return=representation" }),
+      });
+    });
+  }
+
+  /**
+   * Opens one device-verification hand-off: inserts a `requested` row into
+   * scrape.glints_verification for a human to fill with the emailed code.
+   * Service-key only — the table has no anon grants.
+   * @returns the numeric id of the new row, for the operator log line.
+   */
+  async createVerificationRequest(): Promise<number> {
+    return this.guard("createVerificationRequest", async () => {
+      const response = await axios.post(
+        `${this.url}/rest/v1/glints_verification`,
+        [{ status: "requested" }],
+        { headers: this.serviceHeaders({ Prefer: "return=representation" }) }
+      );
+      return Number(response.data[0].id);
+    });
+  }
+
+  /**
+   * The most recently opened verification request, regardless of status.
+   * Drives the code-request rate cap: a recent row means a code email went
+   * out not long ago, so the scraper must not click "send code" again yet —
+   * and the DB timestamp survives container restarts where module state
+   * would not.
+   */
+  async latestVerificationRequest(): Promise<{
+    id: number;
+    requested_at: string;
+    status: string;
+  } | null> {
+    return this.guard("latestVerificationRequest", async () => {
+      const response = await axios.get(`${this.url}/rest/v1/glints_verification`, {
+        headers: this.serviceHeaders(),
+        params: { select: "id,requested_at,status", order: "requested_at.desc", limit: 1 },
+      });
+      const row = response.data[0];
+      if (!row) return null;
+      return {
+        id: Number(row.id),
+        requested_at: String(row.requested_at),
+        status: String(row.status),
+      };
+    });
+  }
+
+  /**
+   * Reads back one verification row while polling for the human-entered code.
+   * The code value is a one-time secret: callers submit it to the portal and
+   * must never write it into a log line or an error message.
+   */
+  async readVerificationRequest(id: number): Promise<{ code: string | null; status: string } | null> {
+    return this.guard("readVerificationRequest", async () => {
+      const response = await axios.get(`${this.url}/rest/v1/glints_verification`, {
+        headers: this.serviceHeaders(),
+        params: { select: "code,status", id: `eq.${id}`, limit: 1 },
+      });
+      const row = response.data[0];
+      if (!row) return null;
+      return {
+        code: typeof row.code === "string" && row.code.trim() !== "" ? row.code.trim() : null,
+        status: String(row.status),
+      };
+    });
+  }
+
+  /**
+   * Settles one verification row: `consumed` once its code logged the scraper
+   * in, `rejected` when the portal refused the code, `expired` when the
+   * bounded wait ran out. submitted_at records when the code was used.
+   */
+  async settleVerificationRequest(
+    id: number,
+    status: "consumed" | "rejected" | "expired",
+    submittedAt?: string
+  ): Promise<void> {
+    return this.guard("settleVerificationRequest", async () => {
+      const patch: Record<string, unknown> = { status };
+      if (submittedAt !== undefined) patch.submitted_at = submittedAt;
+      await axios.patch(`${this.url}/rest/v1/glints_verification?id=eq.${id}`, patch, {
+        headers: this.serviceHeaders({ Prefer: "return=minimal" }),
+      });
+    });
+  }
+
+  /**
+   * Downloads one private object from the artifact bucket (the persisted
+   * session snapshot). Service-key only: the bucket deliberately has no anon
+   * SELECT policy. A missing object resolves to null instead of throwing so
+   * first boot falls through to the credential login path.
+   */
+  async downloadPrivateObject(key: string): Promise<Buffer | null> {
+    return this.guard("downloadPrivateObject", async () => {
+      try {
+        const response = await axios.get(
+          `${this.url}/storage/v1/object/${this.bucket}/${key}`,
+          {
+            headers: this.serviceHeaders(),
+            responseType: "arraybuffer",
+          }
+        );
+        return Buffer.from(response.data);
+      } catch (error) {
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (status === 404 || status === 400) return null;
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * Uploads (and overwrites) one private object in the artifact bucket.
+   * x-upsert makes re-persisting the session snapshot idempotent; anon cannot
+   * do this because overwrite needs UPDATE, which only the service key has.
+   */
+  async uploadPrivateObject(key: string, bytes: Buffer, contentType: string): Promise<void> {
+    return this.guard("uploadPrivateObject", async () => {
+      const auth = this.serviceHeaders();
+      await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+        headers: {
+          apikey: auth.apikey,
+          Authorization: auth.Authorization,
+          "Content-Type": contentType,
+          "x-upsert": "true",
+        },
       });
     });
   }

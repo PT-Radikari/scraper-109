@@ -10,9 +10,11 @@ import { trackBrowser } from "./browserRegistry";
 import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { resolveCandidateIdentity } from "./candidateIdentity";
 import {
+  BucketSessionStore,
   InMemorySessionStore,
   LoginAttemptGuard,
   PortalCredentials,
+  SessionSnapshot,
   captureLoginDebugArtifacts,
   escapeRegExp,
   loadPortalCredentials,
@@ -179,6 +181,7 @@ export type GlintsLoginOutcome =
   | "invalid_credentials"
   | "challenge"
   | "otp_required"
+  | "device_verification"
   | "pending";
 
 const GLINTS_CHALLENGE_PATTERN =
@@ -237,6 +240,34 @@ const GLINTS_OTP_ELEMENT_SELECTOR = [
 ].join(", ");
 
 /**
+ * The "Verifikasi diri Anda" device-verification interstitial (captured live
+ * 2026-08-20, scrape-artifacts/glints/login-debug/2026-08-20T13-56-29-719Z/):
+ * the URL stays on /login, no code input is rendered yet, and the page offers
+ * a WhatsApp OTP and an email verification code behind these two data-cy
+ * buttons. Only the email one is ever clicked — the WhatsApp option would
+ * text a human's phone.
+ */
+export const GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR =
+  '[data-cy="send-email-verification-btn"]';
+export const GLINTS_VERIFICATION_METHOD_SELECTOR =
+  '[data-cy="send-email-verification-btn"], [data-cy="send-whatsApp-verification-btn"]';
+
+/**
+ * Where the emailed code gets typed once the send-email button was clicked.
+ * The exact post-click DOM is not captured, so this covers the common shapes:
+ * the generic OTP input hooks plus numeric/single-character code boxes.
+ */
+const GLINTS_VERIFICATION_CODE_INPUT_SELECTOR = [
+  GLINTS_OTP_ELEMENT_SELECTOR,
+  'input[inputmode="numeric"]',
+  'input[type="tel"]',
+  'input[maxlength="1"]',
+].join(", ");
+
+/** Private bucket object holding the persisted session snapshot. */
+const GLINTS_SESSION_OBJECT_KEY = "glints/session/current.json";
+
+/**
  * Classifies the state of the Glints login page. Pure so the detection logic
  * is unit-testable without a browser: leaving /login means the portal accepted
  * the login unless it landed on a verification route or an OTP form; on /login
@@ -251,10 +282,17 @@ export function classifyGlintsLoginResult(observation: {
   visibleText: string;
   hasChallengeElement: boolean;
   hasOtpElement: boolean;
+  /**
+   * A rendered "Verifikasi diri Anda" method-choice button
+   * (GLINTS_VERIFICATION_METHOD_SELECTOR). Optional so pure classifier call
+   * sites predating the interstitial keep compiling; absent means not seen.
+   */
+  hasVerificationMethodElement?: boolean;
 }): GlintsLoginOutcome {
   const otpFormRendered =
     observation.hasOtpElement && GLINTS_OTP_PATTERN.test(observation.visibleText);
   if (!observation.url.includes("/login")) {
+    if (observation.hasVerificationMethodElement) return "device_verification";
     if (glintsUrlLooksLikeVerification(observation.url) || otpFormRendered) {
       return "otp_required";
     }
@@ -263,6 +301,10 @@ export function classifyGlintsLoginResult(observation: {
   if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
     return "invalid_credentials";
   }
+  // The data-cy method buttons are a stronger signal than any wording: the
+  // interstitial renders no code input yet, so without this it would sit in
+  // "pending" until the timeout (the exact failure production hit).
+  if (observation.hasVerificationMethodElement) return "device_verification";
   if (otpFormRendered) return "otp_required";
   if (
     observation.hasChallengeElement &&
@@ -370,6 +412,16 @@ export class Glints {
 
   private CACHE_DIR: string = '';
   private TARGETCOMPANY: string = '';
+
+  /**
+   * Device-verification pacing. Instance fields (not config) so unit tests can
+   * shrink them; the poll interval is against the hand-off table, not Glints,
+   * so it can stay slow. The request interval is the anti-spam cadence for
+   * "send me a code" emails and must stay long.
+   */
+  private VERIFICATION_CODE_WAIT_MS = 10 * 60_000;
+  private VERIFICATION_POLL_INTERVAL_MS = 15_000;
+  private VERIFICATION_REQUEST_MIN_INTERVAL_MS = 30 * 60_000;
 
   /**
    * Represents a Glints object.
@@ -619,36 +671,11 @@ export class Glints {
 
     switch (outcome) {
       case "success": {
-        await page.goto("https://employers.glints.id/dashboard", {
-          waitUntil: "domcontentloaded",
-          timeout: this.TIMEOUT,
-        });
-        const landing = await this.waitForDashboardOrLogin(page);
-        if (landing !== "dashboard" || !(await this.hasDashboardMarker(page))) {
-          // The portal held the session on an interstitial. If that
-          // interstitial is the OTP/device-verification page, name it.
-          if ((await this.observeLoginPage(page)) === "otp_required") {
-            await this.throwOtpRequired(page, credentials);
-          }
-          glintsLoginGuard.recordFailure("error");
-          await this.captureLoginDebug(
-            page,
-            "login submit left /login but the dashboard never rendered",
-            credentials,
-          );
-          throw new Error(
-            "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state",
-          );
-        }
-        glintsLoginGuard.recordSuccess();
-        glintsSessionStore.set({
-          cookies: await context.cookies(),
-          localStorage: await this.readLocalStorageSnapshot(page),
-          capturedAt: Date.now(),
-        });
-        console.info(
-          "[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles",
-        );
+        await this.confirmDashboardAfterLogin(page, context, credentials, true);
+        return;
+      }
+      case "device_verification": {
+        await this.completeDeviceVerification(page, context, credentials);
         return;
       }
       case "challenge": {
@@ -700,6 +727,298 @@ export class Glints {
     );
     throw new Error(
       "[GLINTS] GLINTS_LOGIN_OTP_REQUIRED: the portal is asking for an email OTP / device verification code — a human must complete the verification (check the GLINTS_EMAIL inbox) or export a fresh session into glints.json; in-process login attempts are parked so the inbox is not flooded",
+    );
+  }
+
+  /**
+   * Verifies that a login the portal accepted actually reaches the dashboard,
+   * then records the success and persists the refreshed session. Leaving
+   * /login alone is not success: the portal can park the session on an
+   * interstitial (device verification, password reset, onboarding).
+   * @param allowVerification Whether a device-verification interstitial found
+   *   here may start the code flow. False when called *from* that flow, so a
+   *   portal that re-raises verification right after a code was accepted
+   *   parks the attempt budget instead of looping.
+   */
+  private async confirmDashboardAfterLogin(
+    page: any,
+    context: { cookies(): Promise<any[]> },
+    credentials: PortalCredentials,
+    allowVerification: boolean,
+  ): Promise<void> {
+    await page.goto("https://employers.glints.id/dashboard", {
+      waitUntil: "domcontentloaded",
+      timeout: this.TIMEOUT,
+    });
+    const landing = await this.waitForDashboardOrLogin(page);
+    if (landing !== "dashboard" || !(await this.hasDashboardMarker(page))) {
+      // The portal held the session on an interstitial. If that interstitial
+      // is the device-verification or OTP page, name (or drive) it.
+      const observed = await this.observeLoginPage(page);
+      if (observed === "device_verification" && allowVerification) {
+        await this.completeDeviceVerification(page, context, credentials);
+        return;
+      }
+      if (observed === "otp_required" || observed === "device_verification") {
+        await this.throwOtpRequired(page, credentials);
+      }
+      glintsLoginGuard.recordFailure("error");
+      await this.captureLoginDebug(
+        page,
+        "login submit left /login but the dashboard never rendered",
+        credentials,
+      );
+      throw new Error(
+        "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state",
+      );
+    }
+    glintsLoginGuard.recordSuccess();
+    await this.persistSession(page, context);
+    console.info(
+      "[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles",
+    );
+  }
+
+  /**
+   * Drives the "Verifikasi diri Anda" device-verification interstitial: asks
+   * the portal to EMAIL a code (never the WhatsApp option), opens a hand-off
+   * row in scrape.glints_verification for a human to fill with that code,
+   * polls the row for a bounded window, submits the code on the page, and
+   * confirms the dashboard.
+   *
+   * Waiting is not a login failure: neither the rate-cap skip nor the code
+   * timeout consumes the credential attempt budget, so the ordinary cycle
+   * cadence keeps re-entering this flow until a human supplies the code. The
+   * "send code" click itself is capped through the row timestamps (one email
+   * per VERIFICATION_REQUEST_MIN_INTERVAL_MS, surviving restarts) so cycling
+   * never floods the inbox.
+   */
+  private async completeDeviceVerification(
+    page: any,
+    context: { cookies(): Promise<any[]> },
+    credentials: PortalCredentials,
+  ): Promise<void> {
+    let sink: SupabaseSink | null = null;
+    try {
+      sink = this.getSink();
+    } catch {
+      sink = null;
+    }
+    if (!sink || !sink.hasServiceAccess()) {
+      // No hand-off channel: park the budget exactly like the legacy OTP
+      // outcome so cycles do not keep re-submitting credentials pointlessly.
+      glintsLoginGuard.recordFailure("otp_required");
+      throw new Error(
+        "[GLINTS] GLINTS_VERIFICATION_UNAVAILABLE: the device-verification page is up but SCORING_SUPABASE_SERVICE_KEY is not configured, so there is no channel to hand a code to this process — configure the key or export a fresh session into glints.json; login attempts are parked",
+      );
+    }
+
+    // Rate-cap the "send code" click on the durable row timestamps — module
+    // state would reset with the container, and a restart loop must not turn
+    // into a code-email storm.
+    const recent = await sink.latestVerificationRequest();
+    if (recent) {
+      const age = Date.now() - Date.parse(recent.requested_at);
+      if (Number.isFinite(age) && age >= 0 && age < this.VERIFICATION_REQUEST_MIN_INTERVAL_MS) {
+        throw new Error(
+          `[GLINTS] GLINTS_VERIFICATION_WAITING: a verification code was already requested at ${recent.requested_at} (scrape.glints_verification row ${recent.id}, status ${recent.status}); not requesting another inside the ${Math.round(this.VERIFICATION_REQUEST_MIN_INTERVAL_MS / 60000)}-minute cadence — the loop keeps cycling`,
+        );
+      }
+    }
+
+    const requestId = await sink.createVerificationRequest();
+    try {
+      await page.click(GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR);
+    } catch (error) {
+      await this.settleVerification(sink, requestId, "expired");
+      glintsLoginGuard.recordFailure("error");
+      await this.captureLoginDebug(
+        page,
+        "device-verification email button did not accept the click",
+        credentials,
+      );
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[GLINTS] GLINTS_LOGIN_FAILED: the device-verification page rendered but the email-code button could not be clicked (UI drift?): ${maskSecrets(message, [credentials.password])} — see the LOGIN_DEBUG_ARTIFACTS line above`,
+      );
+    }
+
+    console.error(
+      `[GLINTS] GLINTS_VERIFICATION_CODE_NEEDED (check email ${credentials.email}; insert code into scrape.glints_verification row ${requestId})`,
+    );
+
+    const attempts = Math.max(
+      1,
+      Math.ceil(this.VERIFICATION_CODE_WAIT_MS / this.VERIFICATION_POLL_INTERVAL_MS),
+    );
+    let code: string | null = null;
+    for (let i = 0; i < attempts; i++) {
+      await page.waitForTimeout(this.VERIFICATION_POLL_INTERVAL_MS);
+      try {
+        const row = await sink.readVerificationRequest(requestId);
+        if (row?.code) {
+          code = row.code;
+          break;
+        }
+      } catch {
+        // Transient hand-off table hiccup — keep polling until the window ends.
+      }
+    }
+    if (code === null) {
+      await this.settleVerification(sink, requestId, "expired");
+      throw new Error(
+        `[GLINTS] GLINTS_VERIFICATION_CODE_TIMEOUT: no code appeared in scrape.glints_verification row ${requestId} within ${Math.round(this.VERIFICATION_CODE_WAIT_MS / 60000)} minutes — the loop keeps cycling and can request a fresh code after the ${Math.round(this.VERIFICATION_REQUEST_MIN_INTERVAL_MS / 60000)}-minute cadence`,
+      );
+    }
+
+    await this.enterVerificationCode(page, code, credentials);
+
+    // The portal accepts the code by leaving /login (or unmounting the
+    // verification card and letting the dashboard confirm below succeed).
+    const settleAttempts = Math.max(1, Math.ceil(this.TIMEOUT / 1000));
+    for (let i = 0; i < settleAttempts; i++) {
+      await page.waitForTimeout(1000);
+      if (!page.url().includes("/login")) break;
+    }
+    if (page.url().includes("/login")) {
+      await this.settleVerification(sink, requestId, "rejected", new Date().toISOString());
+      glintsLoginGuard.recordFailure("error");
+      await this.captureLoginDebug(
+        page,
+        "device-verification code was submitted but the portal stayed on /login",
+        credentials,
+      );
+      throw new Error(
+        `[GLINTS] GLINTS_VERIFICATION_CODE_REJECTED: the code from scrape.glints_verification row ${requestId} did not log the session in (mistyped or expired) — see the LOGIN_DEBUG_ARTIFACTS line above; a fresh code can be requested after the cadence window`,
+      );
+    }
+
+    await this.settleVerification(sink, requestId, "consumed", new Date().toISOString());
+    console.info(
+      `[GLINTS] Device verification completed via scrape.glints_verification row ${requestId}`,
+    );
+    await this.confirmDashboardAfterLogin(page, context, credentials, false);
+  }
+
+  /** Settles a hand-off row, never letting a settle failure mask the real outcome. */
+  private async settleVerification(
+    sink: SupabaseSink,
+    id: number,
+    status: "consumed" | "rejected" | "expired",
+    submittedAt?: string,
+  ): Promise<void> {
+    try {
+      await sink.settleVerificationRequest(id, status, submittedAt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[GLINTS] could not settle scrape.glints_verification row ${id} to ${status}: ${message}`,
+      );
+    }
+  }
+
+  /**
+   * Types the human-supplied code into whatever input shape the portal
+   * rendered after the email-code click: one input gets the whole code, a
+   * row of single-character boxes gets one digit each. Submits via an
+   * explicit submit button when one exists, otherwise Enter on the input.
+   * The code value itself is a one-time secret and never reaches a log line.
+   */
+  private async enterVerificationCode(
+    page: any,
+    code: string,
+    credentials: PortalCredentials,
+  ): Promise<void> {
+    const inputs = page.locator(GLINTS_VERIFICATION_CODE_INPUT_SELECTOR);
+    let count = 0;
+    const renderAttempts = Math.max(1, Math.ceil(this.TIMEOUT / 1000));
+    for (let i = 0; i < renderAttempts; i++) {
+      try {
+        count = await inputs.count();
+      } catch {
+        count = 0;
+      }
+      if (count > 0) break;
+      await page.waitForTimeout(1000);
+    }
+    if (count === 0) {
+      glintsLoginGuard.recordFailure("error");
+      await this.captureLoginDebug(
+        page,
+        "no code input rendered after requesting the email verification code",
+        credentials,
+      );
+      throw new Error(
+        "[GLINTS] GLINTS_LOGIN_FAILED: the email verification code was requested but no code input ever rendered — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state",
+      );
+    }
+
+    if (count === 1) {
+      await inputs.first().fill(code);
+    } else {
+      // One box per character; extra boxes beyond the code length stay empty.
+      const boxes = Math.min(count, code.length);
+      for (let i = 0; i < boxes; i++) {
+        await inputs.nth(i).fill(code[i]);
+      }
+    }
+
+    const submit = page.locator(GLINTS_LOGIN_SUBMIT_SELECTOR);
+    let submitCount = 0;
+    try {
+      submitCount = await submit.count();
+    } catch {
+      submitCount = 0;
+    }
+    if (submitCount > 0) {
+      await submit.first().click();
+    } else {
+      // Many OTP forms auto-submit on the last character; Enter covers the rest.
+      try {
+        await inputs.first().press("Enter");
+      } catch {
+        // Auto-submit already navigated — nothing left to press.
+      }
+    }
+  }
+
+  /**
+   * Snapshots the authenticated session and stores it in process memory and —
+   * when the service key is configured — as a private bucket object, so a
+   * container restart resumes the trusted session instead of triggering a new
+   * device verification. Session material never reaches logs.
+   */
+  private async persistSession(
+    page: any,
+    context: { cookies(): Promise<any[]> },
+  ): Promise<void> {
+    const snapshot: SessionSnapshot = {
+      cookies: await context.cookies(),
+      localStorage: await this.readLocalStorageSnapshot(page),
+      capturedAt: Date.now(),
+    };
+    glintsSessionStore.set(snapshot);
+    const bucketStore = this.getBucketSessionStore();
+    if (bucketStore) {
+      await bucketStore.persist(snapshot);
+    }
+  }
+
+  /**
+   * The durable session store, or null when the sink or its service key is
+   * not configured (session persistence is then memory-only, the pre-existing
+   * behavior).
+   */
+  private getBucketSessionStore(): BucketSessionStore | null {
+    let sink: SupabaseSink;
+    try {
+      sink = this.getSink();
+    } catch {
+      return null;
+    }
+    if (!sink.hasServiceAccess()) return null;
+    return new BucketSessionStore(sink, GLINTS_SESSION_OBJECT_KEY, (message) =>
+      console.warn(`[GLINTS] ${message}`),
     );
   }
 
@@ -777,6 +1096,11 @@ export class Glints {
     return this.detectRenderedElement(page, GLINTS_OTP_ELEMENT_SELECTOR);
   }
 
+  /** Detects the rendered "Verifikasi diri Anda" method-choice buttons. */
+  private async detectVerificationMethodElement(page: any): Promise<boolean> {
+    return this.detectRenderedElement(page, GLINTS_VERIFICATION_METHOD_SELECTOR);
+  }
+
   /** One classifier observation of the page's current state. */
   private async observeLoginPage(page: any): Promise<GlintsLoginOutcome> {
     return classifyGlintsLoginResult({
@@ -784,6 +1108,7 @@ export class Glints {
       visibleText: await this.readLoginVisibleText(page),
       hasChallengeElement: await this.detectLoginChallengeElement(page),
       hasOtpElement: await this.detectLoginOtpElement(page),
+      hasVerificationMethodElement: await this.detectVerificationMethodElement(page),
     });
   }
 
@@ -1258,8 +1583,20 @@ export class Glints {
       locale: "id-ID",
     });
     // A session refreshed by a credential login earlier in this process beats
-    // the committed glints.json export, which is only an optional warm-start.
-    const storedSession = glintsSessionStore.get();
+    // the bucket-persisted session from a previous container, which beats the
+    // committed glints.json export (only an optional warm-start). The bucket
+    // hop is what keeps a device-verified session trusted across restarts.
+    let storedSession = glintsSessionStore.get();
+    if (!storedSession) {
+      const bucketStore = this.getBucketSessionStore();
+      if (bucketStore) {
+        storedSession = await bucketStore.restore();
+        if (storedSession) {
+          glintsSessionStore.set(storedSession);
+          console.info("[GLINTS] Restored persisted session from the artifact bucket");
+        }
+      }
+    }
     const sessionCookies = (storedSession?.cookies as Cookie[] | undefined) ?? this.COOKIES;
     if (sessionCookies.length > 0) {
       await context.addCookies(sessionCookies);
@@ -1360,6 +1697,17 @@ export class Glints {
           "[GLINTS] Session expired: dashboard still redirected to login after a successful credential login",
         );
       }
+    }
+
+    // Every successfully authenticated session gets re-persisted (memory +
+    // bucket) so restarts replay the freshest cookies instead of falling back
+    // to credentials — which from the server's location means another device
+    // verification. Persistence failures must never fail a healthy scrape.
+    try {
+      await this.persistSession(page, context);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[GLINTS] session snapshot after authentication failed: ${message}`);
     }
 
     // Switch to the correct company before scraping — wrong company returns empty results

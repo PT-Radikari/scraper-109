@@ -248,6 +248,41 @@ table "scrape_runs" {
   }
 }
 
+table "glints_verification" {
+  schema  = schema.scrape
+  comment = "Hand-off channel for Glints device-verification codes: the scraper inserts a requested row and polls it; a human writes the emailed code into it. Service-key only — anon has no grants (RLS enabled, no policies)."
+
+  column "id" {
+    type = bigserial
+  }
+  column "requested_at" {
+    type    = timestamptz
+    null    = false
+    default = sql("now()")
+  }
+  column "code" {
+    type = text
+    null = true
+  }
+  column "submitted_at" {
+    type = timestamptz
+    null = true
+  }
+  column "status" {
+    type    = text
+    null    = false
+    default = "requested"
+  }
+
+  primary_key {
+    columns = [column.id]
+  }
+
+  index "glints_verification_requested_at_idx" {
+    columns = [column.requested_at]
+  }
+}
+
 table "talent_scraping" {
   schema = schema.talent_scraping
 

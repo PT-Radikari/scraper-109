@@ -341,3 +341,76 @@ export class InMemorySessionStore {
     this.snapshot = null;
   }
 }
+
+/**
+ * Private object storage for a persisted session snapshot;
+ * SupabaseSink.downloadPrivateObject / uploadPrivateObject satisfy it.
+ */
+export interface SessionObjectStorage {
+  downloadPrivateObject(key: string): Promise<Buffer | null>;
+  uploadPrivateObject(key: string, bytes: Buffer, contentType: string): Promise<void>;
+}
+
+/**
+ * Durable session persistence in a private bucket object, so a verified
+ * session survives container restarts (the in-memory store above does not).
+ * Session material is a credential-equivalent secret: it exists only in the
+ * bucket object and in process memory, and no method here ever logs, throws,
+ * or returns any of its contents in an error path — failures degrade to
+ * "no stored session" (restore) or a key-only warning (persist), and the
+ * caller falls back to the credential login path.
+ */
+export class BucketSessionStore {
+  constructor(
+    private readonly storage: SessionObjectStorage,
+    private readonly key: string,
+    private readonly warn: (message: string) => void = console.warn,
+  ) {}
+
+  /**
+   * Loads the persisted snapshot, or null when the object is missing,
+   * unreadable, or structurally not a session snapshot (staleness of the
+   * *content* — expired cookies — is discovered later by the dashboard
+   * redirecting to login, which the caller already handles).
+   */
+  async restore(): Promise<SessionSnapshot | null> {
+    let bytes: Buffer | null;
+    try {
+      bytes = await this.storage.downloadPrivateObject(this.key);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.warn(`session restore from ${this.key} failed: ${message}`);
+      return null;
+    }
+    if (bytes === null) return null;
+    try {
+      const parsed = JSON.parse(bytes.toString("utf8")) as SessionSnapshot;
+      if (!Array.isArray(parsed?.cookies) || !Array.isArray(parsed?.localStorage)) {
+        this.warn(`session object ${this.key} is not a session snapshot — ignoring it`);
+        return null;
+      }
+      return parsed;
+    } catch {
+      this.warn(`session object ${this.key} holds unparseable JSON — ignoring it`);
+      return null;
+    }
+  }
+
+  /**
+   * Overwrites the persisted snapshot. Never throws: persistence is an
+   * optimization on top of a login that already succeeded, and a storage
+   * outage must not fail the scrape run that produced the fresh session.
+   */
+  async persist(snapshot: SessionSnapshot): Promise<void> {
+    try {
+      await this.storage.uploadPrivateObject(
+        this.key,
+        Buffer.from(JSON.stringify(snapshot), "utf8"),
+        "application/json",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.warn(`session persist to ${this.key} failed: ${message}`);
+    }
+  }
+}

@@ -1,7 +1,9 @@
 import {
+  BucketSessionStore,
   InMemorySessionStore,
   LoginAttemptGuard,
   LoginDebugUploader,
+  SessionSnapshot,
   captureLoginDebugArtifacts,
   loadPortalCredentials,
   maskSecrets,
@@ -287,6 +289,81 @@ describe("captureLoginDebugArtifacts", () => {
     expect(capture).not.toBeNull();
     expect(capture!.screenshotPath).toBeNull();
     expect(capture!.htmlPath).toMatch(/page\.html$/);
+  });
+});
+
+describe("BucketSessionStore", () => {
+  const KEY = "glints/session/current.json";
+  const COOKIE_SECRET = "super-secret-cookie-value";
+
+  const snapshot: SessionSnapshot = {
+    cookies: [{ name: "session", value: COOKIE_SECRET, domain: ".glints.id", path: "/" }],
+    localStorage: [{ key: "k", value: "v" }],
+    capturedAt: 123,
+  };
+
+  class FakeObjectStorage {
+    objects: Record<string, Buffer> = {};
+    downloadError: Error | null = null;
+    uploadError: Error | null = null;
+
+    async downloadPrivateObject(key: string): Promise<Buffer | null> {
+      if (this.downloadError) throw this.downloadError;
+      return this.objects[key] ?? null;
+    }
+    async uploadPrivateObject(key: string, bytes: Buffer): Promise<void> {
+      if (this.uploadError) throw this.uploadError;
+      this.objects[key] = bytes;
+    }
+  }
+
+  it("round-trips a snapshot through the bucket object", async () => {
+    const storage = new FakeObjectStorage();
+    const store = new BucketSessionStore(storage, KEY, () => {});
+
+    await store.persist(snapshot);
+    expect(Object.keys(storage.objects)).toEqual([KEY]);
+
+    await expect(store.restore()).resolves.toEqual(snapshot);
+  });
+
+  it("restores null when no object exists yet", async () => {
+    const store = new BucketSessionStore(new FakeObjectStorage(), KEY, () => {});
+    await expect(store.restore()).resolves.toBeNull();
+  });
+
+  it("restores null on unparseable JSON and on non-snapshot shapes", async () => {
+    const storage = new FakeObjectStorage();
+    const store = new BucketSessionStore(storage, KEY, () => {});
+
+    storage.objects[KEY] = Buffer.from("{not json", "utf8");
+    await expect(store.restore()).resolves.toBeNull();
+
+    storage.objects[KEY] = Buffer.from(JSON.stringify({ hello: "world" }), "utf8");
+    await expect(store.restore()).resolves.toBeNull();
+  });
+
+  it("degrades a download failure to null without leaking session contents", async () => {
+    const storage = new FakeObjectStorage();
+    storage.objects[KEY] = Buffer.from(JSON.stringify(snapshot), "utf8");
+    storage.downloadError = new Error("storage is down");
+    const warns: string[] = [];
+    const store = new BucketSessionStore(storage, KEY, (m) => warns.push(m));
+
+    await expect(store.restore()).resolves.toBeNull();
+    expect(warns.join("\n")).toContain(KEY);
+    expect(warns.join("\n")).not.toContain(COOKIE_SECRET);
+  });
+
+  it("never throws from persist and never puts session contents in the warning", async () => {
+    const storage = new FakeObjectStorage();
+    storage.uploadError = new Error("bucket unavailable");
+    const warns: string[] = [];
+    const store = new BucketSessionStore(storage, KEY, (m) => warns.push(m));
+
+    await expect(store.persist(snapshot)).resolves.toBeUndefined();
+    expect(warns.join("\n")).toContain(KEY);
+    expect(warns.join("\n")).not.toContain(COOKIE_SECRET);
   });
 });
 
