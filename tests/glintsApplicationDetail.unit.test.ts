@@ -22,21 +22,21 @@ function makeConfig(): GlintsConfigJson {
 function liveDetailPayload(): unknown {
   return {
     data: {
-      id: "6ca7e1a5-179e-5338-b112-3abd92298c59",
+      id: "11111111-2222-5333-8444-555555555555",
       status: "IN_REVIEW",
-      resume: "9aa1daad75f8ef63b94feee0bd13b924.pdf",
+      resume: "0123456789abcdef0123456789abcdef.pdf",
       phone: null,
       expectedSalary: 7000000,
       whatsAppDetails: { whatsAppNumber: "+628111234567", isAvailable: true },
-      ApplicantId: "e094fa5a-293c-458d-aefe-a1d611691a77",
+      ApplicantId: "00000000-1111-4222-8333-444444444444",
       Applicant: {
-        id: "e094fa5a-293c-458d-aefe-a1d611691a77",
+        id: "00000000-1111-4222-8333-444444444444",
         email: "candidate@example.com",
-        firstName: "Dendy",
-        lastName: "Rahmat",
+        firstName: "Fixtura",
+        lastName: "Sintetis",
         phone: "+62",
         whatsappNumber: null,
-        birthDate: "1985-12-05T00:00:00.000Z",
+        birthDate: "1990-01-15T00:00:00.000Z",
         gender: "MALE",
       },
     },
@@ -47,12 +47,12 @@ describe("parseGlintsApplicationDetail", () => {
   it("extracts contact, resume key, identity and profile fields from the live payload shape", () => {
     const detail = parseGlintsApplicationDetail(liveDetailPayload());
     expect(detail).toEqual({
-      applicantId: "e094fa5a-293c-458d-aefe-a1d611691a77",
-      applicantName: "Dendy Rahmat",
+      applicantId: "00000000-1111-4222-8333-444444444444",
+      applicantName: "Fixtura Sintetis",
       email: "candidate@example.com",
       whatsappNumber: "+628111234567",
-      resumeKey: "9aa1daad75f8ef63b94feee0bd13b924.pdf",
-      birthDate: "1985-12-05",
+      resumeKey: "0123456789abcdef0123456789abcdef.pdf",
+      birthDate: "1990-01-15",
       gender: "MALE",
     });
   });
@@ -199,12 +199,12 @@ describe("Glints.sendToSink artifact references", () => {
 
     const applicant = {
       ...baseApplicant(),
-      portal_candidate_id: "e094fa5a-293c-458d-aefe-a1d611691a77",
+      portal_candidate_id: "00000000-1111-4222-8333-444444444444",
     };
     await scraper.sendToSink(applicant as Parameters<Glints["sendToSink"]>[0]);
 
     const candidate = sink.upsertCandidate.mock.calls[0][0];
-    expect(candidate.portal_candidate_id).toBe("e094fa5a-293c-458d-aefe-a1d611691a77");
+    expect(candidate.portal_candidate_id).toBe("00000000-1111-4222-8333-444444444444");
     expect(candidate.data.identity.source).toBe("portal");
     expect(candidate.phone).toBe("628111234567");
     expect(candidate.data.contact).toEqual({ type: "WhatsApp", contact_number: "628111234567" });
@@ -295,7 +295,7 @@ describe("Glints application-detail capture and resume download", () => {
       waitForResponse: async (matcher: (resp: any) => boolean) => {
         const matching = {
           url: () =>
-            "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+            "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
           status: () => 200,
           json: async () => liveDetailPayload(),
         };
@@ -307,8 +307,8 @@ describe("Glints application-detail capture and resume download", () => {
         return matching;
       },
     };
-    const detail = await scraper.armApplicationDetailCapture(fakePage, "Dendy Rahmat");
-    expect(detail?.applicantId).toBe("e094fa5a-293c-458d-aefe-a1d611691a77");
+    const detail = await scraper.armApplicationDetailCapture(fakePage, "Fixtura Sintetis");
+    expect(detail?.applicantId).toBe("00000000-1111-4222-8333-444444444444");
     expect(detail?.whatsappNumber).toBe("+628111234567");
   });
 
@@ -316,13 +316,13 @@ describe("Glints application-detail capture and resume download", () => {
     const scraper = new Glints(makeConfig());
     const fakePage = {
       waitForResponse: async () => ({
-        url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+        url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
         status: () => 200,
         json: async () => liveDetailPayload(),
       }),
     };
-    const detail = await scraper.armApplicationDetailCapture(fakePage, "  dendy   RAHMAT ");
-    expect(detail?.applicantId).toBe("e094fa5a-293c-458d-aefe-a1d611691a77");
+    const detail = await scraper.armApplicationDetailCapture(fakePage, "  fixtura   SINTETIS ");
+    expect(detail?.applicantId).toBe("00000000-1111-4222-8333-444444444444");
   });
 
   it("discards a capture whose Applicant name does not match the row's name", async () => {
@@ -331,7 +331,7 @@ describe("Glints application-detail capture and resume download", () => {
       const scraper = new Glints(makeConfig());
       const fakePage = {
         waitForResponse: async () => ({
-          url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+          url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
           status: () => 200,
           json: async () => liveDetailPayload(),
         }),
@@ -350,7 +350,7 @@ describe("Glints application-detail capture and resume download", () => {
         throw new Error("Timeout 20000ms exceeded");
       },
     };
-    await expect(scraper.armApplicationDetailCapture(fakePage, "Dendy Rahmat")).resolves.toBeNull();
+    await expect(scraper.armApplicationDetailCapture(fakePage, "Fixtura Sintetis")).resolves.toBeNull();
   });
 
   it("downloads the resume through the dashboard's s3 endpoint and stores it locally", async () => {
@@ -396,15 +396,15 @@ describe("Glints masked-placeholder gating", () => {
   it("treats Glints' masked contact placeholders in the API payload as absent", () => {
     const detail = parseGlintsApplicationDetail({
       data: {
-        ApplicantId: "5f22b32a-7290-4172-8936-fb670a1f0d1e",
+        ApplicantId: "99999999-8888-4777-8666-555555555555",
         resume: "",
         whatsAppDetails: { whatsAppNumber: "+62****", isAvailable: true },
-        Applicant: { id: "5f22b32a-7290-4172-8936-fb670a1f0d1e", email: "****@****" },
+        Applicant: { id: "99999999-8888-4777-8666-555555555555", email: "****@****" },
       },
     });
     expect(detail?.whatsappNumber).toBe("");
     expect(detail?.email).toBe("");
-    expect(detail?.applicantId).toBe("5f22b32a-7290-4172-8936-fb670a1f0d1e");
+    expect(detail?.applicantId).toBe("99999999-8888-4777-8666-555555555555");
   });
 
   it("treats the modal's masked contact placeholders as absent in the DOM fallback", async () => {
