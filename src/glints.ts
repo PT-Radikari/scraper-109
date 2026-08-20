@@ -818,8 +818,8 @@ export class Glints {
     // into a code-email storm.
     const recent = await sink.latestVerificationRequest();
     if (recent) {
-      const age = Date.now() - Date.parse(recent.requested_at);
-      if (Number.isFinite(age) && age >= 0 && age < this.VERIFICATION_REQUEST_MIN_INTERVAL_MS) {
+      const age = Math.max(0, Date.now() - Date.parse(recent.requested_at));
+      if (Number.isFinite(age) && age < this.VERIFICATION_REQUEST_MIN_INTERVAL_MS) {
         throw new Error(
           `[GLINTS] GLINTS_VERIFICATION_WAITING: a verification code was already requested at ${recent.requested_at} (scrape.glints_verification row ${recent.id}, status ${recent.status}); not requesting another inside the ${Math.round(this.VERIFICATION_REQUEST_MIN_INTERVAL_MS / 60000)}-minute cadence — the loop keeps cycling`,
         );
@@ -871,10 +871,15 @@ export class Glints {
       );
     }
 
-    await this.enterVerificationCode(page, code, credentials);
+    try {
+      await this.enterVerificationCode(page, code, credentials);
+    } catch (error) {
+      await this.settleVerification(sink, requestId, "expired");
+      throw error;
+    }
 
-    // The portal accepts the code by leaving /login (or unmounting the
-    // verification card and letting the dashboard confirm below succeed).
+    // The portal accepts the code by navigating the page off /login within
+    // the window below.
     const settleAttempts = Math.max(1, Math.ceil(this.TIMEOUT / 1000));
     for (let i = 0; i < settleAttempts; i++) {
       await page.waitForTimeout(1000);

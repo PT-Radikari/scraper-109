@@ -904,6 +904,21 @@ describe("Glints device-verification flow", () => {
     expect(next.fills['input[name="email"]']).toBe(EMAIL);
   });
 
+  it("treats a future requested_at (DB clock ahead of the host) as within-cadence", async () => {
+    sink.latest = {
+      id: 7,
+      requested_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      status: "requested",
+    };
+    const page = interstitialPage();
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_WAITING/,
+    );
+    expect(sink.created).toHaveLength(0);
+    expect(page.clicked.join(" ")).not.toContain("send-email");
+  });
+
   it("requests a fresh code once the previous request left the cadence window", async () => {
     sink.latest = {
       id: 7,
@@ -971,5 +986,6 @@ describe("Glints device-verification flow", () => {
       /no code input ever rendered/,
     );
     expect(sink.uploads.length).toBeGreaterThan(0);
+    expect(sink.settles).toEqual([{ id: 42, status: "expired", submittedAt: undefined }]);
   });
 });
