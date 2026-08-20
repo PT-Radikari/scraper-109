@@ -9,7 +9,7 @@ dotenv.config();
 /**
  * Configuration for the Supabase sink. Values fall back to the documented
  * environment variables (SCORING_SUPABASE_URL / SCORING_SUPABASE_ANON_KEY /
- * SCORING_SUPABASE_BUCKET) when not passed explicitly, so tests and the glints
+ * SCORING_SUPABASE_BUCKET) when not passed explicitly, so tests and the portal
  * wiring can construct it either way.
  */
 export interface SupabaseSinkConfig {
@@ -362,10 +362,25 @@ export class SupabaseSink {
    * @returns the object key the artifact was stored under.
    */
   async uploadArtifact(portal: string, kind: string, localPath: string): Promise<string> {
+    const ext = path.extname(localPath).replace(/^\./, "").toLowerCase();
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(localPath);
+    } catch (error) {
+      throw sanitizeSinkError(error, "uploadArtifact");
+    }
+    return this.uploadArtifactBytes(portal, kind, bytes, ext);
+  }
+
+  /**
+   * Same as uploadArtifact for artifacts that only exist in memory (e.g.
+   * pintarnya downloads CVs/photos into File objects, never to disk).
+   * @returns the object key the artifact was stored under.
+   */
+  async uploadArtifactBytes(portal: string, kind: string, bytes: Buffer, extension: string): Promise<string> {
     return this.guard("uploadArtifact", async () => {
-      const bytes = fs.readFileSync(localPath);
       const digest = crypto.createHash("sha256").update(bytes).digest("hex");
-      const ext = path.extname(localPath).replace(/^\./, "").toLowerCase();
+      const ext = extension.replace(/^\./, "").toLowerCase();
       const month = new Date().toISOString().slice(0, 7).replace("-", "");
       const key = `${portal}/${month}/${digest}.${ext}`;
 

@@ -1,7 +1,9 @@
 import axios from "axios";
 import playwright from "playwright";
-import sqlite3 from 'sqlite3';
+import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy } from "./central/portalBridge";
+import { SupabaseSink, SupabaseSinkError } from "./supabaseSink";
+import { sendApplicantToSink, SinkArtifactBytes } from "./portalSink";
 import fs from "fs";
 import path from "path";
 import { trackBrowser } from "./browserRegistry";
@@ -207,6 +209,14 @@ type Applicant = {
   applied_for_id: string;
 
   /**
+   * The portal-native id of the applicant, taken from the intercepted
+   * GET /api/pr/candidate/{id} response. Absent on flows that only see the DOM.
+   * @type {string}
+   * @example "987654"
+   */
+  portal_candidate_id?: string;
+
+  /**
    * The date the applicant applied for the jobVacancy.
    * @type {string}
    * @example "2024-05-24"
@@ -358,9 +368,11 @@ export class Pintarnya {
   private TIMEOUT: number = 30000;
   private MAX_RETRY: number = 3;
 
-  private DB: sqlite3.Database;
+  private DB?: sqlite3.Database;
+  private sink: SupabaseSink | null = null;
 
   private COLLECTED_APPLICANT: number = 0;
+  private VACANCIES_SEEN: number = 0;
   private FAILED_COLLECTED_APPLICANT: FAILED_COLLECTED_APPLICANT[] = [];
   private SKIPPED_APPLICANT_BY_DATABASE: number = 0;
 
@@ -416,8 +428,77 @@ export class Pintarnya {
     this.TIMEOUT = config.timeout;
 
     this.MAX_RETRY = config.max_retry;
+  }
 
-    this.DB = new sqlite3.Database(this.DB_PATH);
+  /**
+   * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+   * Construction is lazy so importing Pintarnya for a helper test does not
+   * require sink credentials.
+   */
+  private getSink(): SupabaseSink {
+    this.sink ??= new SupabaseSink();
+    return this.sink;
+  }
+
+  /** Number of vacancies discovered by this run. */
+  getVacanciesSeen(): number {
+    return this.VACANCIES_SEEN;
+  }
+
+  /** Number of applicants successfully persisted by this run. */
+  getCollectedCount(): number {
+    return this.COLLECTED_APPLICANT;
+  }
+
+  private async ensureLegacyDatabase(): Promise<void> {
+    if (this.DB) return;
+    await this.createDatabaseConnection();
+    await this.createRequiredTables();
+  }
+
+  /** Converts an in-memory File download into the sink's bytes shape. */
+  private async fileToArtifactBytes(file: File | null): Promise<SinkArtifactBytes | null> {
+    if (!file) return null;
+    const extension = path.extname(file.name).replace(/^\./, "") ||
+      (file.type === "application/pdf" ? "pdf" : "bin");
+    return { bytes: Buffer.from(await file.arrayBuffer()), extension };
+  }
+
+  /**
+   * Writes one applicant straight into the scoring Supabase via the shared
+   * direct-sink slice (see src/portalSink.ts). pintarnya carries a portal-
+   * native vacancy id (applied_for_id); CVs/photos only exist in memory, so
+   * they upload as bytes.
+   * @param param - The applicant data to be persisted.
+   */
+  async sendToSink(param: Applicant): Promise<void> {
+    await sendApplicantToSink(this.getSink(), {
+      portal: param.channel,
+      vacancy_id: param.applied_for_id,
+      portal_candidate_id: param.portal_candidate_id,
+      applied_for: param.applied_for,
+      applied_date: param.applied_date,
+      name: param.fullname,
+      email: param.email,
+      phone: param.contact?.contact_number,
+      date_of_birth: param.date_of_birth,
+      location: param.location,
+      work_experience: param.work_experiences,
+      education: param.educations,
+      skill: param.skills,
+      cv_bytes: await this.fileToArtifactBytes(param.cv),
+      photo_bytes: await this.fileToArtifactBytes(param.photo),
+      raw: {
+        type: param.type,
+        gender: param.gender,
+        age: param.age,
+        summary: param.summary,
+        latest_salary: param.latest_salary,
+        salary_expectation: param.salary_expectation,
+        reference_links: param.reference_links,
+      },
+    });
+    this.COLLECTED_APPLICANT++;
   }
 
   getBrowserFallbackExecutablePath(): string | null {
@@ -465,11 +546,9 @@ export class Pintarnya {
    */
   // https://image.moengage.com
   async Scrape(): Promise<void> {
-    console.info("Establishing database connection...");
-    this.DB = await this.createDatabaseConnection();
-
-    console.info("Creating required tables...");
-    await this.createRequiredTables();
+    // Fail fast at cycle start when the sink env vars are missing; the local
+    // SQLite path is bypassed entirely (mirrors glints).
+    this.getSink();
 
     console.info("[LOGIN] Launching browser...");
 
@@ -502,7 +581,13 @@ export class Pintarnya {
     await page.locator(this.SIGN_IN_SUBMIT_SELECTOR).click();
     console.info("[LOGIN] Submitted. Waiting for redirect to job vacancy page...");
 
-    await this.waitForEmployerLandingPage(page);
+    try {
+      await this.waitForEmployerLandingPage(page);
+    } catch (error) {
+      throw new Error(
+        `[PINTARNYA] Session expired: login did not reach the employer page (stuck on ${page.url()}) — refresh credentials/session in pintarnya.json — caused by: ${error instanceof Error ? error.message : error}`,
+      );
+    }
     await page.waitForLoadState("load");
     console.info("[LOGIN] Login successful.");
 
@@ -511,7 +596,8 @@ export class Pintarnya {
       const applicantCount = await this.extractCurrentCandidatePageApplicantCount(page);
       await this.processCurrentCandidatePage(page, applicantCount);
       console.info("[DONE] Finished scraping the current Kandidat page.");
-      process.exit(0);
+      await browser.close();
+      return;
     }
 
     console.info("[VACANCY] Closing modals and fetching job list...");
@@ -522,7 +608,8 @@ export class Pintarnya {
       const applicantCount = await this.extractCurrentCandidatePageApplicantCount(page);
       await this.processCurrentCandidatePage(page, applicantCount);
       console.info("[DONE] Finished scraping the current Kandidat page.");
-      process.exit(0);
+      await browser.close();
+      return;
     }
 
     console.info("[VACANCY] Scrolling to load all job vacancies...");
@@ -545,6 +632,11 @@ export class Pintarnya {
      * Open all the jobVacancy detail.
      */
     for (const jobVacancy of jobVacancyList) {
+      if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
+        console.info("Scrape limit reached. Stopping.");
+        break;
+      }
+
       console.info("=======================================================");
       console.info(`[VACANCY] Processing: "${jobVacancy.position}" @ ${jobVacancy.location}`);
 
@@ -615,42 +707,35 @@ export class Pintarnya {
       const appliedForId = pageUrl.split("job=")[1];
       console.log({ appliedForId });
 
-      const jobVacancyInDatabase = await this.getVacancyByPintarnyaJobId(appliedForId);
-      const applicantsOfJobVacancyInDatabase = await this.countApplicantByPintarnyaJobId(appliedForId);
-      console.log({ applicantsOfJobVacancyInDatabase });
-
-      let shouldScrape = true;
-
-      if (jobVacancyInDatabase === undefined && appliedForId !== undefined) {
-        console.info(`[DB] New vacancy, inserting into local DB: "${jobVacancy.position}" (id: ${appliedForId})`);
-        await this.insertJobVacancy(jobVacancy.position, jobVacancy.location, appliedForId, applicantCount);
-        shouldScrape = applicantCount > 0;
-      } else {
-        console.info(`[DB] Vacancy already in DB. DB applicants: ${jobVacancyInDatabase.applicants}, page applicants: ${applicantCount}, scraped: ${applicantsOfJobVacancyInDatabase}`);
-        if (
-          appliedForId === jobVacancyInDatabase.pintarnya_job_id &&
-          applicantCount === jobVacancyInDatabase.applicants &&
-          jobVacancyInDatabase.applicants === applicantsOfJobVacancyInDatabase
-        ) {
-          console.info("[SKIP] No new applicants since last run. Moving to next vacancy.");
-          shouldScrape = false;
-        } else {
-          console.info("[VACANCY] Applicant count changed, re-scraping...");
-          shouldScrape = applicantCount > 0;
-        }
+      // Sink path: no local staging. The vacancy row is upserted write-once
+      // into the scoring Supabase, and re-scrapes stay idempotent there, so
+      // every vacancy with visible applicants is scraped each cycle.
+      this.VACANCIES_SEEN++;
+      if (appliedForId !== undefined) {
+        await this.getSink().upsertVacancy({
+          portal: this.CHANNEL,
+          portal_vacancy_id: appliedForId,
+          title: jobVacancy.position,
+          link: pageUrl,
+          total_applicant: applicantCount,
+          status: "new",
+          raw: { location: jobVacancy.location },
+        });
       }
+
+      const shouldScrape = applicantCount > 0;
 
       if (shouldScrape) {
         await this.scrapeTableRows(page, appliedForId, jobVacancy.position);
       }
 
       if (jobVacancyList.lastIndexOf(jobVacancy) === jobVacancyList.length - 1) {
-        console.info("All jobVacancies have been processed. Exiting...");
+        console.info("All jobVacancies have been processed.");
         console.info("Total applicants collected: ", this.COLLECTED_APPLICANT);
         console.info("Total skipped applicants by database: ", this.SKIPPED_APPLICANT_BY_DATABASE);
         console.info("Total failed collected applicants: ", this.FAILED_COLLECTED_APPLICANT.length);
         console.info("Failed collected applicants: ", this.FAILED_COLLECTED_APPLICANT);
-        process.exit(0);
+        break;
       }
 
       console.info("=======================================================");
@@ -661,6 +746,8 @@ export class Pintarnya {
       await this.fetchingAllJobList(page);
     }
 
+    await browser.close();
+    console.log("DONE");
   }
 
   /**
@@ -698,8 +785,8 @@ export class Pintarnya {
       }
 
       if (await page.getByText(NO_VACANCY_TEXT).isVisible()) {
-        console.info("[VACANCY] No vacancies found. Exiting.");
-        process.exit(0);
+        console.info("[VACANCY] No vacancies found. Stopping vacancy scroll.");
+        return;
       }
 
       scrollCount++;
@@ -1034,6 +1121,11 @@ export class Pintarnya {
    * @param param - The applicant data.
    * @returns A Promise that resolves when the request is sent successfully.
    */
+  /**
+   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
+   * insert and central mirror. Kept untouched but bypassed: pintarnya now
+   * lands applicants directly in the scoring Supabase via sendToSink().
+   */
   async sendRequest(param: Applicant): Promise<void> {
     if (param.contact.contact_number === "") {
       console.info(`[SKIP] "${param.fullname}" has no phone number. Not sending to API.`);
@@ -1100,6 +1192,7 @@ export class Pintarnya {
 
     console.info("[DB] Inserting applicant into local DB...");
     const databaseKey = param.email || param.contact.contact_number;
+    await this.ensureLegacyDatabase();
     await this.insertApplicant(databaseKey, param.applied_for_id, param);
     this.COLLECTED_APPLICANT++;
     console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED_APPLICANT}`);
@@ -1172,8 +1265,8 @@ export class Pintarnya {
     let newOnPage = 0;
     for (let idx = 0; idx < totalCount; idx++) {
       if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
-        console.info("Scrape limit reached. Exiting...");
-        process.exit(0);
+        console.info("Scrape limit reached. Stopping.");
+        return;
       }
 
       if (this.DELAY > 0 && this.COLLECTED_APPLICANT > 0 && this.COLLECTED_APPLICANT % this.DELAY_AFTER === 0) {
@@ -1258,6 +1351,9 @@ export class Pintarnya {
         return false;
       }
 
+      const portalCandidateId = String(
+        d.id ?? response.url().match(/\/api\/pr\/candidate\/(\d+)$/)?.[1] ?? '',
+      );
       const name: string = d.fullname ?? '';
       const phone: string = (d.contact_phone ?? '').replace(/^\+/, '');
       const email: string = d.email ?? '';
@@ -1271,14 +1367,8 @@ export class Pintarnya {
         return false;
       }
 
-      const existingApplicant = await this.getApplicantByEmail(dedupeKey);
-      if (existingApplicant?.email === dedupeKey && existingApplicant?.applied_for_id === appliedForId) {
-        console.info(`[SKIP] Already in local DB: ${name} (${dedupeKey}).`);
-        this.SKIPPED_APPLICANT_BY_DATABASE++;
-        await page.keyboard.press('Escape').catch(() => {});
-        return false;
-      }
-
+      // No local-DB dedupe on the sink path: the scoring Supabase's
+      // write-once upserts make re-scrapes idempotent.
       const cvUrl: string = d.cv?.download_url ?? d.cv_url ?? '';
       console.info(`[CV] URL: ${cvUrl || '(none)'}`);
       const cvFile = cvUrl ? await this.urlToFile(cvUrl, `${name}.pdf`) : null;
@@ -1313,6 +1403,7 @@ export class Pintarnya {
         type: this.TYPE,
         applied_for: vacancyTitle,
         applied_for_id: appliedForId,
+        portal_candidate_id: portalCandidateId,
         applied_date: d.applied_at ?? '',
         email: email,
         fullname: name,
@@ -1338,12 +1429,13 @@ export class Pintarnya {
       await page.waitForTimeout(300);
 
       console.info(`[CANDIDATE] Sending: ${name}`);
-      await this.sendRequest(applicant);
+      await this.sendToSink(applicant);
       return true;
 
     } catch (error) {
       console.error('[CANDIDATE] Error scraping table row:', error);
       await page.keyboard.press('Escape').catch(() => {});
+      if (error instanceof SupabaseSinkError) throw error;
       return false;
     }
   }
@@ -1562,28 +1654,26 @@ export class Pintarnya {
     const appliedForId = pageUrl.split("job=")[1];
 
     if (appliedForId) {
-      const jobVacancyInDatabase = await this.getVacancyByPintarnyaJobId(appliedForId);
-      const applicantsOfJobVacancyInDatabase = await this.countApplicantByPintarnyaJobId(appliedForId);
-
-      if (jobVacancyInDatabase === undefined) {
-        await this.insertJobVacancy("Pintarnya Kandidat Page", "", appliedForId, applicantCount);
-        isScrappingCard = applicantCount > 0;
-      } else if (
-        applicantCount === jobVacancyInDatabase.applicants &&
-        jobVacancyInDatabase.applicants === applicantsOfJobVacancyInDatabase
-      ) {
-        console.info("[SKIP] No new applicants on the current Kandidat page.");
-        isScrappingCard = false;
-      } else {
-        isScrappingCard = applicantCount > 0;
-      }
+      // Sink path: upsert the vacancy write-once and always scrape visible
+      // applicants; the scoring Supabase dedupes re-scrapes.
+      this.VACANCIES_SEEN++;
+      await this.getSink().upsertVacancy({
+        portal: this.CHANNEL,
+        portal_vacancy_id: appliedForId,
+        title: "Pintarnya Kandidat Page",
+        link: pageUrl,
+        total_applicant: applicantCount,
+        status: "new",
+        raw: {},
+      });
+      isScrappingCard = applicantCount > 0;
     }
 
     let newOnPage = 0;
     while (isScrappingCard) {
       if (this.LIMIT > 0 && this.COLLECTED_APPLICANT >= this.LIMIT) {
-        console.info("Scrape limit reached. Exiting...");
-        process.exit(0);
+        console.info("Scrape limit reached. Stopping.");
+        break;
       }
 
       try {
@@ -1632,18 +1722,8 @@ export class Pintarnya {
           .nth(0)
           .textContent();
 
-        const applicantInDatabase = await this.getApplicantByEmail(candidateEmail || "");
-        if (
-          applicantInDatabase !== undefined &&
-          applicantInDatabase.email === candidateEmail &&
-          applicantInDatabase.applied_for_id === appliedForId
-        ) {
-          console.info("[SKIP] Already in local DB, skipping.");
-          this.SKIPPED_APPLICANT_BY_DATABASE++;
-          nthCard++;
-          continue;
-        }
-
+        // No local-DB dedupe on the sink path: the scoring Supabase's
+        // write-once upserts make re-scrapes idempotent.
         const candidatePhoneButton = candidateCardDetail
           .locator("div.justify-start")
           .locator("button")
@@ -1755,12 +1835,13 @@ export class Pintarnya {
         };
 
         const collectedBefore = this.COLLECTED_APPLICANT;
-        await this.sendRequest(applicant);
+        await this.sendToSink(applicant);
         if (this.COLLECTED_APPLICANT > collectedBefore) {
           newOnPage++;
         }
       } catch (error) {
         console.log(error);
+        if (error instanceof SupabaseSinkError) throw error;
       }
 
       nthCard++;
@@ -1786,16 +1867,18 @@ export class Pintarnya {
     }
 
     /**
-     * Open the database connection.
+     * Open the database connection. sqlite3 is required lazily so the sink
+     * path never loads the native binding (see AGENTS.md sharp edges).
      */
+    const sqlite = require("sqlite3") as typeof import("sqlite3");
     return new Promise((resolve, reject) => {
-      this.DB = new sqlite3.Database(this.DB_PATH, (err) => {
+      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
         if (err) {
           console.error("Error opening database", err.message);
           reject(err.message);
         } else {
           console.log("Connected to the database.");
-          resolve(this.DB);
+          resolve(this.DB!);
         }
       });
     });
@@ -1816,7 +1899,7 @@ export class Pintarnya {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.run(createTableQuery, (err) => {
+      this.DB!.run(createTableQuery, (err) => {
         if (err) {
           console.error("Error creating job_vacancies table", err.message);
           reject(err.message);
@@ -1841,7 +1924,7 @@ export class Pintarnya {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.run(createTableQuery, (err) => {
+      this.DB!.run(createTableQuery, (err) => {
         if (err) {
           console.error("Error creating applicants table", err.message);
           reject(err.message);
@@ -1860,7 +1943,7 @@ export class Pintarnya {
     const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
 
     return new Promise((resolve, reject) => {
-      this.DB.get(query, (err, row) => {
+      this.DB!.get(query, (err, row) => {
         if (err) {
           console.error("Error checking table", err.message);
           reject(err.message);
@@ -1892,7 +1975,7 @@ export class Pintarnya {
     } else {
       // Migrate existing table to add data column if missing
       await new Promise<void>((resolve) => {
-        this.DB.run('ALTER TABLE applicants ADD COLUMN data TEXT', () => resolve());
+        this.DB!.run('ALTER TABLE applicants ADD COLUMN data TEXT', () => resolve());
       });
     }
   }
@@ -1914,7 +1997,7 @@ export class Pintarnya {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
           reject(err.message);
@@ -1948,7 +2031,7 @@ export class Pintarnya {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.get<JobVacancyDB>(selectQuery, (err, row) => {
+      this.DB!.get<JobVacancyDB>(selectQuery, (err, row) => {
         if (err) {
           console.error("Error getting vacancy", err.message);
           reject(err.message);
@@ -1975,7 +2058,7 @@ export class Pintarnya {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.get<CountApplicantByPintarnyaJobIdRes>(selectQuery, (err, row) => {
+      this.DB!.get<CountApplicantByPintarnyaJobIdRes>(selectQuery, (err, row) => {
         if (err) {
           console.error("Error counting applicant", err.message);
           reject(err.message);
@@ -2025,7 +2108,7 @@ export class Pintarnya {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
           reject(err.message);
@@ -2058,7 +2141,7 @@ export class Pintarnya {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.get<ApplicantDB>(selectQuery, (err, row) => {
+      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
         if (err) {
           console.error("Error getting applicant", err.message);
           reject(err.message);
@@ -2075,7 +2158,7 @@ export class Pintarnya {
    */
   async closeDatabaseConnection() {
     new Promise((resolve, reject) => {
-      this.DB.close((err) => {
+      this.DB!.close((err) => {
         if (err) {
           console.error("Error closing database", err.message);
           reject(err.message);
@@ -2130,9 +2213,8 @@ export class Pintarnya {
       await page.screenshot();
       await this.checkLazyLoadedElement(page, locator, retryCount + 1);
     } else {
-      console.error("Lazy-loaded element: %s not found after %s retries. Exiting...", locator, this.MAX_RETRY);
       await page.screenshot();
-      process.exit(1);
+      throw new Error(`[PINTARNYA] Lazy-loaded element not found after ${this.MAX_RETRY} retries: ${locator}`);
     }
   }
 
@@ -2154,8 +2236,7 @@ export class Pintarnya {
         await this.waitPageFromURL(page, url, retryCount + 1);
       } else {
         await page.screenshot();
-        console.error("Error waiting for URL after %s retries. Exiting...", this.MAX_RETRY);
-        process.exit(1);
+        throw new Error(`[PINTARNYA] Timed out waiting for URL after ${this.MAX_RETRY} retries: ${url}`);
       }
     }
   }

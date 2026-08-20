@@ -3,9 +3,11 @@ import fs from "fs";
 import axios from "axios";
 import path from "path";
 import FormData from "form-data";
-import sqlite3 from 'sqlite3';
+import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
+import { SupabaseSink } from "./supabaseSink";
+import { sendApplicantToSink } from "./portalSink";
 
 /**
  * Represents a cookie.
@@ -37,6 +39,7 @@ export interface JoobleConfigJson {
   cookies: Cookie[];
   local_storage: LocalStorageItem[];
   limit: number;
+  /** @deprecated jooble now writes to the scoring Supabase via SupabaseSink. */
   api_destination: string;
   timeout: number;
   slowmo: number;
@@ -88,9 +91,11 @@ export class Jooble {
   private APIDESTINATION: string = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
+  private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
   private DB_PATH: string = "";
-  private DB: sqlite3.Database;
+  private DB?: sqlite3.Database;
+  private sink: SupabaseSink | null = null;
 
   /**
    * Represents a Jooble object.
@@ -106,12 +111,62 @@ export class Jooble {
     this.TIMEOUT = config.timeout;
     this.SLOWMO = config.slowmo;
     this.DB_PATH = path.join(__dirname, config.db_path);
-    this.DB = new sqlite3.Database(this.DB_PATH);
-    console.info("CONFIG GLINTS LOADED");
+    console.info("CONFIG JOOBLE LOADED");
   }
 
   /**
-   * Sends a request with the provided applicant data.
+   * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+   * Construction is lazy so importing Jooble for a selector test does not
+   * require sink credentials.
+   */
+  private getSink(): SupabaseSink {
+    this.sink ??= new SupabaseSink();
+    return this.sink;
+  }
+
+  /** Number of vacancy links discovered by this run. */
+  getVacanciesSeen(): number {
+    return this.VACANCIES_SEEN;
+  }
+
+  /** Number of applicants successfully persisted by this run. */
+  getCollectedCount(): number {
+    return this.COLLECTED;
+  }
+
+  private async ensureLegacyDatabase(): Promise<void> {
+    if (this.DB) return;
+    this.DB = await this.createDatabaseConnection();
+    await this.createRequiredTables();
+  }
+
+  /**
+   * Writes one applicant straight into the scoring Supabase via the shared
+   * direct-sink slice (see src/portalSink.ts). jooble carries no portal-native
+   * candidate id; page_url is the vacancy page shared by every row, so it is
+   * never used as a candidate identity and the ladder starts at email.
+   * @param param - The applicant data to be persisted.
+   */
+  async sendToSink(param: Applicant): Promise<void> {
+    await sendApplicantToSink(this.getSink(), {
+      portal: param.portal,
+      applied_for: param.applied_for,
+      applied_date: param.applied_date,
+      url_profile: param.page_url,
+      vacancy_url: param.page_url,
+      name: param.name,
+      email: param.email,
+      phone: param.phone?.contact_number,
+      cv_path: param.cv,
+      raw: { type: param.type },
+    });
+    this.COLLECTED++;
+  }
+
+  /**
+   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
+   * insert. Kept untouched but bypassed: jooble now lands applicants directly
+   * in the scoring Supabase via sendToSink().
    * @param param - The applicant data.
    * @returns A Promise that resolves when the request is sent successfully.
    */
@@ -135,6 +190,7 @@ export class Jooble {
       });
 
       console.info("Success sending param", param);
+      await this.ensureLegacyDatabase();
       await this.insertApplicant(param);
       this.COLLECTED++;
     } catch (error) {
@@ -219,15 +275,9 @@ export class Jooble {
    * @returns A Promise that resolves when the scraping is complete.
    */
   async Scrape(): Promise<void> {
-    try {
-      this.DB = await this.createDatabaseConnection();
-
-      console.info("Creating required tables...");
-      await this.createRequiredTables();
-    } catch (error) {
-      console.error(error);
-      console.log("Failed to create database connection. Exiting...");
-    }
+    // Fail fast at cycle start when the sink env vars are missing; the local
+    // SQLite path is bypassed entirely (mirrors glints).
+    this.getSink();
 
     const browser = trackBrowser(await playwright.firefox.launch({
       headless: this.HEADLESS,
@@ -253,6 +303,20 @@ export class Jooble {
     await this.checkLazyLoadedElement(page, '[data-test-block="job"]');
 
     const listVacancyPage = await this.ExtractListVacancyPage(page);
+    this.VACANCIES_SEEN = listVacancyPage.length;
+
+    // Replayed-session check: an expired session bounces the employer page to
+    // the public site / login. One loud line, then let the cycle fail so the
+    // continuous loop records it and keeps cycling.
+    if (listVacancyPage.length === 0) {
+      const redirectedAway = !page.url().includes("/employer");
+      const loginFormVisible = (await page.locator('input[type="password"]').count()) > 0;
+      if (redirectedAway || loginFormVisible) {
+        throw new Error(
+          `[JOOBLE] Session expired: employer page landed on ${page.url()} — refresh cookies in jooble.json`,
+        );
+      }
+    }
 
     for (const it of listVacancyPage) {
       if (this.LIMIT != 0) {
@@ -327,16 +391,8 @@ export class Jooble {
           };
         }
 
-        const applicantInDatabase = await this.getApplicantByEmail(applicantData.email);
-
-        if (
-          applicantInDatabase !== undefined &&
-          applicantInDatabase.email === applicantData.email
-        ) {
-          console.info("Applicant already exists in the database. Skipping...");
-          continue;
-        }
-
+        // No local-DB dedupe on the sink path: the scoring Supabase's
+        // write-once upserts make re-scrapes idempotent.
         const downloadPromise = page.waitForEvent("download");
         await page.locator('[data-test-btn="download-cv-btn"]').click();
         const download = await downloadPromise;
@@ -347,18 +403,17 @@ export class Jooble {
 
         applicantData.cv = filePath;
 
-        console.log(applicantData);
-
-        await this.sendRequest(applicantData);
-
-        fs.unlinkSync(filePath);
+        try {
+          await this.sendToSink(applicantData);
+        } finally {
+          fs.unlinkSync(filePath);
+        }
         console.info("collected :", this.COLLECTED);
       }
     }
 
     await browser.close();
     console.log("DONE");
-    process.exit();
   }
 
   /**
@@ -375,16 +430,18 @@ export class Jooble {
     }
 
     /**
-     * Open the database connection.
+     * Open the database connection. sqlite3 is required lazily so the sink
+     * path never loads the native binding (see AGENTS.md sharp edges).
      */
+    const sqlite = require("sqlite3") as typeof import("sqlite3");
     return new Promise((resolve, reject) => {
-      this.DB = new sqlite3.Database(this.DB_PATH, (err) => {
+      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
         if (err) {
           console.error("Error opening database", err.message);
           reject(err);
         } else {
           console.log("Connected to the database.");
-          resolve(this.DB);
+          resolve(this.DB!);
         }
       });
     });
@@ -403,7 +460,7 @@ export class Jooble {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.run(createTableQuery, (err) => {
+      this.DB!.run(createTableQuery, (err) => {
         if (err) {
           console.error("Error creating applicants table", err.message);
           reject(err);
@@ -422,7 +479,7 @@ export class Jooble {
     const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
 
     return new Promise((resolve, reject) => {
-      this.DB.get(query, (err, row) => {
+      this.DB!.get(query, (err, row) => {
         if (err) {
           console.error("Error checking table", err.message);
           reject(err);
@@ -465,7 +522,7 @@ export class Jooble {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting vacancy", err.message);
           reject(err);
@@ -502,7 +559,7 @@ export class Jooble {
     `;
 
     await new Promise<void>((resolve, reject) => {
-      this.DB.run(insertQuery, (err) => {
+      this.DB!.run(insertQuery, (err) => {
         if (err) {
           console.error("Error inserting applicant", err.message);
           reject(err);
@@ -531,7 +588,7 @@ export class Jooble {
     `;
 
     return new Promise((resolve, reject) => {
-      this.DB.get<ApplicantDB>(selectQuery, (err, row) => {
+      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
         if (err) {
           console.error("Error getting applicant", err.message);
           reject(err);
@@ -548,7 +605,7 @@ export class Jooble {
    */
   async closeDatabaseConnection() {
     return new Promise<void>((resolve, reject) => {
-      this.DB.close((err) => {
+      this.DB!.close((err) => {
         if (err) {
           console.error("Error closing database", err.message);
           reject(err);
