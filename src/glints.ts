@@ -1320,8 +1320,10 @@ export class Glints {
    *          If the age element is empty or the input is invalid, it returns "0".
    */
   async extractDateOfBirth(row: any): Promise<string> {
-    // .first(): the cell can render several spans (badges, tooltips); the age is the first
-    const age = (await this.applicantCells(row).nth(2).locator('//div[2]/span').first().textContent())?.trim() ?? "";
+    // count() guard + .first(): the current row DOM renders several spans (or
+    // none at all) here; a missing age must degrade to "0", not wait/throw.
+    const ageLocator = this.applicantCells(row).nth(2).locator('//div[2]/span').first();
+    const age = (await ageLocator.count()) > 0 ? (await ageLocator.textContent())?.trim() ?? "" : "";
 
     // If the age element is empty, return '0'
     if (age == "") {
@@ -1373,16 +1375,19 @@ export class Glints {
    *          If the gender cannot be determined, it returns an empty string.
    */
   async extractGender(row: any): Promise<string> {
-    const genderText = (await this.applicantCells(row).nth(5).textContent())?.trim() ?? "";
-
-    // Mapping Indonesian gender abbreviations to their corresponding values
+    // Mapping Indonesian gender labels to their corresponding values
     const genderType: Record<string, string> = {
       'Perempuan': 'FEMALE',
       'Laki-laki': 'MALE'
     };
 
-    // Return the mapped gender value or an empty string if the gender cannot be determined
-    return genderType[genderText] || "";
+    // The gender column has moved between dashboard revisions; scan the cells
+    // for the two exact labels instead of pinning an index.
+    const cells = (await this.applicantCells(row).allInnerTexts()).map((t: string) => t.trim());
+    for (const text of cells) {
+      if (genderType[text]) return genderType[text];
+    }
+    return "";
   }
 
   /**
@@ -1393,7 +1398,12 @@ export class Glints {
    *          The location is trimmed of leading and trailing spaces.
    */
   async extractLocation(row: any): Promise<string> {
-    const locationText = (await this.applicantCells(row).nth(2).locator('//div[2]/div').first().textContent())?.trim() ?? "";
+    // count() guard: this sub-element vanished in the current row DOM; return
+    // "" immediately instead of waiting out the locator timeout per row.
+    const locationLocator = this.applicantCells(row).nth(2).locator('//div[2]/div').first();
+    const locationText = (await locationLocator.count()) > 0
+      ? (await locationLocator.textContent())?.trim() ?? ""
+      : "";
 
     return locationText;
   }
@@ -1426,21 +1436,21 @@ export class Glints {
    *          If the applied date is not found or is invalid, it returns an empty string.
    */
   async extractAppliedDate(row: any): Promise<string> {
-    const appliedDateTimeText = (await this.applicantCells(row).nth(9).textContent())?.trim() ?? "";
-
-    // Check if dateStr is empty
-    if (appliedDateTimeText == "") {
+    // The applied-date column has moved between dashboard revisions (it sat at
+    // cell 9, which is now "Terakhir Aktif"); find the first cell carrying a
+    // calendar date instead of pinning an index.
+    const cells = (await this.applicantCells(row).allInnerTexts()).map((t: string) => t.trim());
+    const match = cells
+      .map((t: string) => t.match(/(?:(\d{1,2})\s+([A-Za-z]{3})|([A-Za-z]{3})\s+(\d{1,2}))\s+(\d{4})/))
+      .find(Boolean);
+    if (!match) {
       return ""
     }
+    const dayOfMonth = match[1] ?? match[4];
+    const monthId = match[2] ?? match[3];
 
-    // Remove the time part from the date string
-    let appliedDateText = appliedDateTimeText.slice(0, -8)
-
-    type MonthMap = {
-      [key: string]: string;
-    };
     // Mapping Indonesian month abbreviations to english month
-    const monthMap: MonthMap = {
+    const monthMap: Record<string, string> = {
       "Jan": "Jan",
       "Feb": "Feb",
       "Mar": "Mar",
@@ -1449,22 +1459,19 @@ export class Glints {
       "Jun": "Jun",
       "Jul": "Jul",
       "Agt": "Aug",
+      "Agu": "Aug",
       "Sep": "Sep",
       "Okt": "Oct",
       "Nov": "Nov",
       "Des": "Dec"
     };
 
-    let appliedDateSplit = appliedDateText.split(" ")
-    appliedDateSplit[0] = monthMap[appliedDateSplit[0]]
-    appliedDateText = appliedDateSplit.join(" ")
-
-    // Create a Date object from the input string
-    const date = new Date(appliedDateText);
+    // Create a Date object from the normalized parts
+    const date = new Date(`${monthMap[monthId] ?? monthId} ${dayOfMonth} ${match[5]}`);
 
     // Ensure the date is valid
     if (isNaN(date.getTime())) {
-      console.error("Invalid date format", appliedDateText);
+      console.error("Invalid date format", match[0]);
       return "0";
     }
 
