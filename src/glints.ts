@@ -1745,8 +1745,10 @@ export class Glints {
    * @throws Will throw an error if the input dateStr does not match the expected format.
    */
   async convertDateMMDD(text: string): Promise<string> {
-    text = text.trim();
-    if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+    // A period without a "-" (e.g. just "Sekarang") leaves the caller passing
+    // undefined for the missing half.
+    text = text?.trim() ?? "";
+    if (text == "" || text.toLowerCase() == "sekarang") {
       return "0";
     }
 
@@ -1791,8 +1793,8 @@ export class Glints {
  * @throws Will throw an error if the input dateStr does not match the expected format.
  */
 async convertDateMMDDToYYYY(text: string): Promise<string> {
-    text = text.trim();
-    if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+    text = text?.trim() ?? "";
+    if (text == "" || text.toLowerCase() == "sekarang") {
       return "0";
     }
 
