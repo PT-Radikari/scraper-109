@@ -166,21 +166,42 @@ const GLINTS_CHALLENGE_PATTERN =
 const GLINTS_INVALID_CREDENTIALS_PATTERN =
   /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
 
+const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
+  'iframe[src*="captcha"]',
+  'iframe[src*="geetest"]',
+  'iframe[title*="captcha" i]',
+  '[class*="captcha" i]',
+  '[id*="captcha" i]',
+  '[class*="geetest" i]',
+  '[id*="geetest" i]',
+  'input[autocomplete="one-time-code"]',
+  'input[name*="otp" i]',
+  'input[id*="otp" i]',
+  'input[name*="verification" i]',
+].join(", ");
+
 /**
- * Classifies the state of the Glints login page from its URL and body text.
- * Pure so the detection logic is unit-testable without a browser: leaving
- * /login means the portal accepted the login; otherwise the body text is
- * matched for a captcha/2FA/rate-limit wall first (retrying will not help, a
- * human has to look) and a rejected-credentials banner second.
+ * Classifies the state of the Glints login page. Pure so the detection logic
+ * is unit-testable without a browser: leaving /login means the portal accepted
+ * the login; otherwise the visible text (never script content) is matched for
+ * a rejected-credentials banner first, and a captcha/2FA/rate-limit wall is
+ * reported only when an actual challenge widget is on the page, so a bare
+ * keyword mention can never arm the challenge cooldown.
  */
 export function classifyGlintsLoginResult(observation: {
   url: string;
-  bodyText: string;
+  visibleText: string;
+  hasChallengeElement: boolean;
 }): GlintsLoginOutcome {
   if (!observation.url.includes("/login")) return "success";
-  if (GLINTS_CHALLENGE_PATTERN.test(observation.bodyText)) return "challenge";
-  if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.bodyText)) {
+  if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
     return "invalid_credentials";
+  }
+  if (
+    observation.hasChallengeElement &&
+    GLINTS_CHALLENGE_PATTERN.test(observation.visibleText)
+  ) {
+    return "challenge";
   }
   return "pending";
 }
@@ -409,20 +430,71 @@ export class Glints {
       await page.waitForTimeout(pollIntervalMs);
       outcome = classifyGlintsLoginResult({
         url: page.url(),
-        bodyText: await this.readLoginBodyText(page),
+        visibleText: await this.readLoginVisibleText(page),
+        hasChallengeElement: await this.detectLoginChallengeElement(page),
       });
       if (outcome !== "pending") break;
     }
     return outcome;
   }
 
-  /** Reads the page's visible text for login-outcome classification. */
-  private async readLoginBodyText(page: any): Promise<string> {
+  /**
+   * Reads the page's visible text for login-outcome classification via
+   * innerText, so inline script content and hidden static wording never reach
+   * the classifier; falls back to textContent if evaluation fails.
+   */
+  private async readLoginVisibleText(page: any): Promise<string> {
     try {
-      return (await page.locator("body").textContent()) ?? "";
+      return await page.evaluate(() => document.body?.innerText ?? "");
     } catch {
-      return "";
+      try {
+        return (await page.locator("body").textContent()) ?? "";
+      } catch {
+        return "";
+      }
     }
+  }
+
+  /** Detects a rendered captcha/OTP widget for challenge classification. */
+  private async detectLoginChallengeElement(page: any): Promise<boolean> {
+    try {
+      return await page.evaluate((selector: string) => {
+        return Array.from(document.querySelectorAll(selector)).some((el) => {
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      }, GLINTS_CHALLENGE_ELEMENT_SELECTOR);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Waits for the dashboard SPA to settle after navigation: polls until the
+   * URL lands on /login (session expired) or a dashboard-only marker renders
+   * (authenticated). A single timed URL check races the client-side auth
+   * redirect, which can fire after the check passed and destroy the execution
+   * context under later locator calls, so navigation errors inside a poll
+   * iteration are swallowed and polling continues. On timeout the URL decides.
+   */
+  async waitForDashboardOrLogin(page: any): Promise<"dashboard" | "login"> {
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+    for (let i = 0; i < attempts; i++) {
+      await page.waitForTimeout(pollIntervalMs);
+      try {
+        if (page.url().includes("/login")) return "login";
+        const markerCount = await page
+          .locator(
+            '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")',
+          )
+          .count();
+        if (markerCount > 0) return "dashboard";
+      } catch {
+        continue;
+      }
+    }
+    return page.url().includes("/login") ? "login" : "dashboard";
   }
 
   /** Snapshots the page's localStorage for in-memory session reuse. */
@@ -845,9 +917,7 @@ export class Glints {
       timeout: this.TIMEOUT,
     });
 
-    await page.waitForTimeout(3000);
-
-    if (page.url().includes("/login")) {
+    if ((await this.waitForDashboardOrLogin(page)) === "login") {
       // Self-renew: log in with the env credentials, then retry the dashboard.
       await this.ensureAuthenticated(page, context);
 
@@ -855,9 +925,8 @@ export class Glints {
         waitUntil: "domcontentloaded",
         timeout: this.TIMEOUT,
       });
-      await page.waitForTimeout(3000);
 
-      if (page.url().includes("/login")) {
+      if ((await this.waitForDashboardOrLogin(page)) === "login") {
         throw new Error(
           "[GLINTS] Session expired: dashboard still redirected to login after a successful credential login",
         );

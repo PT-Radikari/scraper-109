@@ -29,11 +29,15 @@ function makeConfig(): GlintsConfigJson {
  */
 class FakeLoginPage {
   currentUrl = "https://employers.glints.id/login";
-  bodyText = "Alamat Email Password Lupa password? Masuk";
+  visibleText = "Alamat Email Password Lupa password? Masuk";
+  hasChallengeElement = false;
+  dashboardMarkerCount = 0;
   fills: Record<string, string> = {};
   clicked: string[] = [];
   onSubmit: (() => void) | null = null;
+  onPoll: (() => void) | null = null;
   fillError: Error | null = null;
+  locatorError: Error | null = null;
 
   url(): string {
     return this.currentUrl;
@@ -49,11 +53,22 @@ class FakeLoginPage {
     this.clicked.push(selector);
     this.onSubmit?.();
   }
-  async waitForTimeout(_ms: number): Promise<void> {}
-  locator(_selector: string) {
-    return { textContent: async () => this.bodyText };
+  async waitForTimeout(_ms: number): Promise<void> {
+    this.onPoll?.();
   }
-  async evaluate(_fn: unknown): Promise<{ key: string; value: string }[]> {
+  locator(_selector: string) {
+    return {
+      textContent: async () => this.visibleText,
+      count: async () => {
+        if (this.locatorError) throw this.locatorError;
+        return this.dashboardMarkerCount;
+      },
+    };
+  }
+  async evaluate(fn: unknown): Promise<any> {
+    const source = String(fn);
+    if (source.includes("innerText")) return this.visibleText;
+    if (source.includes("getBoundingClientRect")) return this.hasChallengeElement;
     return [{ key: "glintsEmployersApp", value: "{}" }];
   }
 }
@@ -67,7 +82,8 @@ describe("classifyGlintsLoginResult", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/dashboard",
-        bodyText: "Dashboard",
+        visibleText: "Dashboard",
+        hasChallengeElement: false,
       }),
     ).toBe("success");
   });
@@ -76,7 +92,8 @@ describe("classifyGlintsLoginResult", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
-        bodyText: "Email atau password salah",
+        visibleText: "Email atau password salah",
+        hasChallengeElement: false,
       }),
     ).toBe("invalid_credentials");
   });
@@ -85,16 +102,28 @@ describe("classifyGlintsLoginResult", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
-        bodyText: "Invalid credentials, please try again",
+        visibleText: "Invalid credentials, please try again",
+        hasChallengeElement: false,
       }),
     ).toBe("invalid_credentials");
   });
 
-  it("reports a challenge when a captcha appears", () => {
+  it("prefers the invalid-credentials banner over challenge wording", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
-        bodyText: "Please complete the reCAPTCHA to continue",
+        visibleText: "Email atau password salah. Please complete the captcha",
+        hasChallengeElement: true,
+      }),
+    ).toBe("invalid_credentials");
+  });
+
+  it("reports a challenge when a captcha widget is rendered", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Please complete the reCAPTCHA to continue",
+        hasChallengeElement: true,
       }),
     ).toBe("challenge");
   });
@@ -103,16 +132,38 @@ describe("classifyGlintsLoginResult", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
-        bodyText: "Masukkan kode verifikasi yang dikirim ke email Anda",
+        visibleText: "Masukkan kode verifikasi yang dikirim ke email Anda",
+        hasChallengeElement: true,
       }),
     ).toBe("challenge");
+  });
+
+  it("never classifies challenge from a bare keyword without a challenge element", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "This site is protected by reCAPTCHA and Cloudflare",
+        hasChallengeElement: false,
+      }),
+    ).toBe("pending");
+  });
+
+  it("stays pending when a challenge element exists without challenge wording", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Alamat Email Password Masuk",
+        hasChallengeElement: true,
+      }),
+    ).toBe("pending");
   });
 
   it("stays pending while the login page shows no outcome yet", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
-        bodyText: "Alamat Email Password Masuk",
+        visibleText: "Alamat Email Password Masuk",
+        hasChallengeElement: false,
       }),
     ).toBe("pending");
   });
@@ -166,7 +217,7 @@ describe("Glints.ensureAuthenticated", () => {
   it("fails loudly with GLINTS_LOGIN_FAILED on rejected credentials, without leaking them", async () => {
     const page = new FakeLoginPage();
     page.onSubmit = () => {
-      page.bodyText = "Email atau password salah";
+      page.visibleText = "Email atau password salah";
     };
 
     let thrown: Error | null = null;
@@ -182,7 +233,7 @@ describe("Glints.ensureAuthenticated", () => {
     const failingPage = () => {
       const page = new FakeLoginPage();
       page.onSubmit = () => {
-        page.bodyText = "Email atau password salah";
+        page.visibleText = "Email atau password salah";
       };
       return page;
     };
@@ -198,7 +249,8 @@ describe("Glints.ensureAuthenticated", () => {
   it("raises GLINTS_LOGIN_CHALLENGE when a captcha or 2FA wall appears", async () => {
     const page = new FakeLoginPage();
     page.onSubmit = () => {
-      page.bodyText = "Please complete the captcha";
+      page.visibleText = "Please complete the captcha";
+      page.hasChallengeElement = true;
     };
 
     await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
@@ -222,5 +274,61 @@ describe("Glints.ensureAuthenticated", () => {
     expect(thrown!.message).not.toContain(PASSWORD);
     expect(thrown!.message).not.toContain(EMAIL);
     expect(thrown!.message).toContain("***");
+  });
+});
+
+describe("Glints.waitForDashboardOrLogin", () => {
+  let scraper: Glints;
+
+  beforeEach(() => {
+    scraper = new Glints(makeConfig());
+  });
+
+  it("returns dashboard once a dashboard marker renders", async () => {
+    const page = new FakeLoginPage();
+    page.currentUrl = "https://employers.glints.id/dashboard";
+    let polls = 0;
+    page.onPoll = () => {
+      if (++polls === 2) page.dashboardMarkerCount = 1;
+    };
+
+    await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
+  });
+
+  it("returns login when the SPA auth redirect fires after the first poll", async () => {
+    const page = new FakeLoginPage();
+    page.currentUrl = "https://employers.glints.id/dashboard";
+    let polls = 0;
+    page.onPoll = () => {
+      if (++polls === 2) {
+        page.currentUrl = "https://employers.glints.id/login?next=%2Fdashboard";
+      }
+    };
+
+    await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("login");
+  });
+
+  it("keeps polling through context-destroyed navigation errors", async () => {
+    const page = new FakeLoginPage();
+    page.currentUrl = "https://employers.glints.id/dashboard";
+    page.locatorError = new Error(
+      "locator.count: Execution context was destroyed, most likely because of a navigation",
+    );
+    let polls = 0;
+    page.onPoll = () => {
+      if (++polls === 2) {
+        page.locatorError = null;
+        page.dashboardMarkerCount = 1;
+      }
+    };
+
+    await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
+  });
+
+  it("falls back to the URL when no marker renders before the timeout", async () => {
+    const page = new FakeLoginPage();
+    page.currentUrl = "https://employers.glints.id/dashboard";
+
+    await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
   });
 });
