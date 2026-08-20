@@ -138,6 +138,7 @@ export class KitaLulus {
   private DB?: sqlite3.Database;
   private COOKIES: KitaLulusCookie[] = [];
   private sink: SupabaseSink | null = null;
+  private pendingTempFiles: string[] = [];
 
   private readonly SIGN_IN_EMAIL_SELECTOR: string = '[data-test-id="tfSignInEmail"]';
   private readonly SIGN_IN_PASSWORD_SELECTOR: string = '[data-test-id="tfSignInPassword"]';
@@ -792,16 +793,12 @@ export class KitaLulus {
           console.info(`[CANDIDATE] Opening row ${rowIndex + 1}/${rowCount}${appliedFor ? ` for "${appliedFor}"` : ""}...`);
 
           let detailHandle: ApplicantDetailHandle | null = null;
-          let photoTempPath = "";
-          let cvTempPath = "";
           try {
             detailHandle = await this.openApplicantDetailPage(page, rowIndex);
             console.info("[CANDIDATE] Detail page opened.");
 
             await this.dismissMarketingOverlay(detailHandle.page);
             const applicant = await this.scrapeApplicantDetails("applicant", detailHandle.page, appliedFor);
-            photoTempPath = applicant.photo;
-            cvTempPath = applicant.cv;
 
             if (applicant.whatapps.contact_number === "" && applicant.email === "") {
               console.info("[SKIP] No phone number and no email. Skipping send.");
@@ -818,8 +815,7 @@ export class KitaLulus {
             console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
             if (error instanceof SupabaseSinkError) throw error;
           } finally {
-            await this.RemoveTempFile(photoTempPath);
-            await this.RemoveTempFile(cvTempPath);
+            await this.removePendingTempFiles();
             if (detailHandle) {
               await detailHandle.cleanup();
             }
@@ -940,6 +936,18 @@ export class KitaLulus {
       } catch (error) {
         console.error("failed to remove file", error);
       }
+    }
+  }
+
+  /**
+   * Removes every file downloaded via fetchAndStore since the last drain.
+   * Called from the per-row finally so downloads are cleaned up even when
+   * scrapeApplicantDetails throws partway through extraction.
+   */
+  async removePendingTempFiles(): Promise<void> {
+    const files = this.pendingTempFiles.splice(0);
+    for (const filePath of files) {
+      await this.RemoveTempFile(filePath);
     }
   }
 
@@ -1662,6 +1670,7 @@ export class KitaLulus {
       const filePath = path.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
 
       await fs.promises.writeFile(filePath, response.data);
+      this.pendingTempFiles.push(filePath);
 
       return filePath;
     } catch (error) {
