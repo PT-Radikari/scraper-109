@@ -236,6 +236,9 @@ export function classifyGlintsLoginResult(observation: {
 export interface GlintsApplicationDetail {
   /** Glints' applicant UUID — a genuine portal-native candidate id. */
   applicantId: string;
+  /** Applicant.firstName + Applicant.lastName, used to correlate a captured
+   * payload with the row whose modal open triggered it. */
+  applicantName: string;
   email: string;
   /** The number behind the modal's "WhatsApp:" row, usually +62-prefixed. */
   whatsappNumber: string;
@@ -264,17 +267,23 @@ export function parseGlintsApplicationDetail(payload: unknown): GlintsApplicatio
   // ("+62****", "****@****") instead of real contact values; a placeholder is
   // absent data, and storing it would dedupe unrelated candidates onto one row.
   const contact = (value: unknown): string => stripGlintsContactMask(str(value));
-  // Applicant.phone can be a bare country code ("+62"); too short to be a
-  // number, so it never wins over the real WhatsApp fields.
-  const phone = contact(d.phone).replace(/\D/g, "").length >= 7 ? contact(d.phone) : "";
+  // The phone fallbacks (top-level phone and Applicant.phone) can carry a bare
+  // country code ("+62"); too short to be a number, so it never wins over the
+  // real WhatsApp fields.
+  const phone = (value: unknown): string => {
+    const candidate = contact(value);
+    return candidate.replace(/\D/g, "").length >= 7 ? candidate : "";
+  };
 
   return {
     applicantId: str(d.ApplicantId) || str(applicant.id),
+    applicantName: [str(applicant.firstName), str(applicant.lastName)].filter(Boolean).join(" "),
     email: contact(applicant.email),
     whatsappNumber:
       contact((d.whatsAppDetails as Record<string, unknown> | undefined)?.whatsAppNumber) ||
       contact(applicant.whatsappNumber) ||
-      phone,
+      phone(d.phone) ||
+      phone(applicant.phone),
     resumeKey: str(d.resume),
     birthDate: str(applicant.birthDate).slice(0, 10),
     gender: str(applicant.gender),
@@ -289,6 +298,15 @@ export function parseGlintsApplicationDetail(payload: unknown): GlintsApplicatio
  */
 export function stripGlintsContactMask(value: string): string {
   return value.includes("*") ? "" : value;
+}
+
+/**
+ * Normalizes an applicant name for capture-to-row correlation: trims, collapses
+ * internal whitespace and lowercases, so cosmetic rendering differences between
+ * the API payload and the row text do not count as a mismatch.
+ */
+export function normalizeGlintsApplicantName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 export class Glints {
@@ -883,11 +901,14 @@ export class Glints {
   /**
    * Arms a capture for the GET /api/jobs/{jobId}/applications/{applicationId}
    * response the dashboard itself fires when an applicant modal opens. Must be
-   * called *before* the row click that opens the modal. Resolves null on
-   * timeout or an unparseable payload — callers then fall back to the DOM.
-   * Purely observational: no extra request, no visible side effect.
+   * called *before* the row click that opens the modal. A previous row's
+   * late-arriving response would otherwise satisfy the wait, so the payload is
+   * only trusted when its Applicant name matches the row's extracted name.
+   * Resolves null on timeout, an unparseable payload, or a name mismatch —
+   * callers then fall back to the DOM. Purely observational: no extra request,
+   * no visible side effect.
    */
-  armApplicationDetailCapture(page: any): Promise<GlintsApplicationDetail | null> {
+  armApplicationDetailCapture(page: any, expectedName: string): Promise<GlintsApplicationDetail | null> {
     const timeout = Math.min(this.TIMEOUT, 20000);
     return page
       .waitForResponse(
@@ -895,7 +916,17 @@ export class Glints {
           /\/api\/jobs\/[^/]+\/applications\/[^/?]+/.test(resp.url()) && resp.status() === 200,
         { timeout },
       )
-      .then(async (resp: any) => parseGlintsApplicationDetail(await resp.json()))
+      .then(async (resp: any) => {
+        const detail = parseGlintsApplicationDetail(await resp.json());
+        if (detail === null) return null;
+        if (normalizeGlintsApplicantName(detail.applicantName) !== normalizeGlintsApplicantName(expectedName)) {
+          console.warn(
+            `[GLINTS] application-detail capture is for "${detail.applicantName}", not row "${expectedName}"; discarding it`,
+          );
+          return null;
+        }
+        return detail;
+      })
       .catch(() => null);
   }
 
@@ -1372,7 +1403,7 @@ export class Glints {
         // Opening the modal makes the dashboard fetch the full application
         // detail (contact, resume key, applicant id); arm the capture before
         // the click so the response is never missed.
-        const detailPromise = this.armApplicationDetailCapture(page);
+        const detailPromise = this.armApplicationDetailCapture(page, name);
 
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
@@ -2142,7 +2173,13 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       // Return the file path of the stored image
       return filePath;
     } catch (error) {
-      console.error(error);
+      // Never log the raw error object: an AxiosError carries config.url, and
+      // for resumes that is a signed S3 URL with its signature query.
+      const status = (error as { response?: { status?: number } })?.response?.status;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[GLINTS] fetchAndStore failed${status !== undefined ? ` (status ${status})` : ""}: ${message.split("\n")[0]}`,
+      );
       return "";
     }
   }

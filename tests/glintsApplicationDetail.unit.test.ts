@@ -48,6 +48,7 @@ describe("parseGlintsApplicationDetail", () => {
     const detail = parseGlintsApplicationDetail(liveDetailPayload());
     expect(detail).toEqual({
       applicantId: "e094fa5a-293c-458d-aefe-a1d611691a77",
+      applicantName: "Dendy Rahmat",
       email: "candidate@example.com",
       whatsappNumber: "+628111234567",
       resumeKey: "9aa1daad75f8ef63b94feee0bd13b924.pdf",
@@ -71,12 +72,33 @@ describe("parseGlintsApplicationDetail", () => {
     });
     expect(detail).toEqual({
       applicantId: "abc-123",
+      applicantName: "",
       email: "",
       whatsappNumber: "08123456789",
       resumeKey: "",
       birthDate: "",
       gender: "",
     });
+  });
+
+  it("falls back to a genuine phone number when the WhatsApp fields are absent", () => {
+    const detail = parseGlintsApplicationDetail({
+      data: {
+        phone: null,
+        Applicant: { id: "abc-123", phone: "+628123456789" },
+      },
+    });
+    expect(detail?.whatsappNumber).toBe("+628123456789");
+  });
+
+  it("ignores bare country codes in both phone fallbacks", () => {
+    const detail = parseGlintsApplicationDetail({
+      data: {
+        phone: "+62",
+        Applicant: { id: "abc-123", phone: "+62" },
+      },
+    });
+    expect(detail?.whatsappNumber).toBe("");
   });
 
   it("returns null for payloads without a data object", () => {
@@ -285,9 +307,40 @@ describe("Glints application-detail capture and resume download", () => {
         return matching;
       },
     };
-    const detail = await scraper.armApplicationDetailCapture(fakePage);
+    const detail = await scraper.armApplicationDetailCapture(fakePage, "Dendy Rahmat");
     expect(detail?.applicantId).toBe("e094fa5a-293c-458d-aefe-a1d611691a77");
     expect(detail?.whatsappNumber).toBe("+628111234567");
+  });
+
+  it("accepts a capture whose name differs from the row only in case and whitespace", async () => {
+    const scraper = new Glints(makeConfig());
+    const fakePage = {
+      waitForResponse: async () => ({
+        url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+        status: () => 200,
+        json: async () => liveDetailPayload(),
+      }),
+    };
+    const detail = await scraper.armApplicationDetailCapture(fakePage, "  dendy   RAHMAT ");
+    expect(detail?.applicantId).toBe("e094fa5a-293c-458d-aefe-a1d611691a77");
+  });
+
+  it("discards a capture whose Applicant name does not match the row's name", async () => {
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const scraper = new Glints(makeConfig());
+      const fakePage = {
+        waitForResponse: async () => ({
+          url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+          status: () => 200,
+          json: async () => liveDetailPayload(),
+        }),
+      };
+      await expect(scraper.armApplicationDetailCapture(fakePage, "Ada Lovelace")).resolves.toBeNull();
+      expect(warnSpy).toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("resolves null when no application-detail response arrives in time", async () => {
@@ -297,7 +350,7 @@ describe("Glints application-detail capture and resume download", () => {
         throw new Error("Timeout 20000ms exceeded");
       },
     };
-    await expect(scraper.armApplicationDetailCapture(fakePage)).resolves.toBeNull();
+    await expect(scraper.armApplicationDetailCapture(fakePage, "Dendy Rahmat")).resolves.toBeNull();
   });
 
   it("downloads the resume through the dashboard's s3 endpoint and stores it locally", async () => {
