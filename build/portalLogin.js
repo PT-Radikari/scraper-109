@@ -64,7 +64,7 @@ exports.maskSecrets = maskSecrets;
  * `maxConsecutiveFailures`; once reached, attempts are blocked until
  * `failureBackoffMs` has passed since the last failure, after which a single
  * attempt is allowed (a further failure re-arms the window). A challenge
- * (captcha/2FA) blocks for `challengeBackoffMs` without consuming the
+ * (captcha/rate-limit) blocks for `challengeBackoffMs` without consuming the
  * credential budget — the credentials may be fine, a human just has to look.
  * A success resets everything, so the next session expiry days later starts
  * with a fresh budget.

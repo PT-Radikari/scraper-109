@@ -67,7 +67,7 @@ export interface LoginAttemptGuardOptions {
   maxConsecutiveFailures?: number;
   /** How long to wait after the cap is reached before allowing one more attempt. */
   failureBackoffMs?: number;
-  /** How long to wait after a captcha/2FA/rate-limit challenge before trying again. */
+  /** How long to wait after a captcha/rate-limit challenge before trying again. */
   challengeBackoffMs?: number;
   /** Clock, injected by tests. */
   now?: () => number;
@@ -80,7 +80,7 @@ export interface LoginAttemptGuardOptions {
  * `maxConsecutiveFailures`; once reached, attempts are blocked until
  * `failureBackoffMs` has passed since the last failure, after which a single
  * attempt is allowed (a further failure re-arms the window). A challenge
- * (captcha/2FA) blocks for `challengeBackoffMs` without consuming the
+ * (captcha/rate-limit) blocks for `challengeBackoffMs` without consuming the
  * credential budget — the credentials may be fine, a human just has to look.
  * A success resets everything, so the next session expiry days later starts
  * with a fresh budget.

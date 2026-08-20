@@ -405,7 +405,7 @@ describe("Glints.ensureAuthenticated", () => {
     expect(Object.keys(third.fills)).toHaveLength(0);
   });
 
-  it("raises GLINTS_LOGIN_CHALLENGE when a captcha or 2FA wall appears", async () => {
+  it("raises GLINTS_LOGIN_CHALLENGE when a captcha or rate-limit wall appears", async () => {
     const page = new FakeLoginPage();
     page.onSubmit = () => {
       page.visibleText = "Please complete the captcha";

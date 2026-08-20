@@ -421,7 +421,7 @@ class Glints {
                 }
                 case "challenge": {
                     glintsLoginGuard.recordFailure("challenge");
-                    throw new Error("[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/2FA/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule");
+                    throw new Error("[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule");
                 }
                 case "otp_required": {
                     yield this.throwOtpRequired(page, credentials);
