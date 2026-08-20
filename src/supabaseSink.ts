@@ -9,7 +9,7 @@ dotenv.config();
 /**
  * Configuration for the Supabase sink. Values fall back to the documented
  * environment variables (SCORING_SUPABASE_URL / SCORING_SUPABASE_ANON_KEY /
- * SCORING_SUPABASE_BUCKET) when not passed explicitly, so tests and the glints
+ * SCORING_SUPABASE_BUCKET) when not passed explicitly, so tests and the portal
  * wiring can construct it either way.
  */
 export interface SupabaseSinkConfig {

@@ -78,16 +78,16 @@ docker build -t playwright-runner .
 ```
 Run background mode
 ```
-docker run -d --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble
-docker run -d --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus
-docker run -d --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya
+docker run -d --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble:once
+docker run -d --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus:once
+docker run -d --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya:once
 docker run -d --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints:once
 ```
 Run foreground mode
 ```
-docker run -it --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble
-docker run -it --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus
-docker run -it --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya
+docker run -it --name playwright-runner-jooble -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:jooble:once
+docker run -it --name playwright-runner-kitalulus -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:kitalulus:once
+docker run -it --name playwright-runner-pintarnya -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:pintarnya:once
 docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-runner:latest npm run xvfb:glints:once
 ```
 This command will create and run a Docker container named "playwright-runner-pintarnya" using the "playwright-runner:latest" image. It will also mount the "./db" directory from your local machine to the "/app/db" directory inside the container.
@@ -97,7 +97,7 @@ Central Supabase Ingestion
 
 Scraped candidates, job vacancies and applications are mirrored into a central Supabase (Postgres) database, on top of the per-portal SQLite databases in `db/`.
 
-Dual-write: each scraper except Glints (which writes through the direct Supabase sink described below and is deliberately not mirrored here) writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
+Dual-write: only kitalulus-v2 still takes this path — the sink-routed portals (glints, jooble, seek, pintarnya, kitalulus v1) write through the direct Supabase sink described below and are deliberately not mirrored here. A legacy scraper writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
 
 IDRKOS cross-check: every candidate is checked against the IDRKOS candidate pool before it lands centrally. A candidate already in IDRKOS is linked through `idrkos_staf_id` and marked `idrkos_verified`; a new candidate (scraped or onboarded through QR) is marked `scraped_new` and prioritised at the top of the talent listings (`scraper.talent_listing`). The check runs against the `cross_check_idrkos_candidate` Postgres function, falling back to the IDRKOS `/talents` API.
 
@@ -276,8 +276,9 @@ docker run -d --name scraper-jooble --restart always --env-file .env playwright-
 exponential retry policy above, so transient browser failures retry before the
 next scheduled cycle.
 
-Glints no longer loads SQLite on its direct Supabase path. Legacy portal paths
-still use the native `sqlite3` dependency; if `node_modules/` was copied from a
+The sink-routed portals no longer load SQLite on their direct Supabase path
+(it is required lazily, only if a deprecated legacy method runs). Kitalulus-v2
+and the legacy paths still use the native `sqlite3` dependency; if `node_modules/` was copied from a
 host with a different OS/architecture, reinstall dependencies for the current
 platform or run `npm rebuild sqlite3`. The Docker image installs its own
 dependencies during the build, so rebuilding locally cannot break the container.
