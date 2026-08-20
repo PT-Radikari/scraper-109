@@ -22,9 +22,9 @@ function makeConfig(): GlintsConfigJson {
 function liveDetailPayload(): unknown {
   return {
     data: {
-      id: "6ca7e1a5-179e-5338-b112-3abd92298c59",
+      id: "11111111-2222-5333-8444-555555555555",
       status: "IN_REVIEW",
-      resume: "9aa1daad75f8ef63b94feee0bd13b924.pdf",
+      resume: "0123456789abcdef0123456789abcdef.pdf",
       phone: null,
       expectedSalary: 7000000,
       whatsAppDetails: { whatsAppNumber: "+628111234567", isAvailable: true },
@@ -36,7 +36,7 @@ function liveDetailPayload(): unknown {
         lastName: "Sintetis",
         phone: "+62",
         whatsappNumber: null,
-        birthDate: "1985-12-05T00:00:00.000Z",
+        birthDate: "1990-01-15T00:00:00.000Z",
         gender: "MALE",
       },
     },
@@ -51,8 +51,8 @@ describe("parseGlintsApplicationDetail", () => {
       applicantName: "Fixtura Sintetis",
       email: "candidate@example.com",
       whatsappNumber: "+628111234567",
-      resumeKey: "9aa1daad75f8ef63b94feee0bd13b924.pdf",
-      birthDate: "1985-12-05",
+      resumeKey: "0123456789abcdef0123456789abcdef.pdf",
+      birthDate: "1990-01-15",
       gender: "MALE",
     });
   });
@@ -295,7 +295,7 @@ describe("Glints application-detail capture and resume download", () => {
       waitForResponse: async (matcher: (resp: any) => boolean) => {
         const matching = {
           url: () =>
-            "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+            "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
           status: () => 200,
           json: async () => liveDetailPayload(),
         };
@@ -316,7 +316,7 @@ describe("Glints application-detail capture and resume download", () => {
     const scraper = new Glints(makeConfig());
     const fakePage = {
       waitForResponse: async () => ({
-        url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+        url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
         status: () => 200,
         json: async () => liveDetailPayload(),
       }),
@@ -331,7 +331,7 @@ describe("Glints application-detail capture and resume download", () => {
       const scraper = new Glints(makeConfig());
       const fakePage = {
         waitForResponse: async () => ({
-          url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/6ca7e1a5-179e?",
+          url: () => "https://employers.glints.id/api/jobs/325f4d1a/applications/11111111-2222?",
           status: () => 200,
           json: async () => liveDetailPayload(),
         }),
@@ -396,15 +396,15 @@ describe("Glints masked-placeholder gating", () => {
   it("treats Glints' masked contact placeholders in the API payload as absent", () => {
     const detail = parseGlintsApplicationDetail({
       data: {
-        ApplicantId: "5f22b32a-7290-4172-8936-fb670a1f0d1e",
+        ApplicantId: "99999999-8888-4777-8666-555555555555",
         resume: "",
         whatsAppDetails: { whatsAppNumber: "+62****", isAvailable: true },
-        Applicant: { id: "5f22b32a-7290-4172-8936-fb670a1f0d1e", email: "****@****" },
+        Applicant: { id: "99999999-8888-4777-8666-555555555555", email: "****@****" },
       },
     });
     expect(detail?.whatsappNumber).toBe("");
     expect(detail?.email).toBe("");
-    expect(detail?.applicantId).toBe("5f22b32a-7290-4172-8936-fb670a1f0d1e");
+    expect(detail?.applicantId).toBe("99999999-8888-4777-8666-555555555555");
   });
 
   it("treats the modal's masked contact placeholders as absent in the DOM fallback", async () => {
