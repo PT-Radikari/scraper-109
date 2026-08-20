@@ -378,16 +378,25 @@ export class Glints {
 
     console.info(`[GLINTS] Switching company to: ${TARGET}`);
     await page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX }).first().click();
-    await page.waitForTimeout(1000);
 
     // react-select exposes the menu either as ARIA options or (live dashboard,
-    // 2026-08) as plain divs carrying the select__option class.
+    // 2026-08) as plain divs carrying the select__option class; the menu can
+    // render a beat after the click, so poll briefly before enumerating.
     let optionLocator = page.getByRole('option');
-    if ((await optionLocator.count()) === 0) {
+    for (let i = 0; i < 5; i++) {
+      await page.waitForTimeout(1000);
+      optionLocator = page.getByRole('option');
+      if ((await optionLocator.count()) > 0) break;
       optionLocator = page.locator('[class*="select__option"]');
+      if ((await optionLocator.count()) > 0) break;
     }
     const entries = (await optionLocator.allInnerTexts()).map((t: string) => t.trim());
     console.info(`[GLINTS] Company switcher entries: ${JSON.stringify(entries)}`);
+    if (entries.length === 0) {
+      throw new Error(
+        `[GLINTS] company switcher dropdown rendered no entries after clicking the UBAH control — likely a render race or UI drift, not a target_company mismatch`,
+      );
+    }
 
     const wanted = normalizeCompanyName(TARGET);
     const index = entries.findIndex((entry: string) => normalizeCompanyName(entry) === wanted);
@@ -1135,23 +1144,31 @@ export class Glints {
       // so a single sighting is not proof of emptiness — require it to hold
       // for several consecutive polls with no data rows.
       let emptyStreak = 0;
+      let confirmedEmpty = false;
+      let rowsSettled = false;
       for (let i = 0; i < settleAttempts; i++) {
         await page.waitForTimeout(1000);
         const emptyCount = await emptyMarker.count();
-        if ((await applicantRows.count()) > 0 && emptyCount === 0) break;
+        if ((await applicantRows.count()) > 0 && emptyCount === 0) {
+          rowsSettled = true;
+          break;
+        }
         if (emptyCount > 0) {
-          if (++emptyStreak >= 8) break;
+          if (++emptyStreak >= 8) {
+            confirmedEmpty = true;
+            break;
+          }
         } else {
           emptyStreak = 0;
         }
       }
 
       // Skip job if no candidates in this stage
-      if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
+      if (confirmedEmpty) {
         console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
         continue;
       }
-      if (await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
+      if (!rowsSettled && await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
         const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
         console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
         continue;
