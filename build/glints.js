@@ -35,7 +35,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Glints = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
+exports.Glints = exports.classifyGlintsLoginResult = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
@@ -46,7 +46,119 @@ const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
 const supabaseSink_1 = require("./supabaseSink");
 const candidateIdentity_1 = require("./candidateIdentity");
+const portalLogin_1 = require("./portalLogin");
 exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
+const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
+const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
+const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
+const GLINTS_LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]';
+/**
+ * Per-process login attempt cap. Module-level on purpose: the continuous loop
+ * constructs a fresh Glints instance per attempt/cycle, and the cap must
+ * survive those instances so a wrong password fails twice, loudly, and then
+ * backs off instead of retrying every cycle into an account lockout.
+ */
+const glintsLoginGuard = new portalLogin_1.LoginAttemptGuard({ maxConsecutiveFailures: 2 });
+/**
+ * The refreshed session captured after a successful credential login, held in
+ * memory only (never written to disk or the repo). Subsequent cycles in the
+ * same process replay it instead of the committed glints.json warm-start.
+ */
+exports.glintsSessionStore = new portalLogin_1.InMemorySessionStore();
+/** Clears the login guard and session store. Test-only. */
+function resetGlintsLoginState() {
+    glintsLoginGuard.reset();
+    exports.glintsSessionStore.clear();
+}
+exports.resetGlintsLoginState = resetGlintsLoginState;
+/**
+ * Normalizes a company display name for comparison: trims, collapses inner
+ * whitespace, and lowercases. The switcher renders names like "PT RADIKARI"
+ * whose casing and padding must not defeat the target_company match.
+ */
+function normalizeCompanyName(name) {
+    return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+exports.normalizeCompanyName = normalizeCompanyName;
+/**
+ * The company switcher's change control. The live dashboard renders it as
+ * "UBAH" (uppercase), older sessions rendered "Ubah", and the dashboard
+ * sometimes serves the English locale, where it reads "Change" — match all.
+ */
+const GLINTS_UBAH_REGEX = /^\s*(ubah|change)\s*$/i;
+const GLINTS_CHALLENGE_PATTERN = /captcha|geetest|hcaptcha|cloudflare|too many (login )?attempts|terlalu banyak/i;
+const GLINTS_OTP_PATTERN = /one[\s-]?time (password|code)|\botp\b|kode (otp|verifikasi)|verification code|two[\s-]?factor|\b2fa\b|verifikasi (email|perangkat|akun)|verify (your )?(email|device|identity|account)|dikirim ke (email|alamat|perangkat)|sent (a code )?to your email|\d+[\s-]?digit (code|kode)|(enter|masukkan) (the )?(kode|code)/i;
+/**
+ * Path segments the portal parks a submit on when it wants device/email
+ * verification. Matched segment-anchored against the pathname only (query and
+ * hash never reach it), because a false positive here parks the whole login
+ * attempt budget: `/dashboard?redirect=/verify` and `/settings/devices` must
+ * classify as success. Only consulted once the URL has left /login, so a
+ * Cloudflare interstitial (which keeps the original URL) can never match.
+ */
+const GLINTS_OTP_URL_SEGMENT_PATTERN = /^(verify|verification|two[-_]?factor|2fa|mfa)([-_][a-z0-9]+)*$|(^|[-_])otp([-_]|$)|^device[-_](verification|verify|confirm(ation)?|check)$/i;
+/** True when any pathname segment of `url` is a verification route segment. */
+function glintsUrlLooksLikeVerification(url) {
+    let pathname;
+    try {
+        pathname = new URL(url).pathname;
+    }
+    catch (_a) {
+        pathname = url.split(/[?#]/)[0].replace(/^[a-z]+:\/\/[^/]+/i, "");
+    }
+    return pathname
+        .split("/")
+        .some((segment) => segment !== "" && GLINTS_OTP_URL_SEGMENT_PATTERN.test(segment));
+}
+const GLINTS_INVALID_CREDENTIALS_PATTERN = /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
+const GLINTS_DASHBOARD_MARKER_SELECTOR = '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")';
+const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
+    'iframe[src*="captcha"]',
+    'iframe[src*="geetest"]',
+    'iframe[title*="captcha" i]',
+    '[class*="captcha" i]',
+    '[id*="captcha" i]',
+    '[class*="geetest" i]',
+    '[id*="geetest" i]',
+].join(", ");
+const GLINTS_OTP_ELEMENT_SELECTOR = [
+    'input[autocomplete="one-time-code"]',
+    'input[name*="otp" i]',
+    'input[id*="otp" i]',
+    'input[name*="verification" i]',
+    'input[id*="verification" i]',
+    'input[data-testid*="otp" i]',
+].join(", ");
+/**
+ * Classifies the state of the Glints login page. Pure so the detection logic
+ * is unit-testable without a browser: leaving /login means the portal accepted
+ * the login unless it landed on a verification route or an OTP form; on /login
+ * the visible text (never script content) is matched for a rejected-credentials
+ * banner first, then a rendered code input plus OTP wording marks the
+ * device-verification page, and a captcha/rate-limit wall is reported only
+ * when an actual challenge widget is on the page — so a bare keyword mention
+ * can never arm the challenge or OTP handling.
+ */
+function classifyGlintsLoginResult(observation) {
+    const otpFormRendered = observation.hasOtpElement && GLINTS_OTP_PATTERN.test(observation.visibleText);
+    if (!observation.url.includes("/login")) {
+        if (glintsUrlLooksLikeVerification(observation.url) || otpFormRendered) {
+            return "otp_required";
+        }
+        return "success";
+    }
+    if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
+        return "invalid_credentials";
+    }
+    if (otpFormRendered)
+        return "otp_required";
+    if (observation.hasChallengeElement &&
+        GLINTS_CHALLENGE_PATTERN.test(observation.visibleText)) {
+        return "challenge";
+    }
+    return "pending";
+}
+exports.classifyGlintsLoginResult = classifyGlintsLoginResult;
 class Glints {
     /**
      * Represents a Glints object.
@@ -93,44 +205,133 @@ class Glints {
         return null;
     }
     /**
+     * Waits for the dashboard's company controls to render. The dashboard settle
+     * poll returns on the first dashboard marker, which can paint before the
+     * sidebar company block, so a single-shot check here misses a switcher that
+     * is still rendering — exactly when the account just gained a second company.
+     * @param page The dashboard page.
+     * @returns "target-selected" when the configured company is already active,
+     *          "switcher" once the "Ubah" switcher rendered, or "absent" when
+     *          neither showed up within the polling window.
+     */
+    waitForCompanyControls(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const alreadySelected = page.locator('p').filter({ hasText: this.targetCompanyRegExp() });
+            const ubahLocator = page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX });
+            const pollIntervalMs = 1000;
+            // A cold dashboard can hold the sidebar's company block on "Memuat..." well
+            // past 15s (observed live 2026-08); give it the run's timeout up to 45s.
+            const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 45000) / pollIntervalMs));
+            for (let i = 0; i < attempts; i++) {
+                try {
+                    if ((yield alreadySelected.count()) > 0)
+                        return "target-selected";
+                    if ((yield ubahLocator.count()) > 0)
+                        return "switcher";
+                }
+                catch (_a) {
+                    // A late SPA navigation can destroy the execution context mid-count;
+                    // treat it like "not rendered yet" and keep polling.
+                }
+                yield page.waitForTimeout(pollIntervalMs);
+            }
+            return "absent";
+        });
+    }
+    /**
+     * A whole-string, case- and whitespace-insensitive regex for the configured
+     * target company's display name. Never matches when no target is configured.
+     */
+    targetCompanyRegExp() {
+        const tokens = this.TARGETCOMPANY.trim().split(/\s+/).filter(Boolean).map(portalLogin_1.escapeRegExp);
+        if (tokens.length === 0)
+            return /(?!)/;
+        return new RegExp(`^\\s*${tokens.join("\\s+")}\\s*$`, "i");
+    }
+    /**
+     * Closes any modal sitting over the dashboard (the VIP-expired promo renders
+     * on load and swallows clicks aimed at the sidebar's UBAH switcher).
+     */
+    dismissBlockingModal(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const close = page.locator('[data-testid="modal-close-btn"]');
+            try {
+                for (let i = 0; i < 3 && (yield close.count()) > 0; i++) {
+                    yield close.first().click();
+                    yield page.waitForTimeout(500);
+                }
+            }
+            catch (_a) {
+                // The modal can unmount between count() and click(); it is gone either way.
+            }
+        });
+    }
+    /**
      * Selects the target company from the Glints company switcher dropdown on the dashboard.
-     * Required when the account manages multiple companies — the wrong company will return empty results.
+     * Required when the account manages multiple companies — the wrong company will return
+     * empty results. Matching is against the switcher's *display* strings (trimmed,
+     * case-insensitive); a non-match throws naming every entry seen, never a silent skip.
      */
     selectTargetCompany(page) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.TARGETCOMPANY)
                 return;
             const TARGET = this.TARGETCOMPANY;
-            const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
-            const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
-            if ((yield ubahLocator.count()) === 0) {
-                console.info('[GLINTS] No company switcher found, skipping company selection.');
-                return;
-            }
-            // The current company name is displayed in a paragraph adjacent to the combobox.
-            // When the dropdown is closed there is no visible option list, so this paragraph is the only
-            // occurrence of the company name on the page.
-            const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
-            if ((yield alreadySelected.count()) > 0) {
+            const controls = yield this.waitForCompanyControls(page);
+            if (controls === "target-selected") {
+                // The current company name is displayed in a paragraph adjacent to the
+                // combobox; with the dropdown closed it is the only occurrence of the
+                // name on the page.
                 console.info(`[GLINTS] Company already set to: ${TARGET}`);
                 return;
             }
+            if (controls === "absent") {
+                // Name what actually rendered so the log alone can diagnose a redesign,
+                // an interstitial, or a renamed company.
+                let seen = [];
+                try {
+                    seen = (yield page.locator('p').allInnerTexts())
+                        .map((t) => t.trim())
+                        .filter(Boolean)
+                        .slice(0, 20);
+                }
+                catch (_a) {
+                    // Diagnostics only — never mask the real failure.
+                }
+                throw new Error(`[GLINTS] target_company "${TARGET}" is configured but the dashboard rendered neither the target as the active company nor the UBAH company switcher — cannot confirm which company this session would scrape; paragraphs seen: ${JSON.stringify(seen)}`);
+            }
+            // The VIP-expired modal renders over the sidebar and swallows the UBAH click.
+            yield this.dismissBlockingModal(page);
             console.info(`[GLINTS] Switching company to: ${TARGET}`);
-            // Click the "Ubah" button to open the dropdown
-            yield ubahLocator.locator('..').click();
-            yield page.waitForTimeout(1000);
-            // Try ARIA option role first (react-select exposes these), fall back to div text match
-            const optionByRole = page.getByRole('option', { name: TARGET, exact: true });
-            if ((yield optionByRole.count()) > 0) {
-                yield optionByRole.click();
+            yield page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX }).first().click();
+            // react-select exposes the menu either as ARIA options or (live dashboard,
+            // 2026-08) as plain divs carrying the select__option class; the menu can
+            // render a beat after the click, so poll briefly before enumerating.
+            let optionLocator = page.getByRole('option');
+            for (let i = 0; i < 5; i++) {
+                yield page.waitForTimeout(1000);
+                optionLocator = page.getByRole('option');
+                if ((yield optionLocator.count()) > 0)
+                    break;
+                optionLocator = page.locator('[class*="select__option"]');
+                if ((yield optionLocator.count()) > 0)
+                    break;
             }
-            else {
-                yield page.locator('div').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) }).last().click();
+            const entries = (yield optionLocator.allInnerTexts()).map((t) => t.trim());
+            console.info(`[GLINTS] Company switcher entries: ${JSON.stringify(entries)}`);
+            if (entries.length === 0) {
+                throw new Error(`[GLINTS] company switcher dropdown rendered no entries after clicking the UBAH control — likely a render race or UI drift, not a target_company mismatch`);
             }
+            const wanted = normalizeCompanyName(TARGET);
+            const index = entries.findIndex((entry) => normalizeCompanyName(entry) === wanted);
+            if (index === -1) {
+                throw new Error(`[GLINTS] target_company "${TARGET}" matched none of the company switcher entries ${JSON.stringify(entries)} — set target_company to one of those display strings`);
+            }
+            console.info(`[GLINTS] Choosing switcher entry ${index}: "${entries[index]}"`);
+            yield optionLocator.nth(index).click();
             // Wait for the page to reload with the new company's data
             yield page.waitForTimeout(3000);
-            console.info(`[GLINTS] Company switched to: ${TARGET}`);
+            console.info(`[GLINTS] Company switched to: ${entries[index]}`);
         });
     }
     /**
@@ -151,6 +352,273 @@ class Glints {
     getCollectedCount() {
         return this.COLLECTED;
     }
+    /**
+     * Recovers from an expired/absent session by logging in with the
+     * GLINTS_EMAIL / GLINTS_PASSWORD env credentials. Called when the dashboard
+     * redirected to /login. Leaving /login alone is not success: the portal can
+     * park a submit on an interstitial (OTP route, forced password reset,
+     * onboarding), so the dashboard is re-verified first, and only then are the
+     * refreshed cookies + localStorage held in memory (glintsSessionStore) for
+     * the following cycles and the attempt guard reset. On failure this throws
+     * one loud, credential-free error and lets the cycle fail — the continuous
+     * loop keeps cycling on its normal schedule.
+     *
+     * Every failure path is throttled by the module-level attempt guard so a
+     * wrong password or a captcha wall never becomes a login retry storm.
+     *
+     * @param page The page currently sitting on the login redirect.
+     * @param context The browser context, used to snapshot the fresh cookies.
+     */
+    ensureAuthenticated(page, context) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const credentials = (0, portalLogin_1.loadPortalCredentials)("GLINTS");
+            if (!credentials) {
+                throw new Error("[GLINTS] Session expired: dashboard redirected to login and GLINTS_EMAIL/GLINTS_PASSWORD are not set — configure the credentials or export a fresh session into glints.json");
+            }
+            const gate = glintsLoginGuard.canAttempt();
+            if (!gate.allowed) {
+                throw new Error(`[GLINTS] Session expired and credential login skipped: ${gate.reason}`);
+            }
+            console.info("[GLINTS] Session expired — attempting credential login");
+            let outcome;
+            try {
+                outcome = yield this.attemptCredentialLogin(page, credentials);
+            }
+            catch (error) {
+                glintsLoginGuard.recordFailure("error");
+                // A blocked or never-rendered login form (e.g. a bot-check page served
+                // to the datacenter IP) surfaces here — capture what was on screen so
+                // this server-only shape self-documents too.
+                yield this.captureLoginDebug(page, "credential login threw mid-attempt", credentials);
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`[GLINTS] GLINTS_LOGIN_FAILED: credential login errored: ${(0, portalLogin_1.maskSecrets)(message, [credentials.password, credentials.email])}`);
+            }
+            switch (outcome) {
+                case "success": {
+                    yield page.goto("https://employers.glints.id/dashboard", {
+                        waitUntil: "domcontentloaded",
+                        timeout: this.TIMEOUT,
+                    });
+                    const landing = yield this.waitForDashboardOrLogin(page);
+                    if (landing !== "dashboard" || !(yield this.hasDashboardMarker(page))) {
+                        // The portal held the session on an interstitial. If that
+                        // interstitial is the OTP/device-verification page, name it.
+                        if ((yield this.observeLoginPage(page)) === "otp_required") {
+                            yield this.throwOtpRequired(page, credentials);
+                        }
+                        glintsLoginGuard.recordFailure("error");
+                        yield this.captureLoginDebug(page, "login submit left /login but the dashboard never rendered", credentials);
+                        throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
+                    }
+                    glintsLoginGuard.recordSuccess();
+                    exports.glintsSessionStore.set({
+                        cookies: yield context.cookies(),
+                        localStorage: yield this.readLocalStorageSnapshot(page),
+                        capturedAt: Date.now(),
+                    });
+                    console.info("[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles");
+                    return;
+                }
+                case "challenge": {
+                    glintsLoginGuard.recordFailure("challenge");
+                    throw new Error("[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule");
+                }
+                case "otp_required": {
+                    yield this.throwOtpRequired(page, credentials);
+                    break;
+                }
+                case "invalid_credentials": {
+                    glintsLoginGuard.recordFailure("invalid_credentials");
+                    throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: the portal rejected the configured credentials — fix GLINTS_EMAIL/GLINTS_PASSWORD");
+                }
+                default: {
+                    glintsLoginGuard.recordFailure("error");
+                    yield this.captureLoginDebug(page, "login submit produced no dashboard, error banner, challenge or OTP page", credentials);
+                    throw new Error(`[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state`);
+                }
+            }
+        });
+    }
+    /**
+     * Records and raises the OTP/device-verification outcome: the portal sent a
+     * code out-of-band, so in-process retries can only spam the inbox — the
+     * guard parks every further attempt for its long backoff. The page state is
+     * captured to the artifact bucket so the exact verification page shape is
+     * on record for the humans who must act on it.
+     */
+    throwOtpRequired(page, credentials) {
+        return __awaiter(this, void 0, void 0, function* () {
+            glintsLoginGuard.recordFailure("otp_required");
+            yield this.captureLoginDebug(page, "OTP/device-verification page detected after login submit", credentials);
+            throw new Error("[GLINTS] GLINTS_LOGIN_OTP_REQUIRED: the portal is asking for an email OTP / device verification code — a human must complete the verification (check the GLINTS_EMAIL inbox) or export a fresh session into glints.json; in-process login attempts are parked so the inbox is not flooded");
+        });
+    }
+    /**
+     * Fills and submits the employer login form, then polls until the portal
+     * either leaves /login, shows an error banner, or raises a challenge.
+     * @param page The page to drive; navigated to the login URL if not there.
+     * @param credentials The env credentials to submit.
+     * @returns The observed outcome; "pending" means the timeout elapsed first.
+     */
+    attemptCredentialLogin(page, credentials) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!page.url().includes("/login")) {
+                yield page.goto(GLINTS_LOGIN_URL, {
+                    waitUntil: "domcontentloaded",
+                    timeout: this.TIMEOUT,
+                });
+            }
+            yield page.fill(GLINTS_LOGIN_EMAIL_SELECTOR, credentials.email);
+            yield page.fill(GLINTS_LOGIN_PASSWORD_SELECTOR, credentials.password);
+            yield page.click(GLINTS_LOGIN_SUBMIT_SELECTOR);
+            const pollIntervalMs = 1000;
+            const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+            let outcome = "pending";
+            for (let i = 0; i < attempts; i++) {
+                yield page.waitForTimeout(pollIntervalMs);
+                outcome = yield this.observeLoginPage(page);
+                if (outcome !== "pending")
+                    break;
+            }
+            return outcome;
+        });
+    }
+    /**
+     * Reads the page's visible text for login-outcome classification via
+     * innerText, so inline script content and hidden static wording never reach
+     * the classifier; falls back to textContent if evaluation fails.
+     */
+    readLoginVisibleText(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            try {
+                return yield page.evaluate(() => { var _a, _b; return (_b = (_a = document.body) === null || _a === void 0 ? void 0 : _a.innerText) !== null && _b !== void 0 ? _b : ""; });
+            }
+            catch (_b) {
+                try {
+                    return (_a = (yield page.locator("body").textContent())) !== null && _a !== void 0 ? _a : "";
+                }
+                catch (_c) {
+                    return "";
+                }
+            }
+        });
+    }
+    /** True when any element matching `selector` is rendered with a real box. */
+    detectRenderedElement(page, selector) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                return yield page.evaluate((sel) => {
+                    return Array.from(document.querySelectorAll(sel)).some((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    });
+                }, selector);
+            }
+            catch (_a) {
+                return false;
+            }
+        });
+    }
+    /** Detects a rendered captcha widget for challenge classification. */
+    detectLoginChallengeElement(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.detectRenderedElement(page, GLINTS_CHALLENGE_ELEMENT_SELECTOR);
+        });
+    }
+    /** Detects a rendered OTP/verification-code input for otp_required classification. */
+    detectLoginOtpElement(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.detectRenderedElement(page, GLINTS_OTP_ELEMENT_SELECTOR);
+        });
+    }
+    /** One classifier observation of the page's current state. */
+    observeLoginPage(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return classifyGlintsLoginResult({
+                url: page.url(),
+                visibleText: yield this.readLoginVisibleText(page),
+                hasChallengeElement: yield this.detectLoginChallengeElement(page),
+                hasOtpElement: yield this.detectLoginOtpElement(page),
+            });
+        });
+    }
+    /**
+     * Uploads screenshot + HTML + meta of the current login page to the
+     * artifact bucket so a server-side failure this code cannot reproduce still
+     * documents itself. Never throws; failures only warn.
+     */
+    captureLoginDebug(page, reason, credentials) {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield (0, portalLogin_1.captureLoginDebugArtifacts)({
+                page,
+                portal: "glints",
+                reason,
+                getUploader: () => this.getSink(),
+                // The email is the captain's own infra address and is allowed to appear.
+                secrets: [credentials.password],
+            });
+        });
+    }
+    /**
+     * Waits for the dashboard SPA to settle after navigation: polls until the
+     * URL lands on /login (session expired) or a dashboard-only marker renders
+     * (authenticated). A single timed URL check races the client-side auth
+     * redirect, which can fire after the check passed and destroy the execution
+     * context under later locator calls, so navigation errors inside a poll
+     * iteration are swallowed and polling continues. On timeout the URL decides.
+     */
+    waitForDashboardOrLogin(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const pollIntervalMs = 1000;
+            const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+            for (let i = 0; i < attempts; i++) {
+                yield page.waitForTimeout(pollIntervalMs);
+                try {
+                    if (page.url().includes("/login"))
+                        return "login";
+                    const markerCount = yield page
+                        .locator(GLINTS_DASHBOARD_MARKER_SELECTOR)
+                        .count();
+                    if (markerCount > 0)
+                        return "dashboard";
+                }
+                catch (_a) {
+                    continue;
+                }
+            }
+            return page.url().includes("/login") ? "login" : "dashboard";
+        });
+    }
+    /**
+     * Single-shot check that a dashboard-only marker is currently rendered.
+     * Distinguishes a settle poll that actually saw the dashboard from one that
+     * timed out on an interstitial and fell back to the URL.
+     */
+    hasDashboardMarker(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                return ((yield page.locator(GLINTS_DASHBOARD_MARKER_SELECTOR).count()) > 0);
+            }
+            catch (_a) {
+                return false;
+            }
+        });
+    }
+    /** Snapshots the page's localStorage for in-memory session reuse. */
+    readLocalStorageSnapshot(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                return yield page.evaluate(() => Object.entries(localStorage).map(([key, value]) => ({
+                    key,
+                    value: String(value),
+                })));
+            }
+            catch (_a) {
+                return [];
+            }
+        });
+    }
     ensureLegacyDatabase() {
         return __awaiter(this, void 0, void 0, function* () {
             if (this.DB)
@@ -160,10 +628,10 @@ class Glints {
         });
     }
     /**
-     * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so the
-     * other 5 portal scrapers (jooble/seek/kitalulus/kitalulus-v2/pintarnya) can
-     * keep using it. glints now lands candidates directly in the scoring
-     * Supabase via sendToSink().
+     * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so
+     * kitalulus-v2 (the last non-sink portal) can keep using the pattern.
+     * glints now lands candidates directly in the scoring Supabase via
+     * sendToSink().
      * @param param - The applicant data to be sent.
      * @returns A Promise that resolves when the request is successfully sent.
      */
@@ -435,7 +903,7 @@ class Glints {
      */
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
+            var _a, _b, _c, _d;
             this.getSink();
             const launchOptions = {
                 headless: this.HEADLESS,
@@ -462,9 +930,19 @@ class Glints {
                 fs_1.default.mkdirSync(this.CACHE_DIR);
             }
             const context = browser.contexts()[0] || (yield browser.newContext({
-                viewport: { width: 1440, height: 900 }
+                viewport: { width: 1440, height: 900 },
+                // The dashboard localizes from Accept-Language and Playwright defaults
+                // to en-US; the scraper's text anchors ("Belum Sesuai", "Semua Loker",
+                // gender labels, month names) assume the Indonesian locale.
+                locale: "id-ID",
             }));
-            yield context.addCookies(this.COOKIES);
+            // A session refreshed by a credential login earlier in this process beats
+            // the committed glints.json export, which is only an optional warm-start.
+            const storedSession = exports.glintsSessionStore.get();
+            const sessionCookies = (_a = storedSession === null || storedSession === void 0 ? void 0 : storedSession.cookies) !== null && _a !== void 0 ? _a : this.COOKIES;
+            if (sessionCookies.length > 0) {
+                yield context.addCookies(sessionCookies);
+            }
             context.setDefaultTimeout(this.TIMEOUT);
             const page = yield context.newPage();
             yield page.setViewportSize({ width: 1440, height: 900 });
@@ -535,15 +1013,22 @@ class Glints {
                 }
                 // Suppress mobile app promo page
                 localStorage.setItem('mobileAppPromptViewedDate', JSON.stringify(new Date().toISOString()));
-            }, this.LOCALSTORAGE);
+            }, (_b = storedSession === null || storedSession === void 0 ? void 0 : storedSession.localStorage) !== null && _b !== void 0 ? _b : this.LOCALSTORAGE);
             yield page.waitForTimeout(5000);
             yield page.goto("https://employers.glints.id/dashboard", {
                 waitUntil: "domcontentloaded",
                 timeout: this.TIMEOUT,
             });
-            yield page.waitForTimeout(3000);
-            if (page.url().includes("/login")) {
-                throw new Error("[GLINTS] Session expired: dashboard redirected to login");
+            if ((yield this.waitForDashboardOrLogin(page)) === "login") {
+                // Self-renew: log in with the env credentials, then retry the dashboard.
+                yield this.ensureAuthenticated(page, context);
+                yield page.goto("https://employers.glints.id/dashboard", {
+                    waitUntil: "domcontentloaded",
+                    timeout: this.TIMEOUT,
+                });
+                if ((yield this.waitForDashboardOrLogin(page)) === "login") {
+                    throw new Error("[GLINTS] Session expired: dashboard still redirected to login after a successful credential login");
+                }
             }
             // Switch to the correct company before scraping — wrong company returns empty results
             yield this.selectTargetCompany(page);
@@ -577,7 +1062,7 @@ class Glints {
                 jobCardsFound = yield this.checkLazyLoadedElement(page, '[data-cy="job-card-listed"]');
             }
             if (!jobCardsFound) {
-                const pageText = (_a = (yield page.locator("body").textContent())) === null || _a === void 0 ? void 0 : _a.replace(/\s+/g, " ").trim().slice(0, 500);
+                const pageText = (_c = (yield page.locator("body").textContent())) === null || _c === void 0 ? void 0 : _c.replace(/\s+/g, " ").trim().slice(0, 500);
                 console.warn(`[GLINTS] Dashboard text while looking for cards: ${pageText}`);
                 throw new Error("[GLINTS] No job cards found after checking all dashboard tabs");
             }
@@ -590,15 +1075,50 @@ class Glints {
                 if (this.COLLECTED == this.LIMIT) {
                     break;
                 }
-                yield page.goto(it.link);
-                yield page.waitForTimeout(2000);
+                // Some job cards now link to manage-candidates with
+                // atsTab=RECOMMENDED_TALENT, which opens the (usually empty) AI
+                // recommendations tab instead of the applicant pipeline — strip it so
+                // the page opens on the default applicants view.
+                const vacancyUrl = new URL(it.link, "https://employers.glints.id");
+                vacancyUrl.searchParams.delete("atsTab");
+                yield page.goto(vacancyUrl.toString());
+                // The candidate table hydrates well after domcontentloaded (the page
+                // shows "Memuat..." for many seconds); poll until either the empty-state
+                // marker or the first applicant row renders before deciding to skip.
+                const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+                const applicantRows = page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR);
+                const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+                // The empty-state wrapper can flash while the table hydrates (observed
+                // live: the same vacancy showed it on one run and 8 rows on the next),
+                // so a single sighting is not proof of emptiness — require it to hold
+                // for several consecutive polls with no data rows.
+                let emptyStreak = 0;
+                let confirmedEmpty = false;
+                let rowsSettled = false;
+                for (let i = 0; i < settleAttempts; i++) {
+                    yield page.waitForTimeout(1000);
+                    const emptyCount = yield emptyMarker.count();
+                    if ((yield applicantRows.count()) > 0 && emptyCount === 0) {
+                        rowsSettled = true;
+                        break;
+                    }
+                    if (emptyCount > 0) {
+                        if (++emptyStreak >= 8) {
+                            confirmedEmpty = true;
+                            break;
+                        }
+                    }
+                    else {
+                        emptyStreak = 0;
+                    }
+                }
                 // Skip job if no candidates in this stage
-                if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
+                if (confirmedEmpty) {
                     console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
                     continue;
                 }
-                if ((yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
-                    const pageText = (_b = (yield page.locator("body").textContent())) === null || _b === void 0 ? void 0 : _b.replace(/\s+/g, " ").trim().slice(0, 500);
+                if (!rowsSettled && (yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
+                    const pageText = (_d = (yield page.locator("body").textContent())) === null || _d === void 0 ? void 0 : _d.replace(/\s+/g, " ").trim().slice(0, 500);
                     console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
                     continue;
                 }
@@ -665,7 +1185,12 @@ class Glints {
                     const appliedDate = rows[i].appliedDate;
                     // cell row of applicant
                     yield element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
-                    const modalDetailButtonBelumSelesai = yield page.getByText('Belum Sesuai', { exact: true });
+                    // Scope to the modal: the stage tab bar behind it also reads "Belum
+                    // Sesuai" (the modal itself carries data-testid="modal-wrapper").
+                    const modalDetailButtonBelumSelesai = yield page
+                        .getByTestId('modal-wrapper')
+                        .getByText('Belum Sesuai', { exact: true })
+                        .last();
                     yield modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
                     const modalDetail = yield modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
                     const skills = yield this.extractSkills(modalDetail);
@@ -747,7 +1272,7 @@ class Glints {
             // Check if the photo element exists in the first table cell
             if ((yield this.applicantCells(row).nth(1).locator('//div/span/img').count()) > 0) {
                 // Extract the photo URL from the photo element
-                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//div/span/img').getAttribute('src');
+                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//div/span/img').first().getAttribute('src');
                 // If the photo URL is not empty, fetch and store the photo
                 if (linkPhoto) {
                     photoPath = yield this.fetchAndStore(linkPhoto);
@@ -756,7 +1281,7 @@ class Glints {
             // Check if the photo element exists in the first table cell
             if ((yield this.applicantCells(row).nth(1).locator('//span/img').count()) > 0) {
                 // Extract the photo URL from the photo element
-                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//span/img').getAttribute('src');
+                const linkPhoto = yield this.applicantCells(row).nth(1).locator('//span/img').first().getAttribute('src');
                 // If the photo URL is not empty, fetch and store the photo
                 if (linkPhoto) {
                     photoPath = yield this.fetchAndStore(linkPhoto);
@@ -776,7 +1301,10 @@ class Glints {
     extractDateOfBirth(row) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a, _b;
-            const age = (_b = (_a = (yield this.applicantCells(row).nth(2).locator('//div[2]/span').textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
+            // count() guard + .first(): the current row DOM renders several spans (or
+            // none at all) here; a missing age must degrade to "0", not wait/throw.
+            const ageLocator = this.applicantCells(row).nth(2).locator('//div[2]/span').first();
+            const age = (yield ageLocator.count()) > 0 ? (_b = (_a = (yield ageLocator.textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "" : "";
             // If the age element is empty, return '0'
             if (age == "") {
                 return "0";
@@ -822,15 +1350,19 @@ class Glints {
      */
     extractGender(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
-            const genderText = (_b = (_a = (yield this.applicantCells(row).nth(5).textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
-            // Mapping Indonesian gender abbreviations to their corresponding values
+            // Mapping Indonesian gender labels to their corresponding values
             const genderType = {
                 'Perempuan': 'FEMALE',
                 'Laki-laki': 'MALE'
             };
-            // Return the mapped gender value or an empty string if the gender cannot be determined
-            return genderType[genderText] || "";
+            // The gender column has moved between dashboard revisions; scan the cells
+            // for the two exact labels instead of pinning an index.
+            const cells = (yield this.applicantCells(row).allInnerTexts()).map((t) => t.trim());
+            for (const text of cells) {
+                if (genderType[text])
+                    return genderType[text];
+            }
+            return "";
         });
     }
     /**
@@ -843,7 +1375,12 @@ class Glints {
     extractLocation(row) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a, _b;
-            const locationText = (_b = (_a = (yield this.applicantCells(row).nth(2).locator('//div[2]/div').textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
+            // count() guard: this sub-element vanished in the current row DOM; return
+            // "" immediately instead of waiting out the locator timeout per row.
+            const locationLocator = this.applicantCells(row).nth(2).locator('//div[2]/div').first();
+            const locationText = (yield locationLocator.count()) > 0
+                ? (_b = (_a = (yield locationLocator.textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : ""
+                : "";
             return locationText;
         });
     }
@@ -876,14 +1413,19 @@ class Glints {
      */
     extractAppliedDate(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b;
-            const appliedDateTimeText = (_b = (_a = (yield this.applicantCells(row).nth(9).textContent())) === null || _a === void 0 ? void 0 : _a.trim()) !== null && _b !== void 0 ? _b : "";
-            // Check if dateStr is empty
-            if (appliedDateTimeText == "") {
+            var _a, _b, _c;
+            // The applied-date column has moved between dashboard revisions (it sat at
+            // cell 9, which is now "Terakhir Aktif"); find the first cell carrying a
+            // calendar date instead of pinning an index.
+            const cells = (yield this.applicantCells(row).allInnerTexts()).map((t) => t.trim());
+            const match = cells
+                .map((t) => t.match(/(?:(\d{1,2})\s+([A-Za-z]{3})|([A-Za-z]{3})\s+(\d{1,2}))\s+(\d{4})/))
+                .find(Boolean);
+            if (!match) {
                 return "";
             }
-            // Remove the time part from the date string
-            let appliedDateText = appliedDateTimeText.slice(0, -8);
+            const dayOfMonth = (_a = match[1]) !== null && _a !== void 0 ? _a : match[4];
+            const monthId = (_b = match[2]) !== null && _b !== void 0 ? _b : match[3];
             // Mapping Indonesian month abbreviations to english month
             const monthMap = {
                 "Jan": "Jan",
@@ -894,19 +1436,17 @@ class Glints {
                 "Jun": "Jun",
                 "Jul": "Jul",
                 "Agt": "Aug",
+                "Agu": "Aug",
                 "Sep": "Sep",
                 "Okt": "Oct",
                 "Nov": "Nov",
                 "Des": "Dec"
             };
-            let appliedDateSplit = appliedDateText.split(" ");
-            appliedDateSplit[0] = monthMap[appliedDateSplit[0]];
-            appliedDateText = appliedDateSplit.join(" ");
-            // Create a Date object from the input string
-            const date = new Date(appliedDateText);
+            // Create a Date object from the normalized parts
+            const date = new Date(`${(_c = monthMap[monthId]) !== null && _c !== void 0 ? _c : monthId} ${dayOfMonth} ${match[5]}`);
             // Ensure the date is valid
             if (isNaN(date.getTime())) {
-                console.error("Invalid date format", appliedDateText);
+                console.error("Invalid date format", match[0]);
                 return "0";
             }
             // Format the date as "YYYY-MM-DD"
@@ -997,10 +1537,18 @@ class Glints {
      */
     extractWhatapps(page, modalDetail) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             let wa = "";
             if ((yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").count()) > 0) {
                 yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").hover();
-                wa = yield page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent();
+                try {
+                    // Short timeout + fallback: the tooltip's inner layout drifts between
+                    // dashboard revisions and a missing element must not stall the row.
+                    wa = (_a = (yield page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent({ timeout: 5000 }))) !== null && _a !== void 0 ? _a : "";
+                }
+                catch (_b) {
+                    wa = "";
+                }
             }
             return { type: "WhatsApp", contact_number: wa };
         });
@@ -1015,10 +1563,16 @@ class Glints {
      */
     extractEmail(page, modalDetail) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             let email = "";
             if ((yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").count()) > 0) {
                 yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").hover();
-                email = yield page.getByText("Email").locator("..").locator('div > p').textContent();
+                try {
+                    email = (_a = (yield page.getByText("Email").locator("..").locator('div > p').textContent({ timeout: 5000 }))) !== null && _a !== void 0 ? _a : "";
+                }
+                catch (_b) {
+                    email = "";
+                }
             }
             return email;
         });
@@ -1123,8 +1677,11 @@ class Glints {
      */
     convertDateMMDD(text) {
         return __awaiter(this, void 0, void 0, function* () {
-            text = text.trim();
-            if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+            var _a;
+            // A period without a "-" (e.g. just "Sekarang") leaves the caller passing
+            // undefined for the missing half.
+            text = (_a = text === null || text === void 0 ? void 0 : text.trim()) !== null && _a !== void 0 ? _a : "";
+            if (text == "" || text.toLowerCase() == "sekarang") {
                 return "0";
             }
             // Mapping Indonesian month abbreviations to month numbers
@@ -1162,8 +1719,9 @@ class Glints {
    */
     convertDateMMDDToYYYY(text) {
         return __awaiter(this, void 0, void 0, function* () {
-            text = text.trim();
-            if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+            var _a;
+            text = (_a = text === null || text === void 0 ? void 0 : text.trim()) !== null && _a !== void 0 ? _a : "";
+            if (text == "" || text.toLowerCase() == "sekarang") {
                 return "0";
             }
             // Extract the month abbreviation and year from the input
@@ -1316,7 +1874,11 @@ class Glints {
                 // Get the file extension based on the content type
                 const extension = mimeTypes[contentType];
                 // Generate a file path for the stored image
-                const filePath = path_1.default.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
+                const storageDir = path_1.default.join(__dirname, "../storage/");
+                if (!fs_1.default.existsSync(storageDir)) {
+                    fs_1.default.mkdirSync(storageDir, { recursive: true });
+                }
+                const filePath = path_1.default.join(storageDir, `${Date.now()}.${extension}`);
                 // Write the image data to the file
                 yield fs_1.default.promises.writeFile(filePath, response.data);
                 // Return the file path of the stored image

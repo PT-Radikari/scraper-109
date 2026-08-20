@@ -13,6 +13,7 @@ import {
   InMemorySessionStore,
   LoginAttemptGuard,
   PortalCredentials,
+  captureLoginDebugArtifacts,
   escapeRegExp,
   loadPortalCredentials,
   maskSecrets,
@@ -175,10 +176,38 @@ export type GlintsLoginOutcome =
   | "success"
   | "invalid_credentials"
   | "challenge"
+  | "otp_required"
   | "pending";
 
 const GLINTS_CHALLENGE_PATTERN =
-  /captcha|geetest|hcaptcha|cloudflare|two[\s-]?factor|\b2fa\b|one[\s-]?time password|\botp\b|kode (otp|verifikasi)|verification code|too many (login )?attempts|terlalu banyak/i;
+  /captcha|geetest|hcaptcha|cloudflare|too many (login )?attempts|terlalu banyak/i;
+
+const GLINTS_OTP_PATTERN =
+  /one[\s-]?time (password|code)|\botp\b|kode (otp|verifikasi)|verification code|two[\s-]?factor|\b2fa\b|verifikasi (email|perangkat|akun)|verify (your )?(email|device|identity|account)|dikirim ke (email|alamat|perangkat)|sent (a code )?to your email|\d+[\s-]?digit (code|kode)|(enter|masukkan) (the )?(kode|code)/i;
+
+/**
+ * Path segments the portal parks a submit on when it wants device/email
+ * verification. Matched segment-anchored against the pathname only (query and
+ * hash never reach it), because a false positive here parks the whole login
+ * attempt budget: `/dashboard?redirect=/verify` and `/settings/devices` must
+ * classify as success. Only consulted once the URL has left /login, so a
+ * Cloudflare interstitial (which keeps the original URL) can never match.
+ */
+const GLINTS_OTP_URL_SEGMENT_PATTERN =
+  /^(verify|verification|two[-_]?factor|2fa|mfa)([-_][a-z0-9]+)*$|(^|[-_])otp([-_]|$)|^device[-_](verification|verify|confirm(ation)?|check)$/i;
+
+/** True when any pathname segment of `url` is a verification route segment. */
+function glintsUrlLooksLikeVerification(url: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    pathname = url.split(/[?#]/)[0].replace(/^[a-z]+:\/\/[^/]+/i, "");
+  }
+  return pathname
+    .split("/")
+    .some((segment) => segment !== "" && GLINTS_OTP_URL_SEGMENT_PATTERN.test(segment));
+}
 
 const GLINTS_INVALID_CREDENTIALS_PATTERN =
   /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
@@ -194,29 +223,45 @@ const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
   '[id*="captcha" i]',
   '[class*="geetest" i]',
   '[id*="geetest" i]',
+].join(", ");
+
+const GLINTS_OTP_ELEMENT_SELECTOR = [
   'input[autocomplete="one-time-code"]',
   'input[name*="otp" i]',
   'input[id*="otp" i]',
   'input[name*="verification" i]',
+  'input[id*="verification" i]',
+  'input[data-testid*="otp" i]',
 ].join(", ");
 
 /**
  * Classifies the state of the Glints login page. Pure so the detection logic
  * is unit-testable without a browser: leaving /login means the portal accepted
- * the login; otherwise the visible text (never script content) is matched for
- * a rejected-credentials banner first, and a captcha/2FA/rate-limit wall is
- * reported only when an actual challenge widget is on the page, so a bare
- * keyword mention can never arm the challenge cooldown.
+ * the login unless it landed on a verification route or an OTP form; on /login
+ * the visible text (never script content) is matched for a rejected-credentials
+ * banner first, then a rendered code input plus OTP wording marks the
+ * device-verification page, and a captcha/rate-limit wall is reported only
+ * when an actual challenge widget is on the page — so a bare keyword mention
+ * can never arm the challenge or OTP handling.
  */
 export function classifyGlintsLoginResult(observation: {
   url: string;
   visibleText: string;
   hasChallengeElement: boolean;
+  hasOtpElement: boolean;
 }): GlintsLoginOutcome {
-  if (!observation.url.includes("/login")) return "success";
+  const otpFormRendered =
+    observation.hasOtpElement && GLINTS_OTP_PATTERN.test(observation.visibleText);
+  if (!observation.url.includes("/login")) {
+    if (glintsUrlLooksLikeVerification(observation.url) || otpFormRendered) {
+      return "otp_required";
+    }
+    return "success";
+  }
   if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
     return "invalid_credentials";
   }
+  if (otpFormRendered) return "otp_required";
   if (
     observation.hasChallengeElement &&
     GLINTS_CHALLENGE_PATTERN.test(observation.visibleText)
@@ -475,6 +520,14 @@ export class Glints {
       outcome = await this.attemptCredentialLogin(page, credentials);
     } catch (error) {
       glintsLoginGuard.recordFailure("error");
+      // A blocked or never-rendered login form (e.g. a bot-check page served
+      // to the datacenter IP) surfaces here — capture what was on screen so
+      // this server-only shape self-documents too.
+      await this.captureLoginDebug(
+        page,
+        "credential login threw mid-attempt",
+        credentials,
+      );
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
         `[GLINTS] GLINTS_LOGIN_FAILED: credential login errored: ${maskSecrets(message, [credentials.password, credentials.email])}`,
@@ -489,9 +542,19 @@ export class Glints {
         });
         const landing = await this.waitForDashboardOrLogin(page);
         if (landing !== "dashboard" || !(await this.hasDashboardMarker(page))) {
+          // The portal held the session on an interstitial. If that
+          // interstitial is the OTP/device-verification page, name it.
+          if ((await this.observeLoginPage(page)) === "otp_required") {
+            await this.throwOtpRequired(page, credentials);
+          }
           glintsLoginGuard.recordFailure("error");
+          await this.captureLoginDebug(
+            page,
+            "login submit left /login but the dashboard never rendered",
+            credentials,
+          );
           throw new Error(
-            "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (OTP, password reset, onboarding) that needs a human login",
+            "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state",
           );
         }
         glintsLoginGuard.recordSuccess();
@@ -508,8 +571,12 @@ export class Glints {
       case "challenge": {
         glintsLoginGuard.recordFailure("challenge");
         throw new Error(
-          "[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/2FA/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule",
+          "[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule",
         );
+      }
+      case "otp_required": {
+        await this.throwOtpRequired(page, credentials);
+        break;
       }
       case "invalid_credentials": {
         glintsLoginGuard.recordFailure("invalid_credentials");
@@ -519,11 +586,38 @@ export class Glints {
       }
       default: {
         glintsLoginGuard.recordFailure("error");
+        await this.captureLoginDebug(
+          page,
+          "login submit produced no dashboard, error banner, challenge or OTP page",
+          credentials,
+        );
         throw new Error(
-          `[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms`,
+          `[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state`,
         );
       }
     }
+  }
+
+  /**
+   * Records and raises the OTP/device-verification outcome: the portal sent a
+   * code out-of-band, so in-process retries can only spam the inbox — the
+   * guard parks every further attempt for its long backoff. The page state is
+   * captured to the artifact bucket so the exact verification page shape is
+   * on record for the humans who must act on it.
+   */
+  private async throwOtpRequired(
+    page: any,
+    credentials: PortalCredentials,
+  ): Promise<never> {
+    glintsLoginGuard.recordFailure("otp_required");
+    await this.captureLoginDebug(
+      page,
+      "OTP/device-verification page detected after login submit",
+      credentials,
+    );
+    throw new Error(
+      "[GLINTS] GLINTS_LOGIN_OTP_REQUIRED: the portal is asking for an email OTP / device verification code — a human must complete the verification (check the GLINTS_EMAIL inbox) or export a fresh session into glints.json; in-process login attempts are parked so the inbox is not flooded",
+    );
   }
 
   /**
@@ -553,11 +647,7 @@ export class Glints {
     let outcome: GlintsLoginOutcome = "pending";
     for (let i = 0; i < attempts; i++) {
       await page.waitForTimeout(pollIntervalMs);
-      outcome = classifyGlintsLoginResult({
-        url: page.url(),
-        visibleText: await this.readLoginVisibleText(page),
-        hasChallengeElement: await this.detectLoginChallengeElement(page),
-      });
+      outcome = await this.observeLoginPage(page);
       if (outcome !== "pending") break;
     }
     return outcome;
@@ -580,18 +670,58 @@ export class Glints {
     }
   }
 
-  /** Detects a rendered captcha/OTP widget for challenge classification. */
-  private async detectLoginChallengeElement(page: any): Promise<boolean> {
+  /** True when any element matching `selector` is rendered with a real box. */
+  private async detectRenderedElement(page: any, selector: string): Promise<boolean> {
     try {
-      return await page.evaluate((selector: string) => {
-        return Array.from(document.querySelectorAll(selector)).some((el) => {
+      return await page.evaluate((sel: string) => {
+        return Array.from(document.querySelectorAll(sel)).some((el) => {
           const rect = (el as HTMLElement).getBoundingClientRect();
           return rect.width > 0 && rect.height > 0;
         });
-      }, GLINTS_CHALLENGE_ELEMENT_SELECTOR);
+      }, selector);
     } catch {
       return false;
     }
+  }
+
+  /** Detects a rendered captcha widget for challenge classification. */
+  private async detectLoginChallengeElement(page: any): Promise<boolean> {
+    return this.detectRenderedElement(page, GLINTS_CHALLENGE_ELEMENT_SELECTOR);
+  }
+
+  /** Detects a rendered OTP/verification-code input for otp_required classification. */
+  private async detectLoginOtpElement(page: any): Promise<boolean> {
+    return this.detectRenderedElement(page, GLINTS_OTP_ELEMENT_SELECTOR);
+  }
+
+  /** One classifier observation of the page's current state. */
+  private async observeLoginPage(page: any): Promise<GlintsLoginOutcome> {
+    return classifyGlintsLoginResult({
+      url: page.url(),
+      visibleText: await this.readLoginVisibleText(page),
+      hasChallengeElement: await this.detectLoginChallengeElement(page),
+      hasOtpElement: await this.detectLoginOtpElement(page),
+    });
+  }
+
+  /**
+   * Uploads screenshot + HTML + meta of the current login page to the
+   * artifact bucket so a server-side failure this code cannot reproduce still
+   * documents itself. Never throws; failures only warn.
+   */
+  private async captureLoginDebug(
+    page: any,
+    reason: string,
+    credentials: PortalCredentials,
+  ): Promise<void> {
+    await captureLoginDebugArtifacts({
+      page,
+      portal: "glints",
+      reason,
+      getUploader: () => this.getSink(),
+      // The email is the captain's own infra address and is allowed to appear.
+      secrets: [credentials.password],
+    });
   }
 
   /**
