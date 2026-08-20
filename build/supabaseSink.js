@@ -273,11 +273,28 @@ class SupabaseSink {
      */
     uploadArtifact(portal, kind, localPath) {
         return __awaiter(this, void 0, void 0, function* () {
+            const ext = path_1.default.extname(localPath).replace(/^\./, "").toLowerCase();
+            let bytes;
+            try {
+                bytes = fs_1.default.readFileSync(localPath);
+            }
+            catch (error) {
+                throw sanitizeSinkError(error, "uploadArtifact");
+            }
+            return this.uploadArtifactBytes(portal, kind, bytes, ext);
+        });
+    }
+    /**
+     * Same as uploadArtifact for artifacts that only exist in memory (e.g.
+     * pintarnya downloads CVs/photos into File objects, never to disk).
+     * @returns the object key the artifact was stored under.
+     */
+    uploadArtifactBytes(portal, kind, bytes, extension) {
+        return __awaiter(this, void 0, void 0, function* () {
             return this.guard("uploadArtifact", () => __awaiter(this, void 0, void 0, function* () {
                 var _a;
-                const bytes = fs_1.default.readFileSync(localPath);
                 const digest = crypto_1.default.createHash("sha256").update(bytes).digest("hex");
-                const ext = path_1.default.extname(localPath).replace(/^\./, "").toLowerCase();
+                const ext = extension.replace(/^\./, "").toLowerCase();
                 const month = new Date().toISOString().slice(0, 7).replace("-", "");
                 const key = `${portal}/${month}/${digest}.${ext}`;
                 try {
@@ -297,6 +314,37 @@ class SupabaseSink {
                         throw error;
                 }
                 return key;
+            }));
+        });
+    }
+    /**
+     * Uploads a debugging artifact (login-failure screenshot/HTML/meta) under an
+     * explicit caller-chosen key, unlike the content-addressed uploadArtifact
+     * path. Plain INSERT (the bucket policy is anon insert-only) with the same
+     * duplicate tolerance as uploadArtifactBytes; keys are timestamped so a
+     * duplicate can only mean the artifact is already there.
+     * @returns the bucket-qualified path (`<bucket>/<key>`) for log lines.
+     */
+    uploadDebugArtifact(key, bytes, contentType) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("uploadDebugArtifact", () => __awaiter(this, void 0, void 0, function* () {
+                try {
+                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                        headers: {
+                            apikey: this.anonKey,
+                            Authorization: `Bearer ${this.anonKey}`,
+                            "Content-Type": contentType,
+                        },
+                    });
+                }
+                catch (error) {
+                    const response = axios_1.default.isAxiosError(error) ? error.response : undefined;
+                    const duplicate = ((response === null || response === void 0 ? void 0 : response.status) === 400 || (response === null || response === void 0 ? void 0 : response.status) === 409) &&
+                        /already exists|duplicate/i.test(JSON.stringify(response.data));
+                    if (!duplicate)
+                        throw error;
+                }
+                return `${this.bucket}/${key}`;
             }));
         });
     }

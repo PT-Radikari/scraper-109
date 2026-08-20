@@ -56,7 +56,11 @@ export function maskSecrets(
 }
 
 /** How one login attempt failed. */
-export type LoginFailureKind = "invalid_credentials" | "challenge" | "error";
+export type LoginFailureKind =
+  | "invalid_credentials"
+  | "challenge"
+  | "error"
+  | "otp_required";
 
 export interface LoginAttemptGuardOptions {
   /** Consecutive credential failures allowed before the long backoff kicks in. */
@@ -132,6 +136,16 @@ export class LoginAttemptGuard {
       this.challengeUntil = this.now() + this.challengeBackoffMs;
       return;
     }
+    if (kind === "otp_required") {
+      // An OTP/device-verification page needs a human (or the email inbox):
+      // any in-process retry only fires another verification email. Exhaust
+      // the whole budget so the long backoff applies immediately, after which
+      // a single fresh attempt is allowed (the device may have been verified
+      // out-of-band in the meantime).
+      this.failures = this.maxConsecutiveFailures;
+      this.lastFailureAt = this.now();
+      return;
+    }
     this.failures += 1;
     this.lastFailureAt = this.now();
   }
@@ -140,6 +154,129 @@ export class LoginAttemptGuard {
   reset(): void {
     this.recordSuccess();
   }
+}
+
+/** Where debug artifacts land; SupabaseSink.uploadDebugArtifact satisfies it. */
+export interface LoginDebugUploader {
+  /** Uploads bytes under an explicit key and returns the bucket-qualified path. */
+  uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string>;
+}
+
+/** Bucket paths (bucket-qualified) of the artifacts one capture uploaded. */
+export interface LoginDebugCapture {
+  screenshotPath: string | null;
+  htmlPath: string | null;
+  metaPath: string | null;
+  /** The page's final URL with every secret masked. */
+  finalUrl: string;
+}
+
+/**
+ * Self-documenting evidence for login failures the classifier could not name:
+ * uploads a screenshot, the full page HTML and a small meta record to
+ * `<portal>/login-debug/<timestamp>/` in the artifact bucket, and logs the
+ * uploaded paths loudly so the next unreproducible server-side failure carries
+ * its own page state. Secrets (the password) are masked out of the HTML, the
+ * meta record and the reported URL before anything leaves the process; the
+ * screenshot is safe because password inputs render obscured.
+ *
+ * Never throws: a broken capture (missing sink config, storage outage,
+ * screenshot crash) must not replace the login error it is documenting. Each
+ * artifact is attempted independently so a failing screenshot still leaves the
+ * HTML behind.
+ */
+export async function captureLoginDebugArtifacts(options: {
+  page: {
+    url(): string;
+    screenshot(opts?: unknown): Promise<Buffer>;
+    content(): Promise<string>;
+  };
+  portal: string;
+  /** Why the capture fired, recorded in meta.json (e.g. the outcome name). */
+  reason: string;
+  /** Lazy so a throwing sink constructor lands in this function's try/catch. */
+  getUploader: () => LoginDebugUploader;
+  secrets: Array<string | undefined | null>;
+  log?: (message: string) => void;
+  warn?: (message: string) => void;
+  now?: () => Date;
+}): Promise<LoginDebugCapture | null> {
+  const log = options.log ?? console.error;
+  const warn = options.warn ?? console.warn;
+  const mask = (text: string) => maskSecrets(text, options.secrets);
+  const tag = `[${options.portal.toUpperCase()}]`;
+
+  let finalUrl: string;
+  try {
+    finalUrl = mask(options.page.url());
+  } catch {
+    finalUrl = "<unavailable>";
+  }
+
+  let uploader: LoginDebugUploader;
+  try {
+    uploader = options.getUploader();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    warn(
+      `${tag} login debug capture skipped — no artifact uploader available: ${mask(message)}`,
+    );
+    return null;
+  }
+
+  const timestamp = (options.now?.() ?? new Date())
+    .toISOString()
+    .replace(/[:.]/g, "-");
+  const prefix = `${options.portal}/login-debug/${timestamp}`;
+
+  const upload = async (
+    name: string,
+    contentType: string,
+    read: () => Promise<Buffer>,
+  ): Promise<string | null> => {
+    try {
+      return await uploader.uploadDebugArtifact(`${prefix}/${name}`, await read(), contentType);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warn(`${tag} login debug capture of ${name} failed: ${mask(message)}`);
+      return null;
+    }
+  };
+
+  const screenshotPath = await upload("page.png", "image/png", () =>
+    options.page.screenshot({ fullPage: true }),
+  );
+  const htmlPath = await upload("page.html", "text/html", async () =>
+    Buffer.from(mask(await options.page.content()), "utf8"),
+  );
+  const metaPath = await upload("meta.json", "application/json", async () =>
+    Buffer.from(
+      JSON.stringify(
+        {
+          portal: options.portal,
+          reason: options.reason,
+          final_url: finalUrl,
+          captured_at: (options.now?.() ?? new Date()).toISOString(),
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    ),
+  );
+
+  const uploaded = [screenshotPath, htmlPath, metaPath].filter(
+    (p): p is string => p !== null,
+  );
+  if (uploaded.length === 0) {
+    warn(`${tag} login debug capture uploaded nothing (final URL: ${finalUrl})`);
+  } else {
+    log(
+      `${tag} LOGIN_DEBUG_ARTIFACTS: ${options.reason} — page state captured to ${uploaded.join(", ")} (final URL: ${finalUrl})`,
+    );
+  }
+
+  return { screenshotPath, htmlPath, metaPath, finalUrl };
 }
 
 /** A refreshed portal session captured after a successful credential login. */

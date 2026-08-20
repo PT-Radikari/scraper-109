@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildPortalRunner = void 0;
+exports.runPortalCycle = exports.buildPortalRunner = void 0;
 const portalBridge_1 = require("./central/portalBridge");
 const retry_1 = require("./retry");
 const browserRegistry_1 = require("./browserRegistry");
@@ -151,15 +151,109 @@ function getRunRecordingSink() {
     return runRecordingSink;
 }
 /**
+ * Lazy factories for the continuously looped portals, keyed by portal name.
+ * Same lazy-loading contract as portalRunnerFactories: the portal module and
+ * its config load only when its `<portal>-continuous` command is dispatched,
+ * and each call of the built factory constructs a fresh scraper instance so a
+ * retried attempt never inherits state from the attempt that failed.
+ */
+const continuousScraperFactories = {
+    glints: () => {
+        const { Glints } = require("./glints");
+        const config = loadPortalConfig("glints.json");
+        return () => new Glints(config);
+    },
+    jooble: () => {
+        const { Jooble } = require("./jooble");
+        const config = loadPortalConfig("jooble.json");
+        return () => new Jooble(config);
+    },
+    seek: () => {
+        const { Seek } = require("./seek");
+        const config = loadPortalConfig("seek.json");
+        return () => new Seek(config);
+    },
+    pintarnya: () => {
+        const { Pintarnya } = require("./pintarnya");
+        const config = loadPortalConfig("pintarnya.json");
+        return () => new Pintarnya(config);
+    },
+    kitalulus: () => {
+        const { KitaLulus } = require("./kitalulus");
+        const config = loadPortalConfig("kitalulus.json");
+        return () => new KitaLulus(config);
+    },
+};
+/**
+ * Runs one recorded cycle of a portal: opens a scrape.scrape_runs row, runs
+ * the scrape under the retry policy (a fresh scraper per attempt), drains the
+ * ingestion stream, and closes the run row with the final status, the last
+ * attempt's counters and the error that exhausted the budget (if any).
+ *
+ * Exported separately from the endless loop so tests can drive one cycle with
+ * a mocked sink and a fake scraper factory.
+ */
+function runPortalCycle(portal, buildScraper, sink) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const config = (0, retry_1.loadRetryConfig)();
+        let lastScraper = null;
+        let runId = null;
+        if (sink) {
+            try {
+                runId = yield sink.recordRunStart(portal, "continuous");
+            }
+            catch (error) {
+                console.warn(`[scheduler] failed to record ${portal} run start`, error);
+            }
+        }
+        let cycleError = null;
+        try {
+            yield (0, retry_1.runWithRetry)(portal, () => {
+                lastScraper = buildScraper();
+                return lastScraper.Scrape();
+            }, {
+                config,
+                cleanup: browserRegistry_1.closeTrackedBrowsers,
+            });
+        }
+        catch (error) {
+            cycleError = error;
+            console.error(`${portal} cycle exhausted its attempt budget`, error);
+        }
+        finally {
+            yield (0, portalBridge_1.closeIngestionService)();
+        }
+        if (sink && runId !== null) {
+            try {
+                const scraper = lastScraper;
+                yield sink.recordRunEnd(runId, {
+                    status: cycleError ? "failed" : "success",
+                    error: cycleError
+                        ? cycleError instanceof Error
+                            ? cycleError.message
+                            : String(cycleError)
+                        : null,
+                    vacancies_seen: scraper ? scraper.getVacanciesSeen() : null,
+                    candidates_seen: scraper ? scraper.getCollectedCount() : null,
+                });
+            }
+            catch (error) {
+                console.warn(`[scheduler] failed to record ${portal} run end`, error);
+            }
+        }
+    });
+}
+exports.runPortalCycle = runPortalCycle;
+/**
  * Runs a portal forever, waiting between complete cycles. Each cycle retains
  * the normal attempt-level exponential backoff, and an exhausted cycle starts
  * fresh after SCRAPER_INTERVAL_MS instead of terminating the service.
  *
- * Every cycle writes one row to scrape.scrape_runs: opened before the first
- * attempt, closed with the final status, counts of the last attempt and the
- * error that exhausted the budget (if any).
+ * Every cycle writes one row to scrape.scrape_runs via runPortalCycle. An
+ * expired portal session shows up here as one loud failed cycle (the scraper
+ * throws a "[PORTAL] Session expired ..." line) and the loop keeps cycling.
  */
-function runContinuousPortal(command) {
+function runContinuousPortal(portal) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
         const rawInterval = Number((_a = process.env.SCRAPER_INTERVAL_MS) !== null && _a !== void 0 ? _a : 300000);
@@ -169,65 +263,14 @@ function runContinuousPortal(command) {
         // Loaded once up front: the continuous loop only ever drives one portal, and
         // a broken portal module or config should fail the service loudly at boot
         // rather than on every cycle.
-        const glintsModule = command === "glints"
-            ? require("./glints")
-            : null;
-        const glintsJson = command === "glints"
-            ? loadPortalConfig("glints.json")
-            : null;
+        const factory = continuousScraperFactories[portal];
+        if (!factory) {
+            throw new Error(`unknown continuous portal: ${portal}`);
+        }
+        const buildScraper = factory();
         for (;;) {
-            const config = (0, retry_1.loadRetryConfig)();
-            const cycle = {
-                scraper: null,
-            };
-            const runner = glintsModule && glintsJson
-                ? () => {
-                    cycle.scraper = new glintsModule.Glints(glintsJson);
-                    return cycle.scraper.Scrape();
-                }
-                : buildPortalRunner(command);
-            const sink = getRunRecordingSink();
-            let runId = null;
-            if (sink) {
-                try {
-                    runId = yield sink.recordRunStart(command, "continuous");
-                }
-                catch (error) {
-                    console.warn(`[scheduler] failed to record ${command} run start`, error);
-                }
-            }
-            let cycleError = null;
-            try {
-                yield (0, retry_1.runWithRetry)(command, runner, {
-                    config,
-                    cleanup: browserRegistry_1.closeTrackedBrowsers,
-                });
-            }
-            catch (error) {
-                cycleError = error;
-                console.error(`${command} cycle exhausted its attempt budget`, error);
-            }
-            finally {
-                yield (0, portalBridge_1.closeIngestionService)();
-            }
-            if (sink && runId !== null) {
-                try {
-                    yield sink.recordRunEnd(runId, {
-                        status: cycleError ? "failed" : "success",
-                        error: cycleError
-                            ? cycleError instanceof Error
-                                ? cycleError.message
-                                : String(cycleError)
-                            : null,
-                        vacancies_seen: cycle.scraper ? cycle.scraper.getVacanciesSeen() : null,
-                        candidates_seen: cycle.scraper ? cycle.scraper.getCollectedCount() : null,
-                    });
-                }
-                catch (error) {
-                    console.warn(`[scheduler] failed to record ${command} run end`, error);
-                }
-            }
-            console.info(`[scheduler] ${command}: next newest-first cycle in ${intervalMs}ms`);
+            yield runPortalCycle(portal, buildScraper, getRunRecordingSink());
+            console.info(`[scheduler] ${portal}: next newest-first cycle in ${intervalMs}ms`);
             yield new Promise((resolve) => setTimeout(resolve, intervalMs));
         }
     });
@@ -245,8 +288,10 @@ function logBootBanner(command) {
 function main() {
     const command = args[0];
     logBootBanner(command);
-    if (command === "glints-continuous") {
-        void runContinuousPortal("glints");
+    const continuousMatch = command === null || command === void 0 ? void 0 : command.match(/^([a-z-]+)-continuous$/);
+    if (continuousMatch &&
+        Object.prototype.hasOwnProperty.call(continuousScraperFactories, continuousMatch[1])) {
+        void runContinuousPortal(continuousMatch[1]);
     }
     else if (command &&
         Object.prototype.hasOwnProperty.call(portalRunnerFactories, command)) {

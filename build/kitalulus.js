@@ -19,12 +19,14 @@ const path_1 = __importDefault(require("path"));
 const child_process_1 = require("child_process");
 const form_data_1 = __importDefault(require("form-data"));
 const axios_1 = __importDefault(require("axios"));
-const sqlite3_1 = __importDefault(require("sqlite3"));
 const portalBridge_1 = require("./central/portalBridge");
+const supabaseSink_1 = require("./supabaseSink");
+const portalSink_1 = require("./portalSink");
 const browserRegistry_1 = require("./browserRegistry");
 const pdf_parse_1 = require("pdf-parse");
 class KitaLulus {
     constructor(config) {
+        var _a;
         this.HEADLESS = true;
         this.LIMIT = 0;
         this.BASE_URL = "";
@@ -35,6 +37,9 @@ class KitaLulus {
         this.COLLECTED = 0;
         this.SLOWMO = 10000;
         this.DB_PATH = "";
+        this.COOKIES = [];
+        this.sink = null;
+        this.pendingTempFiles = [];
         this.SIGN_IN_EMAIL_SELECTOR = '[data-test-id="tfSignInEmail"]';
         this.SIGN_IN_PASSWORD_SELECTOR = '[data-test-id="tfSignInPassword"]';
         this.SIGN_IN_SUBMIT_SELECTOR = '[data-test-id="btnSignInSubmit"]';
@@ -65,8 +70,78 @@ class KitaLulus {
         this.TIMEOUT = config.timeout;
         this.SLOWMO = config.slowmo;
         this.DB_PATH = path_1.default.join(__dirname, config.db_path);
-        this.DB = new sqlite3_1.default.Database(this.DB_PATH);
+        this.COOKIES = (_a = config.cookies) !== null && _a !== void 0 ? _a : [];
         console.info("CONFIG KITA LULUS LOADED");
+    }
+    /**
+     * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+     * Construction is lazy so importing KitaLulus for a helper test does not
+     * require sink credentials.
+     */
+    getSink() {
+        var _a;
+        (_a = this.sink) !== null && _a !== void 0 ? _a : (this.sink = new supabaseSink_1.SupabaseSink());
+        return this.sink;
+    }
+    /** kitalulus v1 walks the flat Pelamar list, not per-vacancy pages. */
+    getVacanciesSeen() {
+        return 0;
+    }
+    /** Number of applicants successfully persisted by this run. */
+    getCollectedCount() {
+        return this.COLLECTED;
+    }
+    ensureLegacyDatabase() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.DB)
+                return;
+            yield this.createDatabaseConnection();
+            yield this.createRequiredTables();
+        });
+    }
+    /**
+     * Writes one applicant straight into the scoring Supabase via the shared
+     * direct-sink slice (see src/portalSink.ts). The detail page URL is
+     * candidate-specific only when it differs from the Pelamar list URL, so the
+     * list URL rides along as vacancy_url to keep the identity ladder honest.
+     * @param param - The applicant data to be persisted.
+     * @param listPageUrl - The Pelamar list URL shared by every row.
+     */
+    sendToSink(param, listPageUrl) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            yield (0, portalSink_1.sendApplicantToSink)(this.getSink(), {
+                portal: param.portal,
+                applied_for: param.applied_for,
+                applied_date: param.applied_date,
+                url_profile: param.page_url,
+                vacancy_url: listPageUrl,
+                name: param.name,
+                email: param.email,
+                phone: (_a = param.whatapps) === null || _a === void 0 ? void 0 : _a.contact_number,
+                date_of_birth: param.date_of_birth,
+                location: param.location,
+                work_experience: param.workExperience,
+                education: param.education,
+                skill: param.skill,
+                cv_path: param.cv,
+                photo_path: param.photo,
+                raw: {
+                    type: param.type,
+                    nick_name: param.nick_name,
+                    summary: param.summary,
+                    age: param.age,
+                    salary_expectation: param.salary_expectation,
+                    gender: param.gender,
+                    reference_link: param.reference_link,
+                    cv_filename: param.cv_filename,
+                    cv_text: param.cv_text,
+                    cv_url: param.cv_url,
+                    cv_ocr_method: param.cv_ocr_method,
+                },
+            });
+            this.COLLECTED++;
+        });
     }
     getBrowserFallbackExecutablePath() {
         const candidates = [
@@ -121,7 +196,9 @@ class KitaLulus {
         });
     }
     /**
-     * Sends a request to the specified URL with the provided applicant data.
+     * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
+     * insert and central mirror. Kept untouched but bypassed: kitalulus now
+     * lands applicants directly in the scoring Supabase via sendToSink().
      * @param param - The applicant data.
      * @returns A Promise that resolves to void.
      */
@@ -167,6 +244,7 @@ class KitaLulus {
                 console.error(`[ERROR] API request failed for "${param.name}":`, error);
             }
             console.info("[DB] Inserting applicant into local DB...");
+            yield this.ensureLegacyDatabase();
             yield this.insertApplicant(param);
             this.COLLECTED++;
             console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED}`);
@@ -495,28 +573,39 @@ class KitaLulus {
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
             var _a, _b;
+            // Fail fast at cycle start when the sink env vars are missing; the local
+            // SQLite path is bypassed entirely (mirrors glints).
+            this.getSink();
             let browser = null;
-            try {
-                this.DB = yield this.createDatabaseConnection();
-                console.info("Creating required tables...");
-                yield this.createRequiredTables();
-            }
-            catch (error) {
-                console.error(error);
-                console.log("Failed to create database connection. Exiting...");
-                return;
-            }
             try {
                 browser = (0, browserRegistry_1.trackBrowser)(yield this.launchBrowser());
                 const page = yield browser.newPage();
                 page.setDefaultTimeout(this.TIMEOUT);
+                if (this.COOKIES.length > 0) {
+                    console.info("[LOGIN] Replaying stored session cookies...");
+                    yield page.context().addCookies(this.COOKIES);
+                }
                 console.info("[LOGIN] Navigating to signin page...");
                 yield page.goto("https://employer.kitalulus.com/auth/signin");
-                console.info("[LOGIN] Filling credentials...");
-                yield page.locator(this.SIGN_IN_EMAIL_SELECTOR).fill((_a = this.EMAIL) !== null && _a !== void 0 ? _a : "");
-                yield page.locator(this.SIGN_IN_PASSWORD_SELECTOR).fill((_b = this.PASSWORD) !== null && _b !== void 0 ? _b : "");
-                yield page.locator(this.SIGN_IN_SUBMIT_SELECTOR).click();
-                console.info("[LOGIN] Submitted, waiting for dashboard...");
+                yield page.waitForTimeout(2000);
+                if (!page.url().includes("/auth")) {
+                    console.info("[LOGIN] Replayed session still valid, skipping credential login.");
+                }
+                else {
+                    console.info("[LOGIN] Filling credentials...");
+                    yield page.locator(this.SIGN_IN_EMAIL_SELECTOR).fill((_a = this.EMAIL) !== null && _a !== void 0 ? _a : "");
+                    yield page.locator(this.SIGN_IN_PASSWORD_SELECTOR).fill((_b = this.PASSWORD) !== null && _b !== void 0 ? _b : "");
+                    yield page.locator(this.SIGN_IN_SUBMIT_SELECTOR).click();
+                    console.info("[LOGIN] Submitted, waiting for dashboard...");
+                }
+                try {
+                    yield page.waitForURL((url) => !url.toString().includes("/auth"), {
+                        timeout: this.TIMEOUT,
+                    });
+                }
+                catch (_c) {
+                    throw new Error(`[KITALULUS] Session expired: login never left the sign-in page (${page.url()}) — refresh cookies/credentials in kitalulus.json`);
+                }
                 console.info("[TOOLTIP] Handling dashboard tooltips...");
                 yield this.tooltipsDashbaord(page);
                 console.info("[TOOLTIP] Dashboard tooltips done.");
@@ -559,23 +648,24 @@ class KitaLulus {
                             console.info("[CANDIDATE] Detail page opened.");
                             yield this.dismissMarketingOverlay(detailHandle.page);
                             const applicant = yield this.scrapeApplicantDetails("applicant", detailHandle.page, appliedFor);
-                            if (applicant.whatapps.contact_number === "") {
-                                console.info("[SKIP] No phone number or already in DB. Skipping send.");
+                            if (applicant.whatapps.contact_number === "" && applicant.email === "") {
+                                console.info("[SKIP] No phone number and no email. Skipping send.");
                                 continue;
                             }
                             console.info(`[CANDIDATE] Name: "${applicant.name}", Phone: ${applicant.whatapps.contact_number}`);
                             const collectedBefore = this.COLLECTED;
-                            yield this.sendRequest(applicant);
+                            yield this.sendToSink(applicant, page.url());
                             if (this.COLLECTED > collectedBefore) {
                                 newOnPage++;
                             }
-                            // Keep CV files on disk so the viewer can link directly to the saved document.
-                            yield this.RemoveTempFile(applicant.photo);
                         }
                         catch (error) {
                             console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
+                            if (error instanceof supabaseSink_1.SupabaseSinkError)
+                                throw error;
                         }
                         finally {
+                            yield this.removePendingTempFiles();
                             if (detailHandle) {
                                 yield detailHandle.cleanup();
                             }
@@ -593,13 +683,18 @@ class KitaLulus {
                 console.info(`[DONE] Pelamar scraping finished. Total collected: ${this.COLLECTED}`);
             }
             catch (error) {
+                // Rethrow so the retry loop and the continuous scheduler see the
+                // failure instead of a silently "successful" empty cycle.
                 console.error("[ERROR] Kitalulus scrape failed:", error);
+                throw error;
             }
             finally {
                 if (browser) {
                     yield browser.close();
                 }
-                yield this.closeDatabaseConnection();
+                if (this.DB) {
+                    yield this.closeDatabaseConnection();
+                }
             }
         });
     }
@@ -691,6 +786,19 @@ class KitaLulus {
                 catch (error) {
                     console.error("failed to remove file", error);
                 }
+            }
+        });
+    }
+    /**
+     * Removes every file downloaded via fetchAndStore since the last drain.
+     * Called from the per-row finally so downloads are cleaned up even when
+     * scrapeApplicantDetails throws partway through extraction.
+     */
+    removePendingTempFiles() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const files = this.pendingTempFiles.splice(0);
+            for (const filePath of files) {
+                yield this.RemoveTempFile(filePath);
             }
         });
     }
@@ -967,38 +1075,8 @@ class KitaLulus {
     scrapeApplicantDetails(type, page, vacancyPageTitle) {
         return __awaiter(this, void 0, void 0, function* () {
             const email = yield this.extractEmail(page);
-            const applicantInDatabase = yield this.getApplicantByEmail(email);
-            if (applicantInDatabase !== undefined &&
-                applicantInDatabase.email === email) {
-                console.info("Applicant already exists in the database. Skipping...");
-                return {
-                    portal: "",
-                    type: "",
-                    applied_for: "",
-                    applied_date: "",
-                    name: "",
-                    nick_name: "",
-                    summary: "",
-                    email: "",
-                    whatapps: { type: "", contact_number: "" },
-                    age: "",
-                    date_of_birth: "",
-                    salary_expectation: "",
-                    workExperience: [],
-                    education: [],
-                    skill: [],
-                    location: "",
-                    photo: "",
-                    cv_filename: "",
-                    cv_text: "",
-                    cv_url: "",
-                    cv_ocr_method: "",
-                    gender: "",
-                    reference_link: [],
-                    cv: "",
-                    page_url: ""
-                };
-            }
+            // No local-DB dedupe on the sink path: the scoring Supabase's write-once
+            // upserts make re-scrapes idempotent.
             const cvDetails = yield this.extractCV(page);
             const appliedFor = vacancyPageTitle || "Pelamar KitaLulus";
             const applicant = {
@@ -1431,6 +1509,7 @@ class KitaLulus {
                 const extension = (_b = mimeTypes[contentType]) !== null && _b !== void 0 ? _b : (path_1.default.extname(new URL(imageUrl).pathname).replace(".", "") || "bin");
                 const filePath = path_1.default.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
                 yield fs_1.default.promises.writeFile(filePath, response.data);
+                this.pendingTempFiles.push(filePath);
                 return filePath;
             }
             catch (error) {
@@ -1536,10 +1615,12 @@ class KitaLulus {
                 fs_1.default.writeFileSync(this.DB_PATH, "");
             }
             /**
-             * Open the database connection.
+             * Open the database connection. sqlite3 is required lazily so the sink
+             * path never loads the native binding (see AGENTS.md sharp edges).
              */
+            const sqlite = require("sqlite3");
             return new Promise((resolve, reject) => {
-                this.DB = new sqlite3_1.default.Database(this.DB_PATH, (err) => {
+                this.DB = new sqlite.Database(this.DB_PATH, (err) => {
                     if (err) {
                         console.error("Error opening database", err.message);
                         reject(err);

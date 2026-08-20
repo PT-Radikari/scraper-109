@@ -405,6 +405,35 @@ export class SupabaseSink {
   }
 
   /**
+   * Uploads a debugging artifact (login-failure screenshot/HTML/meta) under an
+   * explicit caller-chosen key, unlike the content-addressed uploadArtifact
+   * path. Plain INSERT (the bucket policy is anon insert-only) with the same
+   * duplicate tolerance as uploadArtifactBytes; keys are timestamped so a
+   * duplicate can only mean the artifact is already there.
+   * @returns the bucket-qualified path (`<bucket>/<key>`) for log lines.
+   */
+  async uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string> {
+    return this.guard("uploadDebugArtifact", async () => {
+      try {
+        await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+          headers: {
+            apikey: this.anonKey,
+            Authorization: `Bearer ${this.anonKey}`,
+            "Content-Type": contentType,
+          },
+        });
+      } catch (error) {
+        const response = axios.isAxiosError(error) ? error.response : undefined;
+        const duplicate =
+          (response?.status === 400 || response?.status === 409) &&
+          /already exists|duplicate/i.test(JSON.stringify(response.data));
+        if (!duplicate) throw error;
+      }
+      return `${this.bucket}/${key}`;
+    });
+  }
+
+  /**
    * Records the start of one scrape run. @returns the numeric id of the run.
    */
   async recordRunStart(portal: string, stage: string): Promise<number> {

@@ -399,6 +399,55 @@ describe("SupabaseSink", () => {
     });
   });
 
+  describe("uploadDebugArtifact", () => {
+    it("uploads bytes to the caller's explicit key and returns the bucket-qualified path", async () => {
+      const sink = buildSink();
+      const key = "glints/login-debug/2026-08-20T09-30-45-123Z/page.html";
+
+      const uploaded = await sink.uploadDebugArtifact(key, Buffer.from("<html>"), "text/html");
+
+      expect(uploaded).toBe(`${BUCKET}/${key}`);
+      expect(mockedAxios.post).toHaveBeenCalledWith(
+        `${URL}/storage/v1/object/${BUCKET}/${key}`,
+        Buffer.from("<html>"),
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            apikey: ANON_KEY,
+            Authorization: `Bearer ${ANON_KEY}`,
+            "Content-Type": "text/html",
+          }),
+        })
+      );
+    });
+
+    it("treats an already-existing object as a successful upload", async () => {
+      mockedAxios.post.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 409, data: { message: "The resource already exists" } },
+      });
+      mockedAxios.isAxiosError.mockReturnValueOnce(true);
+
+      const uploaded = await buildSink().uploadDebugArtifact(
+        "glints/login-debug/t/page.png",
+        Buffer.from("png"),
+        "image/png"
+      );
+
+      expect(uploaded).toBe(`${BUCKET}/glints/login-debug/t/page.png`);
+    });
+
+    it("sanitizes storage failures into SupabaseSinkError", async () => {
+      mockedAxios.post.mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 403, data: { message: "new row violates row-level security policy" } },
+      });
+
+      await expect(
+        buildSink().uploadDebugArtifact("glints/login-debug/t/page.png", Buffer.from("png"), "image/png")
+      ).rejects.toThrow(SupabaseSinkError);
+    });
+  });
+
   describe("recordRunStart / recordRunEnd", () => {
     it("inserts a scrape run and returns its id", async () => {
       mockedAxios.post.mockResolvedValue({ data: [{ id: 42 }] } as never);

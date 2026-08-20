@@ -31,6 +31,7 @@ class FakeLoginPage {
   currentUrl = "https://employers.glints.id/login";
   visibleText = "Alamat Email Password Lupa password? Masuk";
   hasChallengeElement = false;
+  hasOtpElement = false;
   dashboardMarkerCount = 0;
   fills: Record<string, string> = {};
   clicked: string[] = [];
@@ -38,6 +39,8 @@ class FakeLoginPage {
   onPoll: (() => void) | null = null;
   fillError: Error | null = null;
   locatorError: Error | null = null;
+  pageHtml = "<html><body>Masuk</body></html>";
+  screenshotError: Error | null = null;
 
   url(): string {
     return this.currentUrl;
@@ -56,6 +59,13 @@ class FakeLoginPage {
   async waitForTimeout(_ms: number): Promise<void> {
     this.onPoll?.();
   }
+  async screenshot(_options?: unknown): Promise<Buffer> {
+    if (this.screenshotError) throw this.screenshotError;
+    return Buffer.from("fake-png");
+  }
+  async content(): Promise<string> {
+    return this.pageHtml;
+  }
   locator(_selector: string) {
     return {
       textContent: async () => this.visibleText,
@@ -65,11 +75,29 @@ class FakeLoginPage {
       },
     };
   }
-  async evaluate(fn: unknown): Promise<any> {
+  async evaluate(fn: unknown, arg?: unknown): Promise<any> {
     const source = String(fn);
     if (source.includes("innerText")) return this.visibleText;
-    if (source.includes("getBoundingClientRect")) return this.hasChallengeElement;
+    if (source.includes("getBoundingClientRect")) {
+      // The element probes pass their selector list as the evaluate argument;
+      // the OTP probe is the one naming the one-time-code autocomplete.
+      return String(arg).includes("one-time-code")
+        ? this.hasOtpElement
+        : this.hasChallengeElement;
+    }
     return [{ key: "glintsEmployersApp", value: "{}" }];
+  }
+}
+
+/** Captures uploadDebugArtifact calls in place of the real SupabaseSink. */
+class FakeDebugSink {
+  uploads: { key: string; bytes: Buffer; contentType: string }[] = [];
+  uploadError: Error | null = null;
+
+  async uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string> {
+    if (this.uploadError) throw this.uploadError;
+    this.uploads.push({ key, bytes, contentType });
+    return `scrape-artifacts/${key}`;
   }
 }
 
@@ -84,6 +112,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/dashboard",
         visibleText: "Dashboard",
         hasChallengeElement: false,
+        hasOtpElement: false,
       }),
     ).toBe("success");
   });
@@ -94,6 +123,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Email atau password salah",
         hasChallengeElement: false,
+        hasOtpElement: false,
       }),
     ).toBe("invalid_credentials");
   });
@@ -104,6 +134,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Invalid credentials, please try again",
         hasChallengeElement: false,
+        hasOtpElement: false,
       }),
     ).toBe("invalid_credentials");
   });
@@ -114,6 +145,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Email atau password salah. Please complete the captcha",
         hasChallengeElement: true,
+        hasOtpElement: false,
       }),
     ).toBe("invalid_credentials");
   });
@@ -124,18 +156,83 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Please complete the reCAPTCHA to continue",
         hasChallengeElement: true,
+        hasOtpElement: false,
       }),
     ).toBe("challenge");
   });
 
-  it("reports a challenge when a verification code is requested", () => {
+  it("reports otp_required when a code input renders on the login page", () => {
     expect(
       classifyGlintsLoginResult({
         url: "https://employers.glints.id/login",
         visibleText: "Masukkan kode verifikasi yang dikirim ke email Anda",
-        hasChallengeElement: true,
+        hasChallengeElement: false,
+        hasOtpElement: true,
       }),
-    ).toBe("challenge");
+    ).toBe("otp_required");
+  });
+
+  it("prefers otp_required over challenge when both shapes render", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Enter the verification code sent to your email",
+        hasChallengeElement: true,
+        hasOtpElement: true,
+      }),
+    ).toBe("otp_required");
+  });
+
+  it("reports otp_required when the submit navigates to a verification route", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/verify-otp?next=%2Fdashboard",
+        visibleText: "",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("otp_required");
+  });
+
+  it("reports otp_required when an off-login page shows a code input with OTP wording", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/session/new-device",
+        visibleText: "We sent a one-time password to your email",
+        hasChallengeElement: false,
+        hasOtpElement: true,
+      }),
+    ).toBe("otp_required");
+  });
+
+  it("recognizes n-digit-code wording variants when a code input renders", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Enter the 6-digit code we sent to you",
+        hasChallengeElement: false,
+        hasOtpElement: true,
+      }),
+    ).toBe("otp_required");
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Masukkan kode yang dikirim ke perangkat Anda",
+        hasChallengeElement: false,
+        hasOtpElement: true,
+      }),
+    ).toBe("otp_required");
+  });
+
+  it("never classifies otp_required from bare OTP wording without a code input", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "You may be asked for a verification code",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("pending");
   });
 
   it("never classifies challenge from a bare keyword without a challenge element", () => {
@@ -144,6 +241,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "This site is protected by reCAPTCHA and Cloudflare",
         hasChallengeElement: false,
+        hasOtpElement: false,
       }),
     ).toBe("pending");
   });
@@ -154,6 +252,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Alamat Email Password Masuk",
         hasChallengeElement: true,
+        hasOtpElement: false,
       }),
     ).toBe("pending");
   });
@@ -164,6 +263,7 @@ describe("classifyGlintsLoginResult", () => {
         url: "https://employers.glints.id/login",
         visibleText: "Alamat Email Password Masuk",
         hasChallengeElement: false,
+        hasOtpElement: false,
       }),
     ).toBe("pending");
   });
@@ -219,7 +319,7 @@ describe("Glints.ensureAuthenticated", () => {
     const interstitialPage = () => {
       const page = new FakeLoginPage();
       page.onSubmit = () => {
-        page.currentUrl = "https://employers.glints.id/verify-otp";
+        page.currentUrl = "https://employers.glints.id/onboarding";
       };
       return page;
     };
@@ -287,6 +387,83 @@ describe("Glints.ensureAuthenticated", () => {
     const next = new FakeLoginPage();
     await expect(scraper.ensureAuthenticated(next, fakeContext)).rejects.toThrow(/skipped/);
     expect(Object.keys(next.fills)).toHaveLength(0);
+  });
+
+  it("raises GLINTS_LOGIN_OTP_REQUIRED and parks further attempts when an OTP form renders", async () => {
+    const page = new FakeLoginPage();
+    page.onSubmit = () => {
+      page.visibleText = "Masukkan kode verifikasi yang dikirim ke email Anda";
+      page.hasOtpElement = true;
+    };
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_OTP_REQUIRED/,
+    );
+    expect(glintsSessionStore.get()).toBeNull();
+
+    // A single OTP page consumes the whole in-process budget: another attempt
+    // would only trigger another verification email, never a login.
+    const next = new FakeLoginPage();
+    await expect(scraper.ensureAuthenticated(next, fakeContext)).rejects.toThrow(/skipped/);
+    expect(Object.keys(next.fills)).toHaveLength(0);
+  });
+
+  it("raises GLINTS_LOGIN_OTP_REQUIRED when the submit navigates to a verification route", async () => {
+    const page = new FakeLoginPage();
+    page.onSubmit = () => {
+      page.currentUrl = "https://employers.glints.id/verify-otp";
+    };
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_OTP_REQUIRED/,
+    );
+    expect(glintsSessionStore.get()).toBeNull();
+  });
+
+  it("uploads screenshot, html and meta debug artifacts on an unclassified outcome", async () => {
+    const sink = new FakeDebugSink();
+    (scraper as any).sink = sink;
+    const page = new FakeLoginPage();
+    page.pageHtml = `<html><body>Something new: ${PASSWORD}</body></html>`;
+    // No onSubmit mutation: the page never leaves /login and never shows a
+    // banner, the exact shape production hit.
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED/,
+    );
+
+    const keys = sink.uploads.map((u) => u.key);
+    expect(keys).toHaveLength(3);
+    for (const key of keys) {
+      expect(key).toMatch(/^glints\/login-debug\/[0-9TZ-]+\/(page\.png|page\.html|meta\.json)$/);
+    }
+    const html = sink.uploads.find((u) => u.key.endsWith("page.html"))!;
+    expect(html.bytes.toString("utf8")).not.toContain(PASSWORD);
+  });
+
+  it("uploads debug artifacts when the submit lands on an unrecognized interstitial", async () => {
+    const sink = new FakeDebugSink();
+    (scraper as any).sink = sink;
+    const page = new FakeLoginPage();
+    page.onSubmit = () => {
+      page.currentUrl = "https://employers.glints.id/onboarding";
+    };
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED/,
+    );
+    expect(sink.uploads.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the original failure when the debug upload itself fails", async () => {
+    const sink = new FakeDebugSink();
+    sink.uploadError = new Error("storage is down");
+    (scraper as any).sink = sink;
+    const page = new FakeLoginPage();
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED: login submit produced no dashboard/,
+    );
   });
 
   it("masks the credentials in unexpected login-flow errors", async () => {

@@ -1,6 +1,8 @@
 import {
   InMemorySessionStore,
   LoginAttemptGuard,
+  LoginDebugUploader,
+  captureLoginDebugArtifacts,
   loadPortalCredentials,
   maskSecrets,
 } from "../src/portalLogin";
@@ -112,6 +114,148 @@ describe("LoginAttemptGuard", () => {
     // The challenge did not eat into the credential-failure budget.
     guard.recordFailure("invalid_credentials");
     expect(guard.canAttempt().allowed).toBe(true);
+  });
+
+  it("parks every further attempt immediately after an OTP requirement", () => {
+    const nowRef = { t: 0 };
+    const guard = makeGuard(nowRef);
+
+    guard.recordFailure("otp_required");
+    // A single OTP page exhausts the whole in-process budget: retrying would
+    // only send more verification emails, never a login.
+    expect(guard.canAttempt().allowed).toBe(false);
+
+    nowRef.t = 6 * HOUR - 1;
+    expect(guard.canAttempt().allowed).toBe(false);
+
+    // After the long backoff a single fresh attempt is allowed again.
+    nowRef.t = 6 * HOUR + 1;
+    expect(guard.canAttempt().allowed).toBe(true);
+  });
+});
+
+describe("captureLoginDebugArtifacts", () => {
+  const PASSWORD = "p@ss(word)!";
+
+  class FakeUploader implements LoginDebugUploader {
+    uploads: { key: string; bytes: Buffer; contentType: string }[] = [];
+    failOn: string | null = null;
+
+    async uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string> {
+      if (this.failOn && key.endsWith(this.failOn)) {
+        throw new Error(`upload of ${key} refused`);
+      }
+      this.uploads.push({ key, bytes, contentType });
+      return `scrape-artifacts/${key}`;
+    }
+  }
+
+  function makePage() {
+    return {
+      url: () => `https://employers.glints.id/login?next=%2Fdashboard&pw=${PASSWORD}`,
+      screenshot: async () => Buffer.from("png-bytes"),
+      content: async () => `<html><body><input value="${PASSWORD}">Masuk</body></html>`,
+    };
+  }
+
+  it("uploads screenshot, html and meta under <portal>/login-debug/<timestamp>/ and logs the paths", async () => {
+    const uploader = new FakeUploader();
+    const logs: string[] = [];
+
+    const capture = await captureLoginDebugArtifacts({
+      page: makePage(),
+      portal: "glints",
+      reason: "unclassified login outcome",
+      getUploader: () => uploader,
+      secrets: [PASSWORD],
+      log: (m) => logs.push(m),
+      now: () => new Date("2026-08-20T09:30:45.123Z"),
+    });
+
+    expect(capture).not.toBeNull();
+    const keys = uploader.uploads.map((u) => u.key);
+    expect(keys).toHaveLength(3);
+    const prefix = "glints/login-debug/2026-08-20T09-30-45-123Z/";
+    expect(keys).toEqual([`${prefix}page.png`, `${prefix}page.html`, `${prefix}meta.json`]);
+
+    expect(capture!.screenshotPath).toBe(`scrape-artifacts/${prefix}page.png`);
+    expect(capture!.htmlPath).toBe(`scrape-artifacts/${prefix}page.html`);
+    expect(capture!.metaPath).toBe(`scrape-artifacts/${prefix}meta.json`);
+
+    // The one loud log line names every uploaded path and the final URL.
+    const line = logs.join("\n");
+    expect(line).toContain(`${prefix}page.png`);
+    expect(line).toContain(`${prefix}page.html`);
+    expect(line).toContain(`${prefix}meta.json`);
+    expect(line).toContain("/login");
+    expect(line).not.toContain(PASSWORD);
+  });
+
+  it("masks the password in the html, the meta and the reported final URL", async () => {
+    const uploader = new FakeUploader();
+
+    const capture = await captureLoginDebugArtifacts({
+      page: makePage(),
+      portal: "glints",
+      reason: "unclassified login outcome",
+      getUploader: () => uploader,
+      secrets: [PASSWORD],
+      log: () => {},
+      now: () => new Date("2026-08-20T09:30:45.123Z"),
+    });
+
+    const html = uploader.uploads.find((u) => u.key.endsWith("page.html"))!;
+    expect(html.bytes.toString("utf8")).not.toContain(PASSWORD);
+    expect(html.bytes.toString("utf8")).toContain("***");
+    expect(html.contentType).toBe("text/html");
+
+    const meta = uploader.uploads.find((u) => u.key.endsWith("meta.json"))!;
+    const parsed = JSON.parse(meta.bytes.toString("utf8"));
+    expect(parsed.portal).toBe("glints");
+    expect(parsed.reason).toBe("unclassified login outcome");
+    expect(parsed.final_url).toContain("/login");
+    expect(meta.bytes.toString("utf8")).not.toContain(PASSWORD);
+
+    expect(capture!.finalUrl).not.toContain(PASSWORD);
+    expect(capture!.finalUrl).toContain("/login");
+  });
+
+  it("returns null and warns when the uploader cannot be constructed", async () => {
+    const warns: string[] = [];
+
+    const capture = await captureLoginDebugArtifacts({
+      page: makePage(),
+      portal: "glints",
+      reason: "unclassified login outcome",
+      getUploader: () => {
+        throw new Error("SupabaseSink: SCORING_SUPABASE_URL is required");
+      },
+      secrets: [PASSWORD],
+      log: () => {},
+      warn: (m) => warns.push(m),
+    });
+
+    expect(capture).toBeNull();
+    expect(warns.join("\n")).toContain("SCORING_SUPABASE_URL");
+  });
+
+  it("still uploads the html when the screenshot upload fails", async () => {
+    const uploader = new FakeUploader();
+    uploader.failOn = "page.png";
+
+    const capture = await captureLoginDebugArtifacts({
+      page: makePage(),
+      portal: "glints",
+      reason: "unclassified login outcome",
+      getUploader: () => uploader,
+      secrets: [PASSWORD],
+      log: () => {},
+      warn: () => {},
+    });
+
+    expect(capture).not.toBeNull();
+    expect(capture!.screenshotPath).toBeNull();
+    expect(capture!.htmlPath).toMatch(/page\.html$/);
   });
 });
 

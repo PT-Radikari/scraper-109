@@ -19,7 +19,8 @@ const path_1 = __importDefault(require("path"));
 const axios_1 = __importDefault(require("axios"));
 const form_data_1 = __importDefault(require("form-data"));
 const browserRegistry_1 = require("./browserRegistry");
-const sqlite3_1 = __importDefault(require("sqlite3"));
+const supabaseSink_1 = require("./supabaseSink");
+const portalSink_1 = require("./portalSink");
 class Seek {
     /**
      * Represents a Seek object.
@@ -38,6 +39,8 @@ class Seek {
         this.DB_PATH = "";
         this.TIMEOUT = 60000;
         this.SLOWMO = 1000;
+        this.COLLECTED = 0;
+        this.sink = null;
         this.HEADLESS = config.headless;
         this.LIMIT = config.limit;
         this.COOKIES = config.cookies;
@@ -48,7 +51,6 @@ class Seek {
         this.DB_PATH = path_1.default.join(__dirname, config.db_path);
         this.TIMEOUT = (_c = config.timeout) !== null && _c !== void 0 ? _c : this.TIMEOUT;
         this.SLOWMO = (_d = config.slowmo) !== null && _d !== void 0 ? _d : this.SLOWMO;
-        this.DB = new sqlite3_1.default.Database(this.DB_PATH);
         console.info("CONFIG SEEK LOADED");
     }
     getBrowserFallbackExecutablePath() {
@@ -91,8 +93,11 @@ class Seek {
                 fs_1.default.mkdirSync(path_1.default.dirname(this.DB_PATH), { recursive: true });
                 fs_1.default.writeFileSync(this.DB_PATH, "");
             }
+            // sqlite3 is required lazily so the sink path never loads the native
+            // binding (see AGENTS.md sharp edges).
+            const sqlite = require("sqlite3");
             return new Promise((resolve, reject) => {
-                this.DB = new sqlite3_1.default.Database(this.DB_PATH, (err) => {
+                this.DB = new sqlite.Database(this.DB_PATH, (err) => {
                     if (err) {
                         reject(err);
                     }
@@ -101,6 +106,61 @@ class Seek {
                     }
                 });
             });
+        });
+    }
+    ensureLegacyDatabase() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.DB)
+                return;
+            yield this.createDatabaseConnection();
+            yield this.createRequiredTables();
+        });
+    }
+    /**
+     * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+     * Construction is lazy so importing Seek for a selector test does not
+     * require sink credentials.
+     */
+    getSink() {
+        var _a;
+        (_a = this.sink) !== null && _a !== void 0 ? _a : (this.sink = new supabaseSink_1.SupabaseSink());
+        return this.sink;
+    }
+    /** Number of vacancy pages discovered by this run (seek scrapes one shared candidates page). */
+    getVacanciesSeen() {
+        return 0;
+    }
+    /** Number of applicants successfully persisted by this run. */
+    getCollectedCount() {
+        return this.COLLECTED;
+    }
+    /**
+     * Writes one applicant straight into the scoring Supabase via the shared
+     * direct-sink slice (see src/portalSink.ts). page_url is candidate-specific
+     * only when the row carried its own link; passing the shared candidates-page
+     * URL as vacancy_url keeps the identity ladder from keying everyone to it.
+     * @param param - The applicant data to be persisted.
+     * @param vacancyUrl - The candidates page URL shared by every row.
+     */
+    sendToSink(param, vacancyUrl) {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield (0, portalSink_1.sendApplicantToSink)(this.getSink(), {
+                portal: param.portal,
+                applied_for: param.applied_for,
+                applied_date: param.applied_date,
+                url_profile: param.page_url,
+                vacancy_url: vacancyUrl,
+                name: param.name,
+                email: param.email,
+                phone: param.phone,
+                location: param.location,
+                work_experience: param.work_experience,
+                education: param.education,
+                skill: param.skill,
+                cv_path: param.cv,
+                raw: { type: param.type, salary_expectation: param.salary_expectation },
+            });
+            this.COLLECTED++;
         });
     }
     createApplicantsTable() {
@@ -146,7 +206,9 @@ class Seek {
         });
     }
     /**
-     * Sends a request with the provided applicant data.
+     * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
+     * insert. Kept untouched but bypassed: seek now lands applicants directly
+     * in the scoring Supabase via sendToSink().
      * @param param - The applicant data.
      * @returns A Promise that resolves when the request is sent successfully.
      */
@@ -183,6 +245,7 @@ class Seek {
                 console.info("Error sending param", param);
                 console.error("Error sending request with response:", (_b = (_a = error.response) === null || _a === void 0 ? void 0 : _a.data) !== null && _b !== void 0 ? _b : error.message);
             }
+            yield this.ensureLegacyDatabase();
             yield this.insertApplicant(Object.assign(Object.assign({}, param), { email: databaseKey }));
         });
     }
@@ -234,8 +297,9 @@ class Seek {
     Scrape() {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
-            yield this.createDatabaseConnection();
-            yield this.createRequiredTables();
+            // Fail fast at cycle start when the sink env vars are missing; the local
+            // SQLite path is bypassed entirely (mirrors glints).
+            this.getSink();
             const browser = (0, browserRegistry_1.trackBrowser)(yield this.launchBrowser());
             const context = yield browser.newContext({ viewport: { width: 1440, height: 900 } });
             context.setDefaultTimeout(this.TIMEOUT);
@@ -267,8 +331,7 @@ class Seek {
                 if (yield this.isLoginPage(page)) {
                     const loginSucceeded = yield this.loginWithCredentials(page);
                     if (!loginSucceeded) {
-                        console.error("[SEEK] Authentication is expired or missing. Refresh cookies/local_storage or valid email/password in seek.json, then rerun.");
-                        return;
+                        throw new Error("[SEEK] Session expired: candidates page redirected to login — refresh cookies/local_storage or credentials in seek.json");
                     }
                 }
                 yield this.checkLazyLoadedElement(page, "body");
@@ -276,8 +339,7 @@ class Seek {
                 if (yield this.isLoginPage(page)) {
                     const loginSucceeded = yield this.loginWithCredentials(page);
                     if (!loginSucceeded) {
-                        console.error("[SEEK] Authentication expired after redirect settled. Refresh cookies/local_storage or valid email/password in seek.json, then rerun.");
-                        return;
+                        throw new Error("[SEEK] Session expired after redirect settled — refresh cookies/local_storage or credentials in seek.json");
                     }
                 }
                 const applicants = yield this.extractVisibleApplicants(page);
@@ -291,12 +353,9 @@ class Seek {
                     if (!key) {
                         continue;
                     }
-                    const applicantInDatabase = yield this.getApplicantByEmail(key);
-                    if (applicantInDatabase !== undefined) {
-                        console.info(`[SEEK] Applicant already exists in DB: ${key}. Skipping.`);
-                        continue;
-                    }
-                    yield this.sendRequest(applicant, key);
+                    // No local-DB dedupe on the sink path: the scoring Supabase's
+                    // write-once upserts make re-scrapes idempotent.
+                    yield this.sendToSink(applicant, page.url());
                 }
             }
             finally {
