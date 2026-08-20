@@ -3,6 +3,7 @@
     "base_url": "https://employer.kitalulus.com",
     "email": "",
     "password": "",
+    "cookies": [],
     "api_destination": "http://localhost:3000/upload",
     "limit": 2,
     "timeout": 30000,

@@ -178,16 +178,23 @@ Runs `scrape-all.sh`, which launches all scrapers sequentially in a single shell
 
 Prefix any scraper command with `xvfb:` to wrap it in `xvfb-run -a`, which provides a virtual display. Use these when running on a server without a physical display.
 
+Every sink-routed portal ships one container with a continuous loop as its
+entrypoint (`xvfb:<portal>`) plus a `:once` variant for a single run:
+
+| Continuous entrypoint (production) | Single run | Source |
+|---|---|---|
+| `npm run xvfb:glints` | `npm run xvfb:glints:once` | Glints |
+| `npm run xvfb:jooble` | `npm run xvfb:jooble:once` | Jooble |
+| `npm run xvfb:seek` | `npm run xvfb:seek:once` | Seek |
+| `npm run xvfb:pintarnya` | `npm run xvfb:pintarnya:once` | Pintarnya |
+| `npm run xvfb:kitalulus` | `npm run xvfb:kitalulus:once` | Kitalulus (v1, the live variant) |
+
+Kitalulus v2 keeps its staged one-shot commands:
+
 ```
-npm run xvfb:kitalulus
 npm run xvfb:kitalulus-v2-vacancies
 npm run xvfb:kitalulus-v2-applicants
 npm run xvfb:kitalulus-v2-process-applicants
-npm run xvfb:jooble
-npm run xvfb:seek
-npm run xvfb:pintarnya
-npm run xvfb:glints        # continuous newest-first loop (production entrypoint)
-npm run xvfb:glints:once   # single Glints run, exits when done
 npm run xvfb          # generic, no source selected
 ```
 
@@ -205,11 +212,11 @@ Then run using the compiled output in `build/`:
 
 | Command | Source |
 |---|---|
-| `npm run start:kitalulus` | Kitalulus |
-| `npm run start:jooble` | Jooble |
-| `npm run start:seek` | Seek |
-| `npm run start:pintarnya` | Pintarnya |
-| `npm run start:glints` | Glints |
+| `npm run start:kitalulus` | Kitalulus (single run; `start:kitalulus:continuous` for the loop) |
+| `npm run start:jooble` | Jooble (single run; `start:jooble:continuous` for the loop) |
+| `npm run start:seek` | Seek (single run; `start:seek:continuous` for the loop) |
+| `npm run start:pintarnya` | Pintarnya (single run; `start:pintarnya:continuous` for the loop) |
+| `npm run start:glints` | Glints (single run; `start:glints:continuous` for the loop) |
 | `npm run start` | Generic |
 
 All `start:*` commands automatically use `xvfb-run` for headless compatibility.
@@ -228,10 +235,11 @@ Runs the Jest test suite.
 
 Since the Supabase sink feature, scraped candidates are written straight into
 the scoring Supabase (`src/supabaseSink.ts`) instead of hopping through the
-legacy `api_destination` HTTP endpoint. The glints scraper is the first portal
-wired to it; the other 5 portals (jooble/seek/kitalulus/kitalulus-v2/pintarnya)
-still use `sendRequest` + `api_destination`, which is kept and marked
-deprecated until a follow-up migrates them.
+legacy `api_destination` HTTP endpoint. Glints, jooble, seek, pintarnya and
+kitalulus (v1) are all wired to it through the shared slice in
+`src/portalSink.ts`; only kitalulus-v2 still uses `sendRequest` +
+`api_destination`, and each portal's legacy `sendRequest` path is kept but
+bypassed and marked deprecated.
 
 The sink reads its configuration from the environment (via dotenv). Copy
 `.env.sample` to `.env` and fill in:
@@ -248,15 +256,20 @@ migration runbook (Atlas migration + `storage.sql` companion). The same Atlas
 project mirrors the scoring service's `talent_scraping` schema on self-hosted
 Supabase.
 
-Run Glints continuously, newest candidates first, with an env-driven pause
-between idempotent cycles:
+Run any sink-routed portal continuously, newest candidates first, with an
+env-driven pause between idempotent cycles (`SCRAPER_INTERVAL_MS`, default
+5 minutes). One Dokploy container per portal; each cycle writes one row to
+`scrape.scrape_runs`, and an expired portal session fails that cycle with one
+loud `[PORTAL] Session expired ...` log line while the loop keeps cycling:
 
 ```bash
-npm run dev:glints:continuous
+npm run dev:glints:continuous     # also: dev:jooble:continuous, dev:seek:continuous,
+                                  #       dev:pintarnya:continuous, dev:kitalulus:continuous
 # ts-node under xvfb (the Dokploy container entrypoint):
-npm run xvfb:glints
-# Production container supervision:
+npm run xvfb:glints               # also: xvfb:jooble, xvfb:seek, xvfb:pintarnya, xvfb:kitalulus
+# Production container supervision (one container per portal):
 docker run -d --name scraper-glints --restart always --env-file .env playwright-runner:latest npm run start:glints:continuous
+docker run -d --name scraper-jooble --restart always --env-file .env playwright-runner:latest npm run start:jooble:continuous
 ```
 
 `SCRAPER_INTERVAL_MS` defaults to five minutes. Each cycle also uses the

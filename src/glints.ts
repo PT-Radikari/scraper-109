@@ -40,7 +40,7 @@ export interface GlintsConfigJson {
   cookies: Cookie[];
   local_storage: LocalStorageItem[];
   limit: number;
-  /** @deprecated The other 5 portals still POST here. glints now writes to the scoring Supabase via SupabaseSink. */
+  /** @deprecated Only kitalulus-v2 still POSTs here. The sink-routed portals write to the scoring Supabase via SupabaseSink. */
   api_destination: string;
   timeout: number;
   slowmo: number;
@@ -244,10 +244,10 @@ export class Glints {
   }
 
   /**
-   * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so the
-   * other 5 portal scrapers (jooble/seek/kitalulus/kitalulus-v2/pintarnya) can
-   * keep using it. glints now lands candidates directly in the scoring
-   * Supabase via sendToSink().
+   * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so
+   * kitalulus-v2 (the last non-sink portal) can keep using the pattern.
+   * glints now lands candidates directly in the scoring Supabase via
+   * sendToSink().
    * @param param - The applicant data to be sent.
    * @returns A Promise that resolves when the request is successfully sent.
    */

@@ -4,7 +4,9 @@ import path from "path";
 import axios from "axios";
 import FormData from "form-data";
 import { trackBrowser } from "./browserRegistry";
-import sqlite3 from "sqlite3";
+import type sqlite3 from "sqlite3";
+import { SupabaseSink } from "./supabaseSink";
+import { sendApplicantToSink } from "./portalSink";
 
 /**
  * Represents a cookie.
@@ -38,6 +40,7 @@ export interface SeekConfigJson {
   email?: string;
   password?: string;
   limit: number;
+  /** @deprecated seek now writes to the scoring Supabase via SupabaseSink. */
   api_destination: string;
   db_path: string;
   timeout?: number;
@@ -102,9 +105,11 @@ export class Seek {
   private PASSWORD: string = "";
   private APIDESTINATION: string = "";
   private DB_PATH: string = "";
-  private DB!: sqlite3.Database;
+  private DB?: sqlite3.Database;
   private TIMEOUT: number = 60000;
   private SLOWMO: number = 1000;
+  private COLLECTED: number = 0;
+  private sink: SupabaseSink | null = null;
 
   /**
    * Represents a Seek object.
@@ -122,7 +127,6 @@ export class Seek {
     this.DB_PATH = path.join(__dirname, config.db_path);
     this.TIMEOUT = config.timeout ?? this.TIMEOUT;
     this.SLOWMO = config.slowmo ?? this.SLOWMO;
-    this.DB = new sqlite3.Database(this.DB_PATH);
     console.info("CONFIG SEEK LOADED");
   }
 
@@ -171,24 +175,81 @@ export class Seek {
       fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
       fs.writeFileSync(this.DB_PATH, "");
     }
+    // sqlite3 is required lazily so the sink path never loads the native
+    // binding (see AGENTS.md sharp edges).
+    const sqlite = require("sqlite3") as typeof import("sqlite3");
     return new Promise((resolve, reject) => {
-      this.DB = new sqlite3.Database(this.DB_PATH, (err) => {
-        if (err) { reject(err); } else { resolve(this.DB); }
+      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
+        if (err) { reject(err); } else { resolve(this.DB!); }
       });
     });
+  }
+
+  private async ensureLegacyDatabase(): Promise<void> {
+    if (this.DB) return;
+    await this.createDatabaseConnection();
+    await this.createRequiredTables();
+  }
+
+  /**
+   * Builds the scoring Supabase sink from the SCORING_SUPABASE_* env vars.
+   * Construction is lazy so importing Seek for a selector test does not
+   * require sink credentials.
+   */
+  private getSink(): SupabaseSink {
+    this.sink ??= new SupabaseSink();
+    return this.sink;
+  }
+
+  /** Number of vacancy pages discovered by this run (seek scrapes one shared candidates page). */
+  getVacanciesSeen(): number {
+    return 0;
+  }
+
+  /** Number of applicants successfully persisted by this run. */
+  getCollectedCount(): number {
+    return this.COLLECTED;
+  }
+
+  /**
+   * Writes one applicant straight into the scoring Supabase via the shared
+   * direct-sink slice (see src/portalSink.ts). page_url is candidate-specific
+   * only when the row carried its own link; passing the shared candidates-page
+   * URL as vacancy_url keeps the identity ladder from keying everyone to it.
+   * @param param - The applicant data to be persisted.
+   * @param vacancyUrl - The candidates page URL shared by every row.
+   */
+  async sendToSink(param: Applicant, vacancyUrl: string): Promise<void> {
+    await sendApplicantToSink(this.getSink(), {
+      portal: param.portal,
+      applied_for: param.applied_for,
+      applied_date: param.applied_date,
+      url_profile: param.page_url,
+      vacancy_url: vacancyUrl,
+      name: param.name,
+      email: param.email,
+      phone: param.phone,
+      location: param.location,
+      work_experience: param.work_experience,
+      education: param.education,
+      skill: param.skill,
+      cv_path: param.cv,
+      raw: { type: param.type, salary_expectation: param.salary_expectation },
+    });
+    this.COLLECTED++;
   }
 
   async createApplicantsTable(): Promise<void> {
     const query = `CREATE TABLE IF NOT EXISTS applicants (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, data TEXT NOT NULL)`;
     return new Promise((resolve, reject) => {
-      this.DB.run(query, (err) => { err ? reject(err) : resolve(); });
+      this.DB!.run(query, (err) => { err ? reject(err) : resolve(); });
     });
   }
 
   async isTableExist(tableName: string): Promise<boolean> {
     const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
     return new Promise((resolve, reject) => {
-      this.DB.get(query, (err, row) => { err ? reject(err) : resolve(row !== undefined); });
+      this.DB!.get(query, (err, row) => { err ? reject(err) : resolve(row !== undefined); });
     });
   }
 
@@ -201,7 +262,7 @@ export class Seek {
     const safeEmail = email.replace(/'/g, "''");
     const query = `SELECT * FROM applicants WHERE email = '${safeEmail}'`;
     return new Promise((resolve, reject) => {
-      this.DB.get(query, (err, row) => { err ? reject(err) : resolve(row); });
+      this.DB!.get(query, (err, row) => { err ? reject(err) : resolve(row); });
     });
   }
 
@@ -210,12 +271,14 @@ export class Seek {
     const json = JSON.stringify(data).replace(/'/g, "''");
     const query = `INSERT INTO applicants (email, data) VALUES ('${safeEmail}', '${json}')`;
     return new Promise((resolve, reject) => {
-      this.DB.run(query, (err) => { err ? reject(err) : resolve(); });
+      this.DB!.run(query, (err) => { err ? reject(err) : resolve(); });
     });
   }
 
   /**
-   * Sends a request with the provided applicant data.
+   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
+   * insert. Kept untouched but bypassed: seek now lands applicants directly
+   * in the scoring Supabase via sendToSink().
    * @param param - The applicant data.
    * @returns A Promise that resolves when the request is sent successfully.
    */
@@ -252,6 +315,7 @@ export class Seek {
       console.error("Error sending request with response:", (error as any).response?.data ?? (error as any).message);
     }
 
+    await this.ensureLegacyDatabase();
     await this.insertApplicant({ ...param, email: databaseKey });
   }
 
@@ -304,8 +368,9 @@ export class Seek {
    * @returns A Promise that resolves when the scraping is complete.
    */
   async Scrape(): Promise<void> {
-    await this.createDatabaseConnection();
-    await this.createRequiredTables();
+    // Fail fast at cycle start when the sink env vars are missing; the local
+    // SQLite path is bypassed entirely (mirrors glints).
+    this.getSink();
 
     const browser = trackBrowser(await this.launchBrowser());
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -342,8 +407,7 @@ export class Seek {
       if (await this.isLoginPage(page)) {
         const loginSucceeded = await this.loginWithCredentials(page);
         if (!loginSucceeded) {
-          console.error("[SEEK] Authentication is expired or missing. Refresh cookies/local_storage or valid email/password in seek.json, then rerun.");
-          return;
+          throw new Error("[SEEK] Session expired: candidates page redirected to login — refresh cookies/local_storage or credentials in seek.json");
         }
       }
 
@@ -352,8 +416,7 @@ export class Seek {
       if (await this.isLoginPage(page)) {
         const loginSucceeded = await this.loginWithCredentials(page);
         if (!loginSucceeded) {
-          console.error("[SEEK] Authentication expired after redirect settled. Refresh cookies/local_storage or valid email/password in seek.json, then rerun.");
-          return;
+          throw new Error("[SEEK] Session expired after redirect settled — refresh cookies/local_storage or credentials in seek.json");
         }
       }
 
@@ -370,13 +433,9 @@ export class Seek {
           continue;
         }
 
-        const applicantInDatabase = await this.getApplicantByEmail(key);
-        if (applicantInDatabase !== undefined) {
-          console.info(`[SEEK] Applicant already exists in DB: ${key}. Skipping.`);
-          continue;
-        }
-
-        await this.sendRequest(applicant, key);
+        // No local-DB dedupe on the sink path: the scoring Supabase's
+        // write-once upserts make re-scrapes idempotent.
+        await this.sendToSink(applicant, page.url());
       }
     } finally {
       await browser.close();
