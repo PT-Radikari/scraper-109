@@ -585,7 +585,7 @@ export class Pintarnya {
       await this.waitForEmployerLandingPage(page);
     } catch (error) {
       throw new Error(
-        `[PINTARNYA] Session expired: login did not reach the employer page (stuck on ${page.url()}) — refresh credentials/session in pintarnya.json`,
+        `[PINTARNYA] Session expired: login did not reach the employer page (stuck on ${page.url()}) — refresh credentials/session in pintarnya.json — caused by: ${error instanceof Error ? error.message : error}`,
       );
     }
     await page.waitForLoadState("load");

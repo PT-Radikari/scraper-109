@@ -793,6 +793,7 @@ export class KitaLulus {
 
           let detailHandle: ApplicantDetailHandle | null = null;
           let photoTempPath = "";
+          let cvTempPath = "";
           try {
             detailHandle = await this.openApplicantDetailPage(page, rowIndex);
             console.info("[CANDIDATE] Detail page opened.");
@@ -800,6 +801,7 @@ export class KitaLulus {
             await this.dismissMarketingOverlay(detailHandle.page);
             const applicant = await this.scrapeApplicantDetails("applicant", detailHandle.page, appliedFor);
             photoTempPath = applicant.photo;
+            cvTempPath = applicant.cv;
 
             if (applicant.whatapps.contact_number === "" && applicant.email === "") {
               console.info("[SKIP] No phone number and no email. Skipping send.");
@@ -816,8 +818,8 @@ export class KitaLulus {
             console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
             if (error instanceof SupabaseSinkError) throw error;
           } finally {
-            // Keep CV files on disk so the viewer can link directly to the saved document.
             await this.RemoveTempFile(photoTempPath);
+            await this.RemoveTempFile(cvTempPath);
             if (detailHandle) {
               await detailHandle.cleanup();
             }
