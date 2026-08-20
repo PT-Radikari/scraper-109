@@ -154,6 +154,22 @@ export function resetGlintsLoginState(): void {
   glintsSessionStore.clear();
 }
 
+/**
+ * Normalizes a company display name for comparison: trims, collapses inner
+ * whitespace, and lowercases. The switcher renders names like "PT RADIKARI"
+ * whose casing and padding must not defeat the target_company match.
+ */
+export function normalizeCompanyName(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * The company switcher's change control. The live dashboard renders it as
+ * "UBAH" (uppercase), older sessions rendered "Ubah", and the dashboard
+ * sometimes serves the English locale, where it reads "Change" — match all.
+ */
+const GLINTS_UBAH_REGEX = /^\s*(ubah|change)\s*$/i;
+
 /** What the login page shows after (or while) a credential submit settles. */
 export type GlintsLoginOutcome =
   | "success"
@@ -275,12 +291,13 @@ export class Glints {
   async waitForCompanyControls(
     page: playwright.Page,
   ): Promise<"target-selected" | "switcher" | "absent"> {
-    const TARGET_REGEX_ESCAPED = escapeRegExp(this.TARGETCOMPANY);
-    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+    const alreadySelected = page.locator('p').filter({ hasText: this.targetCompanyRegExp() });
+    const ubahLocator = page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX });
 
     const pollIntervalMs = 1000;
-    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 15000) / pollIntervalMs));
+    // A cold dashboard can hold the sidebar's company block on "Memuat..." well
+    // past 15s (observed live 2026-08); give it the run's timeout up to 45s.
+    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 45000) / pollIntervalMs));
     for (let i = 0; i < attempts; i++) {
       try {
         if (await alreadySelected.count() > 0) return "target-selected";
@@ -295,14 +312,41 @@ export class Glints {
   }
 
   /**
+   * A whole-string, case- and whitespace-insensitive regex for the configured
+   * target company's display name. Never matches when no target is configured.
+   */
+  private targetCompanyRegExp(): RegExp {
+    const tokens = this.TARGETCOMPANY.trim().split(/\s+/).filter(Boolean).map(escapeRegExp);
+    if (tokens.length === 0) return /(?!)/;
+    return new RegExp(`^\\s*${tokens.join("\\s+")}\\s*$`, "i");
+  }
+
+  /**
+   * Closes any modal sitting over the dashboard (the VIP-expired promo renders
+   * on load and swallows clicks aimed at the sidebar's UBAH switcher).
+   */
+  private async dismissBlockingModal(page: playwright.Page): Promise<void> {
+    const close = page.locator('[data-testid="modal-close-btn"]');
+    try {
+      for (let i = 0; i < 3 && (await close.count()) > 0; i++) {
+        await close.first().click();
+        await page.waitForTimeout(500);
+      }
+    } catch {
+      // The modal can unmount between count() and click(); it is gone either way.
+    }
+  }
+
+  /**
    * Selects the target company from the Glints company switcher dropdown on the dashboard.
-   * Required when the account manages multiple companies — the wrong company will return empty results.
+   * Required when the account manages multiple companies — the wrong company will return
+   * empty results. Matching is against the switcher's *display* strings (trimmed,
+   * case-insensitive); a non-match throws naming every entry seen, never a silent skip.
    */
   async selectTargetCompany(page: playwright.Page): Promise<void> {
     if (!this.TARGETCOMPANY) return;
 
     const TARGET = this.TARGETCOMPANY;
-    const TARGET_REGEX_ESCAPED = escapeRegExp(TARGET);
 
     const controls = await this.waitForCompanyControls(page);
     if (controls === "target-selected") {
@@ -313,30 +357,61 @@ export class Glints {
       return;
     }
     if (controls === "absent") {
-      console.warn(
-        `[GLINTS] target_company "${TARGET}" is configured but no company switcher rendered and the target is not the active company — continuing with the session's current company`,
+      // Name what actually rendered so the log alone can diagnose a redesign,
+      // an interstitial, or a renamed company.
+      let seen: string[] = [];
+      try {
+        seen = (await page.locator('p').allInnerTexts())
+          .map((t: string) => t.trim())
+          .filter(Boolean)
+          .slice(0, 20);
+      } catch {
+        // Diagnostics only — never mask the real failure.
+      }
+      throw new Error(
+        `[GLINTS] target_company "${TARGET}" is configured but the dashboard rendered neither the target as the active company nor the UBAH company switcher — cannot confirm which company this session would scrape; paragraphs seen: ${JSON.stringify(seen)}`,
       );
-      return;
     }
 
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+    // The VIP-expired modal renders over the sidebar and swallows the UBAH click.
+    await this.dismissBlockingModal(page);
+
     console.info(`[GLINTS] Switching company to: ${TARGET}`);
+    await page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX }).first().click();
 
-    // Click the "Ubah" button to open the dropdown
-    await ubahLocator.locator('..').click();
-    await page.waitForTimeout(1000);
-
-    // Try ARIA option role first (react-select exposes these), fall back to div text match
-    const optionByRole = page.getByRole('option', { name: TARGET, exact: true });
-    if (await optionByRole.count() > 0) {
-      await optionByRole.click();
-    } else {
-      await page.locator('div').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) }).last().click();
+    // react-select exposes the menu either as ARIA options or (live dashboard,
+    // 2026-08) as plain divs carrying the select__option class; the menu can
+    // render a beat after the click, so poll briefly before enumerating.
+    let optionLocator = page.getByRole('option');
+    for (let i = 0; i < 5; i++) {
+      await page.waitForTimeout(1000);
+      optionLocator = page.getByRole('option');
+      if ((await optionLocator.count()) > 0) break;
+      optionLocator = page.locator('[class*="select__option"]');
+      if ((await optionLocator.count()) > 0) break;
     }
+    const entries = (await optionLocator.allInnerTexts()).map((t: string) => t.trim());
+    console.info(`[GLINTS] Company switcher entries: ${JSON.stringify(entries)}`);
+    if (entries.length === 0) {
+      throw new Error(
+        `[GLINTS] company switcher dropdown rendered no entries after clicking the UBAH control — likely a render race or UI drift, not a target_company mismatch`,
+      );
+    }
+
+    const wanted = normalizeCompanyName(TARGET);
+    const index = entries.findIndex((entry: string) => normalizeCompanyName(entry) === wanted);
+    if (index === -1) {
+      throw new Error(
+        `[GLINTS] target_company "${TARGET}" matched none of the company switcher entries ${JSON.stringify(entries)} — set target_company to one of those display strings`,
+      );
+    }
+
+    console.info(`[GLINTS] Choosing switcher entry ${index}: "${entries[index]}"`);
+    await optionLocator.nth(index).click();
 
     // Wait for the page to reload with the new company's data
     await page.waitForTimeout(3000);
-    console.info(`[GLINTS] Company switched to: ${TARGET}`);
+    console.info(`[GLINTS] Company switched to: ${entries[index]}`);
   }
 
   /**
@@ -889,7 +964,11 @@ export class Glints {
     }
 
     const context = browser.contexts()[0] || await browser.newContext({
-      viewport: { width: 1440, height: 900 }
+      viewport: { width: 1440, height: 900 },
+      // The dashboard localizes from Accept-Language and Playwright defaults
+      // to en-US; the scraper's text anchors ("Belum Sesuai", "Semua Loker",
+      // gender labels, month names) assume the Indonesian locale.
+      locale: "id-ID",
     });
     // A session refreshed by a credential login earlier in this process beats
     // the committed glints.json export, which is only an optional warm-start.
@@ -1046,16 +1125,50 @@ export class Glints {
         break;
       }
 
-      await page.goto(it.link);
+      // Some job cards now link to manage-candidates with
+      // atsTab=RECOMMENDED_TALENT, which opens the (usually empty) AI
+      // recommendations tab instead of the applicant pipeline — strip it so
+      // the page opens on the default applicants view.
+      const vacancyUrl = new URL(it.link, "https://employers.glints.id");
+      vacancyUrl.searchParams.delete("atsTab");
+      await page.goto(vacancyUrl.toString());
 
-      await page.waitForTimeout(2000);
+      // The candidate table hydrates well after domcontentloaded (the page
+      // shows "Memuat..." for many seconds); poll until either the empty-state
+      // marker or the first applicant row renders before deciding to skip.
+      const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+      const applicantRows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
+      const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+      // The empty-state wrapper can flash while the table hydrates (observed
+      // live: the same vacancy showed it on one run and 8 rows on the next),
+      // so a single sighting is not proof of emptiness — require it to hold
+      // for several consecutive polls with no data rows.
+      let emptyStreak = 0;
+      let confirmedEmpty = false;
+      let rowsSettled = false;
+      for (let i = 0; i < settleAttempts; i++) {
+        await page.waitForTimeout(1000);
+        const emptyCount = await emptyMarker.count();
+        if ((await applicantRows.count()) > 0 && emptyCount === 0) {
+          rowsSettled = true;
+          break;
+        }
+        if (emptyCount > 0) {
+          if (++emptyStreak >= 8) {
+            confirmedEmpty = true;
+            break;
+          }
+        } else {
+          emptyStreak = 0;
+        }
+      }
 
       // Skip job if no candidates in this stage
-      if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
+      if (confirmedEmpty) {
         console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
         continue;
       }
-      if (await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
+      if (!rowsSettled && await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
         const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
         console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
         continue;
@@ -1133,7 +1246,12 @@ export class Glints {
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
 
-        const modalDetailButtonBelumSelesai = await page.getByText('Belum Sesuai', { exact: true });
+        // Scope to the modal: the stage tab bar behind it also reads "Belum
+        // Sesuai" (the modal itself carries data-testid="modal-wrapper").
+        const modalDetailButtonBelumSelesai = await page
+          .getByTestId('modal-wrapper')
+          .getByText('Belum Sesuai', { exact: true })
+          .last();
         await modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
         const modalDetail = await modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
 
@@ -1215,7 +1333,7 @@ export class Glints {
     // Check if the photo element exists in the first table cell
     if (await this.applicantCells(row).nth(1).locator('//div/span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await this.applicantCells(row).nth(1).locator('//div/span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//div/span/img').first().getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
       if (linkPhoto) {
@@ -1226,7 +1344,7 @@ export class Glints {
     // Check if the photo element exists in the first table cell
     if (await this.applicantCells(row).nth(1).locator('//span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await this.applicantCells(row).nth(1).locator('//span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//span/img').first().getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
       if (linkPhoto) {
@@ -1246,7 +1364,10 @@ export class Glints {
    *          If the age element is empty or the input is invalid, it returns "0".
    */
   async extractDateOfBirth(row: any): Promise<string> {
-    const age = (await this.applicantCells(row).nth(2).locator('//div[2]/span').textContent())?.trim() ?? "";
+    // count() guard + .first(): the current row DOM renders several spans (or
+    // none at all) here; a missing age must degrade to "0", not wait/throw.
+    const ageLocator = this.applicantCells(row).nth(2).locator('//div[2]/span').first();
+    const age = (await ageLocator.count()) > 0 ? (await ageLocator.textContent())?.trim() ?? "" : "";
 
     // If the age element is empty, return '0'
     if (age == "") {
@@ -1298,16 +1419,19 @@ export class Glints {
    *          If the gender cannot be determined, it returns an empty string.
    */
   async extractGender(row: any): Promise<string> {
-    const genderText = (await this.applicantCells(row).nth(5).textContent())?.trim() ?? "";
-
-    // Mapping Indonesian gender abbreviations to their corresponding values
+    // Mapping Indonesian gender labels to their corresponding values
     const genderType: Record<string, string> = {
       'Perempuan': 'FEMALE',
       'Laki-laki': 'MALE'
     };
 
-    // Return the mapped gender value or an empty string if the gender cannot be determined
-    return genderType[genderText] || "";
+    // The gender column has moved between dashboard revisions; scan the cells
+    // for the two exact labels instead of pinning an index.
+    const cells = (await this.applicantCells(row).allInnerTexts()).map((t: string) => t.trim());
+    for (const text of cells) {
+      if (genderType[text]) return genderType[text];
+    }
+    return "";
   }
 
   /**
@@ -1318,7 +1442,12 @@ export class Glints {
    *          The location is trimmed of leading and trailing spaces.
    */
   async extractLocation(row: any): Promise<string> {
-    const locationText = (await this.applicantCells(row).nth(2).locator('//div[2]/div').textContent())?.trim() ?? "";
+    // count() guard: this sub-element vanished in the current row DOM; return
+    // "" immediately instead of waiting out the locator timeout per row.
+    const locationLocator = this.applicantCells(row).nth(2).locator('//div[2]/div').first();
+    const locationText = (await locationLocator.count()) > 0
+      ? (await locationLocator.textContent())?.trim() ?? ""
+      : "";
 
     return locationText;
   }
@@ -1351,21 +1480,21 @@ export class Glints {
    *          If the applied date is not found or is invalid, it returns an empty string.
    */
   async extractAppliedDate(row: any): Promise<string> {
-    const appliedDateTimeText = (await this.applicantCells(row).nth(9).textContent())?.trim() ?? "";
-
-    // Check if dateStr is empty
-    if (appliedDateTimeText == "") {
+    // The applied-date column has moved between dashboard revisions (it sat at
+    // cell 9, which is now "Terakhir Aktif"); find the first cell carrying a
+    // calendar date instead of pinning an index.
+    const cells = (await this.applicantCells(row).allInnerTexts()).map((t: string) => t.trim());
+    const match = cells
+      .map((t: string) => t.match(/(?:(\d{1,2})\s+([A-Za-z]{3})|([A-Za-z]{3})\s+(\d{1,2}))\s+(\d{4})/))
+      .find(Boolean);
+    if (!match) {
       return ""
     }
+    const dayOfMonth = match[1] ?? match[4];
+    const monthId = match[2] ?? match[3];
 
-    // Remove the time part from the date string
-    let appliedDateText = appliedDateTimeText.slice(0, -8)
-
-    type MonthMap = {
-      [key: string]: string;
-    };
     // Mapping Indonesian month abbreviations to english month
-    const monthMap: MonthMap = {
+    const monthMap: Record<string, string> = {
       "Jan": "Jan",
       "Feb": "Feb",
       "Mar": "Mar",
@@ -1374,22 +1503,19 @@ export class Glints {
       "Jun": "Jun",
       "Jul": "Jul",
       "Agt": "Aug",
+      "Agu": "Aug",
       "Sep": "Sep",
       "Okt": "Oct",
       "Nov": "Nov",
       "Des": "Dec"
     };
 
-    let appliedDateSplit = appliedDateText.split(" ")
-    appliedDateSplit[0] = monthMap[appliedDateSplit[0]]
-    appliedDateText = appliedDateSplit.join(" ")
-
-    // Create a Date object from the input string
-    const date = new Date(appliedDateText);
+    // Create a Date object from the normalized parts
+    const date = new Date(`${monthMap[monthId] ?? monthId} ${dayOfMonth} ${match[5]}`);
 
     // Ensure the date is valid
     if (isNaN(date.getTime())) {
-      console.error("Invalid date format", appliedDateText);
+      console.error("Invalid date format", match[0]);
       return "0";
     }
 
@@ -1492,7 +1618,13 @@ export class Glints {
     let wa = "";
     if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").count() > 0) {
       await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").hover();
-      wa = await page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent();
+      try {
+        // Short timeout + fallback: the tooltip's inner layout drifts between
+        // dashboard revisions and a missing element must not stall the row.
+        wa = (await page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent({ timeout: 5000 })) ?? "";
+      } catch {
+        wa = "";
+      }
     }
 
 
@@ -1511,7 +1643,11 @@ export class Glints {
     let email = "";
     if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").count() > 0) {
       await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").hover();
-      email = await page.getByText("Email").locator("..").locator('div > p').textContent();
+      try {
+        email = (await page.getByText("Email").locator("..").locator('div > p').textContent({ timeout: 5000 })) ?? "";
+      } catch {
+        email = "";
+      }
     }
 
     return email
@@ -1626,8 +1762,10 @@ export class Glints {
    * @throws Will throw an error if the input dateStr does not match the expected format.
    */
   async convertDateMMDD(text: string): Promise<string> {
-    text = text.trim();
-    if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+    // A period without a "-" (e.g. just "Sekarang") leaves the caller passing
+    // undefined for the missing half.
+    text = text?.trim() ?? "";
+    if (text == "" || text.toLowerCase() == "sekarang") {
       return "0";
     }
 
@@ -1672,8 +1810,8 @@ export class Glints {
  * @throws Will throw an error if the input dateStr does not match the expected format.
  */
 async convertDateMMDDToYYYY(text: string): Promise<string> {
-    text = text.trim();
-    if (text == "" || text == undefined || text.toLowerCase() == "sekarang") {
+    text = text?.trim() ?? "";
+    if (text == "" || text.toLowerCase() == "sekarang") {
       return "0";
     }
 
@@ -1849,7 +1987,11 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       const extension = mimeTypes[contentType];
 
       // Generate a file path for the stored image
-      const filePath = path.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
+      const storageDir = path.join(__dirname, "../storage/");
+      if (!fs.existsSync(storageDir)) {
+        fs.mkdirSync(storageDir, { recursive: true });
+      }
+      const filePath = path.join(storageDir, `${Date.now()}.${extension}`);
 
       // Write the image data to the file
       await fs.promises.writeFile(filePath, response.data);
