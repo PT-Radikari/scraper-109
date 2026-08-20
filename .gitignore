@@ -33,3 +33,8 @@ db/*.db-journal
 node-modules/
 node_modules/
 logs/
+
+# Runtime page-asset cache written by the scrapers
+cache/
+# Runtime downloaded CV/photo temp files
+storage/

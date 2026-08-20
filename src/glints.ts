@@ -9,6 +9,14 @@ import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./c
 import { trackBrowser } from "./browserRegistry";
 import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { resolveCandidateIdentity } from "./candidateIdentity";
+import {
+  InMemorySessionStore,
+  LoginAttemptGuard,
+  PortalCredentials,
+  escapeRegExp,
+  loadPortalCredentials,
+  maskSecrets,
+} from "./portalLogin";
 
 /**
  * Represents a cookie.
@@ -120,6 +128,88 @@ type ApplicantDB = Pick<Applicant, "email"> & {
 export const GLINTS_APPLICANT_ROW_SELECTOR =
   '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
 
+const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
+const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
+const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
+const GLINTS_LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]';
+
+/**
+ * Per-process login attempt cap. Module-level on purpose: the continuous loop
+ * constructs a fresh Glints instance per attempt/cycle, and the cap must
+ * survive those instances so a wrong password fails twice, loudly, and then
+ * backs off instead of retrying every cycle into an account lockout.
+ */
+const glintsLoginGuard = new LoginAttemptGuard({ maxConsecutiveFailures: 2 });
+
+/**
+ * The refreshed session captured after a successful credential login, held in
+ * memory only (never written to disk or the repo). Subsequent cycles in the
+ * same process replay it instead of the committed glints.json warm-start.
+ */
+export const glintsSessionStore = new InMemorySessionStore();
+
+/** Clears the login guard and session store. Test-only. */
+export function resetGlintsLoginState(): void {
+  glintsLoginGuard.reset();
+  glintsSessionStore.clear();
+}
+
+/** What the login page shows after (or while) a credential submit settles. */
+export type GlintsLoginOutcome =
+  | "success"
+  | "invalid_credentials"
+  | "challenge"
+  | "pending";
+
+const GLINTS_CHALLENGE_PATTERN =
+  /captcha|geetest|hcaptcha|cloudflare|two[\s-]?factor|\b2fa\b|one[\s-]?time password|\botp\b|kode (otp|verifikasi)|verification code|too many (login )?attempts|terlalu banyak/i;
+
+const GLINTS_INVALID_CREDENTIALS_PATTERN =
+  /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
+
+const GLINTS_DASHBOARD_MARKER_SELECTOR =
+  '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")';
+
+const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
+  'iframe[src*="captcha"]',
+  'iframe[src*="geetest"]',
+  'iframe[title*="captcha" i]',
+  '[class*="captcha" i]',
+  '[id*="captcha" i]',
+  '[class*="geetest" i]',
+  '[id*="geetest" i]',
+  'input[autocomplete="one-time-code"]',
+  'input[name*="otp" i]',
+  'input[id*="otp" i]',
+  'input[name*="verification" i]',
+].join(", ");
+
+/**
+ * Classifies the state of the Glints login page. Pure so the detection logic
+ * is unit-testable without a browser: leaving /login means the portal accepted
+ * the login; otherwise the visible text (never script content) is matched for
+ * a rejected-credentials banner first, and a captcha/2FA/rate-limit wall is
+ * reported only when an actual challenge widget is on the page, so a bare
+ * keyword mention can never arm the challenge cooldown.
+ */
+export function classifyGlintsLoginResult(observation: {
+  url: string;
+  visibleText: string;
+  hasChallengeElement: boolean;
+}): GlintsLoginOutcome {
+  if (!observation.url.includes("/login")) return "success";
+  if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
+    return "invalid_credentials";
+  }
+  if (
+    observation.hasChallengeElement &&
+    GLINTS_CHALLENGE_PATTERN.test(observation.visibleText)
+  ) {
+    return "challenge";
+  }
+  return "pending";
+}
+
 export class Glints {
   private HEADLESS: boolean = true;
   private LIMIT: number = 0;
@@ -173,6 +263,38 @@ export class Glints {
   }
 
   /**
+   * Waits for the dashboard's company controls to render. The dashboard settle
+   * poll returns on the first dashboard marker, which can paint before the
+   * sidebar company block, so a single-shot check here misses a switcher that
+   * is still rendering — exactly when the account just gained a second company.
+   * @param page The dashboard page.
+   * @returns "target-selected" when the configured company is already active,
+   *          "switcher" once the "Ubah" switcher rendered, or "absent" when
+   *          neither showed up within the polling window.
+   */
+  async waitForCompanyControls(
+    page: playwright.Page,
+  ): Promise<"target-selected" | "switcher" | "absent"> {
+    const TARGET_REGEX_ESCAPED = escapeRegExp(this.TARGETCOMPANY);
+    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
+    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 15000) / pollIntervalMs));
+    for (let i = 0; i < attempts; i++) {
+      try {
+        if (await alreadySelected.count() > 0) return "target-selected";
+        if (await ubahLocator.count() > 0) return "switcher";
+      } catch {
+        // A late SPA navigation can destroy the execution context mid-count;
+        // treat it like "not rendered yet" and keep polling.
+      }
+      await page.waitForTimeout(pollIntervalMs);
+    }
+    return "absent";
+  }
+
+  /**
    * Selects the target company from the Glints company switcher dropdown on the dashboard.
    * Required when the account manages multiple companies — the wrong company will return empty results.
    */
@@ -180,24 +302,24 @@ export class Glints {
     if (!this.TARGETCOMPANY) return;
 
     const TARGET = this.TARGETCOMPANY;
-    const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const TARGET_REGEX_ESCAPED = escapeRegExp(TARGET);
 
-    // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
-    if (await ubahLocator.count() === 0) {
-      console.info('[GLINTS] No company switcher found, skipping company selection.');
-      return;
-    }
-
-    // The current company name is displayed in a paragraph adjacent to the combobox.
-    // When the dropdown is closed there is no visible option list, so this paragraph is the only
-    // occurrence of the company name on the page.
-    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
-    if (await alreadySelected.count() > 0) {
+    const controls = await this.waitForCompanyControls(page);
+    if (controls === "target-selected") {
+      // The current company name is displayed in a paragraph adjacent to the
+      // combobox; with the dropdown closed it is the only occurrence of the
+      // name on the page.
       console.info(`[GLINTS] Company already set to: ${TARGET}`);
       return;
     }
+    if (controls === "absent") {
+      console.warn(
+        `[GLINTS] target_company "${TARGET}" is configured but no company switcher rendered and the target is not the active company — continuing with the session's current company`,
+      );
+      return;
+    }
 
+    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
     console.info(`[GLINTS] Switching company to: ${TARGET}`);
 
     // Click the "Ubah" button to open the dropdown
@@ -235,6 +357,223 @@ export class Glints {
   /** Number of applicants successfully persisted by this run. */
   getCollectedCount(): number {
     return this.COLLECTED;
+  }
+
+  /**
+   * Recovers from an expired/absent session by logging in with the
+   * GLINTS_EMAIL / GLINTS_PASSWORD env credentials. Called when the dashboard
+   * redirected to /login. Leaving /login alone is not success: the portal can
+   * park a submit on an interstitial (OTP route, forced password reset,
+   * onboarding), so the dashboard is re-verified first, and only then are the
+   * refreshed cookies + localStorage held in memory (glintsSessionStore) for
+   * the following cycles and the attempt guard reset. On failure this throws
+   * one loud, credential-free error and lets the cycle fail — the continuous
+   * loop keeps cycling on its normal schedule.
+   *
+   * Every failure path is throttled by the module-level attempt guard so a
+   * wrong password or a captcha wall never becomes a login retry storm.
+   *
+   * @param page The page currently sitting on the login redirect.
+   * @param context The browser context, used to snapshot the fresh cookies.
+   */
+  async ensureAuthenticated(
+    page: any,
+    context: { cookies(): Promise<any[]> },
+  ): Promise<void> {
+    const credentials = loadPortalCredentials("GLINTS");
+    if (!credentials) {
+      throw new Error(
+        "[GLINTS] Session expired: dashboard redirected to login and GLINTS_EMAIL/GLINTS_PASSWORD are not set — configure the credentials or export a fresh session into glints.json",
+      );
+    }
+
+    const gate = glintsLoginGuard.canAttempt();
+    if (!gate.allowed) {
+      throw new Error(
+        `[GLINTS] Session expired and credential login skipped: ${gate.reason}`,
+      );
+    }
+
+    console.info("[GLINTS] Session expired — attempting credential login");
+    let outcome: GlintsLoginOutcome;
+    try {
+      outcome = await this.attemptCredentialLogin(page, credentials);
+    } catch (error) {
+      glintsLoginGuard.recordFailure("error");
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[GLINTS] GLINTS_LOGIN_FAILED: credential login errored: ${maskSecrets(message, [credentials.password, credentials.email])}`,
+      );
+    }
+
+    switch (outcome) {
+      case "success": {
+        await page.goto("https://employers.glints.id/dashboard", {
+          waitUntil: "domcontentloaded",
+          timeout: this.TIMEOUT,
+        });
+        const landing = await this.waitForDashboardOrLogin(page);
+        if (landing !== "dashboard" || !(await this.hasDashboardMarker(page))) {
+          glintsLoginGuard.recordFailure("error");
+          throw new Error(
+            "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (OTP, password reset, onboarding) that needs a human login",
+          );
+        }
+        glintsLoginGuard.recordSuccess();
+        glintsSessionStore.set({
+          cookies: await context.cookies(),
+          localStorage: await this.readLocalStorageSnapshot(page),
+          capturedAt: Date.now(),
+        });
+        console.info(
+          "[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles",
+        );
+        return;
+      }
+      case "challenge": {
+        glintsLoginGuard.recordFailure("challenge");
+        throw new Error(
+          "[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/2FA/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule",
+        );
+      }
+      case "invalid_credentials": {
+        glintsLoginGuard.recordFailure("invalid_credentials");
+        throw new Error(
+          "[GLINTS] GLINTS_LOGIN_FAILED: the portal rejected the configured credentials — fix GLINTS_EMAIL/GLINTS_PASSWORD",
+        );
+      }
+      default: {
+        glintsLoginGuard.recordFailure("error");
+        throw new Error(
+          `[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Fills and submits the employer login form, then polls until the portal
+   * either leaves /login, shows an error banner, or raises a challenge.
+   * @param page The page to drive; navigated to the login URL if not there.
+   * @param credentials The env credentials to submit.
+   * @returns The observed outcome; "pending" means the timeout elapsed first.
+   */
+  async attemptCredentialLogin(
+    page: any,
+    credentials: PortalCredentials,
+  ): Promise<GlintsLoginOutcome> {
+    if (!page.url().includes("/login")) {
+      await page.goto(GLINTS_LOGIN_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+    }
+
+    await page.fill(GLINTS_LOGIN_EMAIL_SELECTOR, credentials.email);
+    await page.fill(GLINTS_LOGIN_PASSWORD_SELECTOR, credentials.password);
+    await page.click(GLINTS_LOGIN_SUBMIT_SELECTOR);
+
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+    let outcome: GlintsLoginOutcome = "pending";
+    for (let i = 0; i < attempts; i++) {
+      await page.waitForTimeout(pollIntervalMs);
+      outcome = classifyGlintsLoginResult({
+        url: page.url(),
+        visibleText: await this.readLoginVisibleText(page),
+        hasChallengeElement: await this.detectLoginChallengeElement(page),
+      });
+      if (outcome !== "pending") break;
+    }
+    return outcome;
+  }
+
+  /**
+   * Reads the page's visible text for login-outcome classification via
+   * innerText, so inline script content and hidden static wording never reach
+   * the classifier; falls back to textContent if evaluation fails.
+   */
+  private async readLoginVisibleText(page: any): Promise<string> {
+    try {
+      return await page.evaluate(() => document.body?.innerText ?? "");
+    } catch {
+      try {
+        return (await page.locator("body").textContent()) ?? "";
+      } catch {
+        return "";
+      }
+    }
+  }
+
+  /** Detects a rendered captcha/OTP widget for challenge classification. */
+  private async detectLoginChallengeElement(page: any): Promise<boolean> {
+    try {
+      return await page.evaluate((selector: string) => {
+        return Array.from(document.querySelectorAll(selector)).some((el) => {
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      }, GLINTS_CHALLENGE_ELEMENT_SELECTOR);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Waits for the dashboard SPA to settle after navigation: polls until the
+   * URL lands on /login (session expired) or a dashboard-only marker renders
+   * (authenticated). A single timed URL check races the client-side auth
+   * redirect, which can fire after the check passed and destroy the execution
+   * context under later locator calls, so navigation errors inside a poll
+   * iteration are swallowed and polling continues. On timeout the URL decides.
+   */
+  async waitForDashboardOrLogin(page: any): Promise<"dashboard" | "login"> {
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(this.TIMEOUT / pollIntervalMs));
+    for (let i = 0; i < attempts; i++) {
+      await page.waitForTimeout(pollIntervalMs);
+      try {
+        if (page.url().includes("/login")) return "login";
+        const markerCount = await page
+          .locator(GLINTS_DASHBOARD_MARKER_SELECTOR)
+          .count();
+        if (markerCount > 0) return "dashboard";
+      } catch {
+        continue;
+      }
+    }
+    return page.url().includes("/login") ? "login" : "dashboard";
+  }
+
+  /**
+   * Single-shot check that a dashboard-only marker is currently rendered.
+   * Distinguishes a settle poll that actually saw the dashboard from one that
+   * timed out on an interstitial and fell back to the URL.
+   */
+  private async hasDashboardMarker(page: any): Promise<boolean> {
+    try {
+      return (
+        (await page.locator(GLINTS_DASHBOARD_MARKER_SELECTOR).count()) > 0
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /** Snapshots the page's localStorage for in-memory session reuse. */
+  private async readLocalStorageSnapshot(
+    page: any,
+  ): Promise<{ key: string; value: string }[]> {
+    try {
+      return await page.evaluate(() =>
+        Object.entries(localStorage).map(([key, value]) => ({
+          key,
+          value: String(value),
+        })),
+      );
+    } catch {
+      return [];
+    }
   }
 
   private async ensureLegacyDatabase(): Promise<void> {
@@ -552,7 +891,13 @@ export class Glints {
     const context = browser.contexts()[0] || await browser.newContext({
       viewport: { width: 1440, height: 900 }
     });
-    await context.addCookies(this.COOKIES);
+    // A session refreshed by a credential login earlier in this process beats
+    // the committed glints.json export, which is only an optional warm-start.
+    const storedSession = glintsSessionStore.get();
+    const sessionCookies = (storedSession?.cookies as Cookie[] | undefined) ?? this.COOKIES;
+    if (sessionCookies.length > 0) {
+      await context.addCookies(sessionCookies);
+    }
     context.setDefaultTimeout(this.TIMEOUT);
 
     const page = await context.newPage();
@@ -626,7 +971,7 @@ export class Glints {
       }
       // Suppress mobile app promo page
       localStorage.setItem('mobileAppPromptViewedDate', JSON.stringify(new Date().toISOString()));
-    }, this.LOCALSTORAGE);
+    }, storedSession?.localStorage ?? this.LOCALSTORAGE);
 
     await page.waitForTimeout(5000);
 
@@ -635,10 +980,20 @@ export class Glints {
       timeout: this.TIMEOUT,
     });
 
-    await page.waitForTimeout(3000);
+    if ((await this.waitForDashboardOrLogin(page)) === "login") {
+      // Self-renew: log in with the env credentials, then retry the dashboard.
+      await this.ensureAuthenticated(page, context);
 
-    if (page.url().includes("/login")) {
-      throw new Error("[GLINTS] Session expired: dashboard redirected to login");
+      await page.goto("https://employers.glints.id/dashboard", {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+
+      if ((await this.waitForDashboardOrLogin(page)) === "login") {
+        throw new Error(
+          "[GLINTS] Session expired: dashboard still redirected to login after a successful credential login",
+        );
+      }
     }
 
     // Switch to the correct company before scraping — wrong company returns empty results

@@ -45,7 +45,9 @@ npm run dev:seek
 ```
 If `seek.json` has `email` and `password`, the login form is prefilled but not submitted automatically.
 
-If a Glints account manages multiple companies, set `target_company` in `glints.json` to the exact company name shown in the dashboard's company switcher; the scraper selects it before scraping, since the wrong company returns empty results.
+If a Glints account manages multiple companies, set `target_company` in `glints.json` to the exact company name shown in the dashboard's company switcher; the scraper selects it before scraping, since the wrong company returns empty results. If neither the switcher nor the already-active target renders on the dashboard (for example the company attachment is not yet visible to this login), the scraper logs a loud `[GLINTS] target_company ...` warning naming the target and continues with the session's current company instead of failing.
+
+Glints authenticates itself: set `GLINTS_EMAIL` and `GLINTS_PASSWORD` in the environment (see `.env.sample`; they are runtime secrets — never commit values). When the session injected from `glints.json` is missing or expired, the scraper signs in on the employer login page, verifies the dashboard loads, and keeps the refreshed cookies + localStorage in memory for the following cycles of the same process; the cookies committed in `glints.json` are only an optional warm-start. Failure modes are loud and throttled (`src/portalLogin.ts`): rejected credentials log `GLINTS_LOGIN_FAILED` and are capped at 2 consecutive attempts per process before a long backoff, and a captcha/2FA wall logs `GLINTS_LOGIN_CHALLENGE` and pauses login attempts while the loop keeps cycling — export a fresh session by hand in that case. Credentials are masked in every log line and error.
 
 Every scraper launches Playwright's bundled Chromium first and falls back to a system-installed Chrome/Chromium if that launch fails, so a host missing Playwright's browser cache still works.
 
@@ -260,7 +262,8 @@ Run any sink-routed portal continuously, newest candidates first, with an
 env-driven pause between idempotent cycles (`SCRAPER_INTERVAL_MS`, default
 5 minutes). One Dokploy container per portal; each cycle writes one row to
 `scrape.scrape_runs`, and an expired portal session fails that cycle with one
-loud `[PORTAL] Session expired ...` log line while the loop keeps cycling:
+loud `[PORTAL] Session expired ...` log line while the loop keeps cycling
+(Glints first tries the credential self-login described above):
 
 ```bash
 npm run dev:glints:continuous     # also: dev:jooble:continuous, dev:seek:continuous,
