@@ -92,6 +92,8 @@ type Applicant = {
   gender: string;
   photo: string;
   cv: string;
+  /** Glints' own applicant UUID from the application detail API, when seen. */
+  portal_candidate_id?: string;
 };
 
 /**
@@ -269,6 +271,87 @@ export function classifyGlintsLoginResult(observation: {
     return "challenge";
   }
   return "pending";
+}
+
+/**
+ * The application-detail fields the scraper consumes from the dashboard's own
+ * GET /api/jobs/{jobId}/applications/{applicationId} response, which fires when
+ * an applicant modal opens. Every field degrades to "" when absent.
+ */
+export interface GlintsApplicationDetail {
+  /** Glints' applicant UUID — a genuine portal-native candidate id. */
+  applicantId: string;
+  /** Applicant.firstName + Applicant.lastName, used to correlate a captured
+   * payload with the row whose modal open triggered it. */
+  applicantName: string;
+  email: string;
+  /** The number behind the modal's "WhatsApp:" row, usually +62-prefixed. */
+  whatsappNumber: string;
+  /** Resume file key for GET /api/s3/download?key={resumeKey}&label=resume. */
+  resumeKey: string;
+  /** YYYY-MM-DD */
+  birthDate: string;
+  /** MALE / FEMALE / "" */
+  gender: string;
+}
+
+/**
+ * Parses the application-detail API payload into the fields the scraper needs.
+ * Pure so the mapping is unit-testable against captured payload shapes; returns
+ * null when the payload carries no data object at all (endpoint drift), which
+ * callers treat as "fall back to DOM extraction".
+ */
+export function parseGlintsApplicationDetail(payload: unknown): GlintsApplicationDetail | null {
+  const data = (payload as { data?: unknown } | null)?.data;
+  if (typeof data !== "object" || data === null) return null;
+  const d = data as Record<string, any>;
+  const applicant = (typeof d.Applicant === "object" && d.Applicant !== null ? d.Applicant : {}) as Record<string, any>;
+
+  const str = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+  // Un-progressed ("BARU") applications carry Glints' masked placeholders
+  // ("+62****", "****@****") instead of real contact values; a placeholder is
+  // absent data, and storing it would dedupe unrelated candidates onto one row.
+  const contact = (value: unknown): string => stripGlintsContactMask(str(value));
+  // The phone fallbacks (top-level phone and Applicant.phone) can carry a bare
+  // country code ("+62"); too short to be a number, so it never wins over the
+  // real WhatsApp fields.
+  const phone = (value: unknown): string => {
+    const candidate = contact(value);
+    return candidate.replace(/\D/g, "").length >= 7 ? candidate : "";
+  };
+
+  return {
+    applicantId: str(d.ApplicantId) || str(applicant.id),
+    applicantName: [str(applicant.firstName), str(applicant.lastName)].filter(Boolean).join(" "),
+    email: contact(applicant.email),
+    whatsappNumber:
+      contact((d.whatsAppDetails as Record<string, unknown> | undefined)?.whatsAppNumber) ||
+      contact(applicant.whatsappNumber) ||
+      phone(d.phone) ||
+      phone(applicant.phone),
+    resumeKey: str(d.resume),
+    birthDate: str(applicant.birthDate).slice(0, 10),
+    gender: str(applicant.gender),
+  };
+}
+
+/**
+ * Collapses Glints' masked contact placeholders to "". Contact info is gated
+ * until an application is moved past the "BARU" stage; both the modal and the
+ * application-detail API then render mask literals like "+62****" and
+ * "****@****" — never real data, so any starred value is treated as absent.
+ */
+export function stripGlintsContactMask(value: string): string {
+  return value.includes("*") ? "" : value;
+}
+
+/**
+ * Normalizes an applicant name for capture-to-row correlation: trims, collapses
+ * internal whitespace and lowercases, so cosmetic rendering differences between
+ * the API payload and the row text do not count as a mismatch.
+ */
+export function normalizeGlintsApplicantName(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 export class Glints {
@@ -862,6 +945,7 @@ export class Glints {
       .update(`${param.portal}${param.applied_for}`)
       .digest("hex");
     const identity = resolveCandidateIdentity({
+      portalCandidateId: param.portal_candidate_id,
       urlProfile: param.url_profile,
       vacancyUrl: param.url_profile,
       email: param.email,
@@ -898,6 +982,15 @@ export class Glints {
         photo_object_key: photoKey,
         data: {
           ...param,
+          // Rows must reference artifacts by bucket object key, never by the
+          // scraper host's filesystem path (param.photo/param.cv are local
+          // temp paths that are deleted right after this upload).
+          photo: photoKey ?? "",
+          cv: cvKey ?? "",
+          contact: {
+            type: param.contact?.type ?? "WhatsApp",
+            contact_number: identity.phone ?? param.contact?.contact_number ?? "",
+          },
           identity: {
             source: identity.source,
             low_confidence: identity.lowConfidence,
@@ -932,6 +1025,70 @@ export class Glints {
         error: sinkError.message,
       });
       throw sinkError;
+    }
+  }
+
+  /**
+   * Arms a capture for the GET /api/jobs/{jobId}/applications/{applicationId}
+   * response the dashboard itself fires when an applicant modal opens. Must be
+   * called *before* the row click that opens the modal. A previous row's
+   * late-arriving response would otherwise satisfy the wait, so the payload is
+   * only trusted when its Applicant name matches the row's extracted name.
+   * Resolves null on timeout, an unparseable payload, or a name mismatch —
+   * callers then fall back to the DOM. Purely observational: no extra request,
+   * no visible side effect.
+   */
+  armApplicationDetailCapture(page: any, expectedName: string): Promise<GlintsApplicationDetail | null> {
+    const timeout = Math.min(this.TIMEOUT, 20000);
+    return page
+      .waitForResponse(
+        (resp: any) =>
+          /\/api\/jobs\/[^/]+\/applications\/[^/?]+/.test(resp.url()) && resp.status() === 200,
+        { timeout },
+      )
+      .then(async (resp: any) => {
+        const detail = parseGlintsApplicationDetail(await resp.json());
+        if (detail === null) return null;
+        if (normalizeGlintsApplicantName(detail.applicantName) !== normalizeGlintsApplicantName(expectedName)) {
+          console.warn(
+            `[GLINTS] application-detail capture is for "${detail.applicantName}", not row "${expectedName}"; discarding it`,
+          );
+          return null;
+        }
+        return detail;
+      })
+      .catch(() => null);
+  }
+
+  /**
+   * Downloads the applicant's resume through the dashboard's own
+   * GET /api/s3/download endpoint (the same call the modal's CV tab makes) and
+   * stores it locally for the sink upload. Failures degrade to "" so a missing
+   * resume never fails the row; the signed URL is never logged.
+   *
+   * @param page - The page whose session performs the API request.
+   * @param resumeKey - The resume file key from the application detail.
+   * @param filename - Display filename for the content-disposition, no path.
+   * @returns The local file path of the stored resume, or "".
+   */
+  async fetchResumeViaApi(page: any, resumeKey: string, filename: string): Promise<string> {
+    try {
+      const response = await page.request.get("https://employers.glints.id/api/s3/download", {
+        params: { key: resumeKey, label: "resume", filename: `${filename}.pdf` },
+        timeout: Math.min(this.TIMEOUT, 30000),
+      });
+      if (!response.ok()) {
+        console.warn(`[GLINTS] resume download endpoint returned status ${response.status()}`);
+        return "";
+      }
+      const body = await response.json();
+      const signedUrl = typeof body?.url === "string" ? body.url : "";
+      if (signedUrl === "") return "";
+      return await this.fetchAndStore(signedUrl);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[GLINTS] resume download failed: ${message.split("\n")[0]}`);
+      return "";
     }
   }
 
@@ -1373,6 +1530,11 @@ export class Glints {
         const salaryExpectation = await this.extractSalaryExpectation(element);
         const appliedDate = rows[i].appliedDate;
 
+        // Opening the modal makes the dashboard fetch the full application
+        // detail (contact, resume key, applicant id); arm the capture before
+        // the click so the response is never missed.
+        const detailPromise = this.armApplicationDetailCapture(page, name);
+
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
 
@@ -1387,11 +1549,24 @@ export class Glints {
 
         const skills = await this.extractSkills(modalDetail);
         const summary = await this.extractSummary(modalDetail);
-        const wa = await this.extractWhatapps(page, modalDetail);
-        const email = await this.extractEmail(page, modalDetail);
         const workExperience = await this.extractWorkExperience(modalDetail)
         const education = await this.extractEducation(modalDetail)
-        cv = await this.extractCV(page);
+
+        // The application-detail API is the primary source for contact, CV and
+        // identity; the modal's "Kontak Pelamar" block is the DOM fallback.
+        const detail = await detailPromise;
+        const wa =
+          detail && detail.whatsappNumber !== ""
+            ? { type: "WhatsApp", contact_number: detail.whatsappNumber }
+            : await this.extractWhatapps(page, modalDetail);
+        const email = detail && detail.email !== "" ? detail.email : await this.extractEmail(page, modalDetail);
+        cv =
+          detail && detail.resumeKey !== ""
+            ? await this.fetchResumeViaApi(page, detail.resumeKey, `${name} - ${job}`)
+            : "";
+        if (cv === "") {
+          cv = await this.extractCV(page);
+        }
 
         const applicant: Applicant = {
           portal: "glints",
@@ -1402,16 +1577,17 @@ export class Glints {
           email: email,
           summary: summary,
           contact: wa,
-          date_of_birth: dateOfBirth,
+          date_of_birth: detail && detail.birthDate !== "" ? detail.birthDate : dateOfBirth,
           salary_expectation: salaryExpectation,
           work_experience: workExperience,
           education: education,
           skill: skills,
           location: location,
-          gender: gender,
+          gender: detail && detail.gender !== "" ? detail.gender : gender,
           photo: photo,
           cv: cv,
           url_profile: await page.url(),
+          portal_candidate_id: detail?.applicantId ?? "",
         }
 
         await this.sendToSink(applicant)
@@ -1737,50 +1913,48 @@ export class Glints {
   }
 
   /**
-   * Extracts and processes WhatsApp details from a modal detail section.
+   * Reads the value next to one label of the modal's "Kontak Pelamar" block.
+   * The live dashboard renders each contact as a label paragraph ("WhatsApp:",
+   * "Email: ") followed by a sibling anchor carrying the plain-text value — no
+   * hover or reveal interaction involved. Missing block degrades to "".
+   */
+  private async extractContactValue(modalDetail: any, label: string): Promise<string> {
+    try {
+      const labelLocator = modalDetail.getByText(label).first();
+      if ((await labelLocator.count()) === 0) return "";
+      const row = labelLocator.locator("..");
+      const anchor = row.locator("a").first();
+      if ((await anchor.count()) > 0) {
+        return stripGlintsContactMask(((await anchor.textContent()) ?? "").trim());
+      }
+      // Anchor drift fallback: the row's text minus the label itself.
+      return stripGlintsContactMask(((await row.innerText()) ?? "").replace(label, "").trim());
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Extracts the WhatsApp number from the modal's "Kontak Pelamar" block.
    *
-   * @param page - The Playwright page object representing the web page.
-   * @param modalDetail - The modal detail section from which to extract the WhatsApp details.
-   * @returns A Promise that resolves to the extracted WhatsApp number.
-   *          If the WhatsApp number is not found, it returns an empty string.
+   * @param page - Unused; kept for call-site compatibility.
+   * @param modalDetail - The modal detail section to read the contact from.
+   * @returns The contact; contact_number is "" when the block is absent.
    */
   async extractWhatapps(page: any, modalDetail: any): Promise<Contact> {
-    let wa = "";
-    if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").count() > 0) {
-      await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").hover();
-      try {
-        // Short timeout + fallback: the tooltip's inner layout drifts between
-        // dashboard revisions and a missing element must not stall the row.
-        wa = (await page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent({ timeout: 5000 })) ?? "";
-      } catch {
-        wa = "";
-      }
-    }
-
-
+    const wa = await this.extractContactValue(modalDetail, "WhatsApp:");
     return { type: "WhatsApp", contact_number: wa };
   }
 
   /**
-   * Extracts and processes email details from a modal detail section.
+   * Extracts the email from the modal's "Kontak Pelamar" block.
    *
-   * @param page - The Playwright page object representing the web page.
-   * @param modalDetail - The modal detail section from which to extract the email details.
-   * @returns A Promise that resolves to the extracted email.
-   *          If the email is not found, it returns an empty string.
+   * @param page - Unused; kept for call-site compatibility.
+   * @param modalDetail - The modal detail section to read the contact from.
+   * @returns The email, or "" when the block is absent.
    */
   async extractEmail(page: any, modalDetail: any): Promise<string> {
-    let email = "";
-    if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").count() > 0) {
-      await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").hover();
-      try {
-        email = (await page.getByText("Email").locator("..").locator('div > p').textContent({ timeout: 5000 })) ?? "";
-      } catch {
-        email = "";
-      }
-    }
-
-    return email
+    return this.extractContactValue(modalDetail, "Email:");
   }
 
   /**
@@ -2129,7 +2303,13 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       // Return the file path of the stored image
       return filePath;
     } catch (error) {
-      console.error(error);
+      // Never log the raw error object: an AxiosError carries config.url, and
+      // for resumes that is a signed S3 URL with its signature query.
+      const status = (error as { response?: { status?: number } })?.response?.status;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[GLINTS] fetchAndStore failed${status !== undefined ? ` (status ${status})` : ""}: ${message.split("\n")[0]}`,
+      );
       return "";
     }
   }
