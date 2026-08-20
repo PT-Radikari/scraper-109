@@ -259,6 +259,38 @@ export class Glints {
   }
 
   /**
+   * Waits for the dashboard's company controls to render. The dashboard settle
+   * poll returns on the first dashboard marker, which can paint before the
+   * sidebar company block, so a single-shot check here misses a switcher that
+   * is still rendering — exactly when the account just gained a second company.
+   * @param page The dashboard page.
+   * @returns "target-selected" when the configured company is already active,
+   *          "switcher" once the "Ubah" switcher rendered, or "absent" when
+   *          neither showed up within the polling window.
+   */
+  async waitForCompanyControls(
+    page: playwright.Page,
+  ): Promise<"target-selected" | "switcher" | "absent"> {
+    const TARGET_REGEX_ESCAPED = this.TARGETCOMPANY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
+    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
+
+    const pollIntervalMs = 1000;
+    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 15000) / pollIntervalMs));
+    for (let i = 0; i < attempts; i++) {
+      try {
+        if (await alreadySelected.count() > 0) return "target-selected";
+        if (await ubahLocator.count() > 0) return "switcher";
+      } catch {
+        // A late SPA navigation can destroy the execution context mid-count;
+        // treat it like "not rendered yet" and keep polling.
+      }
+      await page.waitForTimeout(pollIntervalMs);
+    }
+    return "absent";
+  }
+
+  /**
    * Selects the target company from the Glints company switcher dropdown on the dashboard.
    * Required when the account manages multiple companies — the wrong company will return empty results.
    */
@@ -268,22 +300,22 @@ export class Glints {
     const TARGET = this.TARGETCOMPANY;
     const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-    // Check if the company switcher exists ("Ubah" button is only shown when multiple companies exist)
-    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
-    if (await ubahLocator.count() === 0) {
-      console.info('[GLINTS] No company switcher found, skipping company selection.');
-      return;
-    }
-
-    // The current company name is displayed in a paragraph adjacent to the combobox.
-    // When the dropdown is closed there is no visible option list, so this paragraph is the only
-    // occurrence of the company name on the page.
-    const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
-    if (await alreadySelected.count() > 0) {
+    const controls = await this.waitForCompanyControls(page);
+    if (controls === "target-selected") {
+      // The current company name is displayed in a paragraph adjacent to the
+      // combobox; with the dropdown closed it is the only occurrence of the
+      // name on the page.
       console.info(`[GLINTS] Company already set to: ${TARGET}`);
       return;
     }
+    if (controls === "absent") {
+      console.warn(
+        `[GLINTS] target_company "${TARGET}" is configured but no company switcher rendered and the target is not the active company — continuing with the session's current company`,
+      );
+      return;
+    }
 
+    const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
     console.info(`[GLINTS] Switching company to: ${TARGET}`);
 
     // Click the "Ubah" button to open the dropdown
