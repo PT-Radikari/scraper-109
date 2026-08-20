@@ -1130,9 +1130,20 @@ export class Glints {
       const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
       const applicantRows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
       const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+      // The empty-state wrapper can flash while the table hydrates (observed
+      // live: the same vacancy showed it on one run and 8 rows on the next),
+      // so a single sighting is not proof of emptiness — require it to hold
+      // for several consecutive polls with no data rows.
+      let emptyStreak = 0;
       for (let i = 0; i < settleAttempts; i++) {
         await page.waitForTimeout(1000);
-        if ((await emptyMarker.count()) > 0 || (await applicantRows.count()) > 0) break;
+        const emptyCount = await emptyMarker.count();
+        if ((await applicantRows.count()) > 0 && emptyCount === 0) break;
+        if (emptyCount > 0) {
+          if (++emptyStreak >= 8) break;
+        } else {
+          emptyStreak = 0;
+        }
       }
 
       // Skip job if no candidates in this stage
@@ -1218,9 +1229,12 @@ export class Glints {
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
 
-        // .last(): the stage tab bar behind the modal also reads "Belum
-        // Sesuai"; the modal is portaled to the end of the DOM.
-        const modalDetailButtonBelumSelesai = await page.getByText('Belum Sesuai', { exact: true }).last();
+        // Scope to the modal: the stage tab bar behind it also reads "Belum
+        // Sesuai" (the modal itself carries data-testid="modal-wrapper").
+        const modalDetailButtonBelumSelesai = await page
+          .getByTestId('modal-wrapper')
+          .getByText('Belum Sesuai', { exact: true })
+          .last();
         await modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
         const modalDetail = await modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
 
