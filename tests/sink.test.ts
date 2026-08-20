@@ -515,6 +515,132 @@ function serializeError(error: unknown): string {
   return JSON.stringify(error, Object.getOwnPropertyNames(error as object));
 }
 
+describe("SupabaseSink service-key surfaces", () => {
+  const SERVICE_KEY = "test-service-key";
+
+  function buildServiceSink(): SupabaseSink {
+    return new SupabaseSink({ url: URL, anonKey: ANON_KEY, bucket: BUCKET, serviceKey: SERVICE_KEY });
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.SCORING_SUPABASE_SERVICE_KEY;
+    mockedAxios.post.mockResolvedValue({ data: [{ id: 5 }] } as never);
+    mockedAxios.get.mockResolvedValue({ data: [] } as never);
+    mockedAxios.patch.mockResolvedValue({ data: [] } as never);
+  });
+
+  it("reports service access from the config key and from the environment", () => {
+    expect(buildSink().hasServiceAccess()).toBe(false);
+    expect(buildServiceSink().hasServiceAccess()).toBe(true);
+    process.env.SCORING_SUPABASE_SERVICE_KEY = "env-service-key";
+    expect(buildSink().hasServiceAccess()).toBe(true);
+    delete process.env.SCORING_SUPABASE_SERVICE_KEY;
+  });
+
+  it("refuses service-only operations without the key, naming the env var", async () => {
+    await expect(buildSink().createVerificationRequest()).rejects.toThrow(
+      /SCORING_SUPABASE_SERVICE_KEY/
+    );
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+
+  it("opens a verification request with the service key, never the anon key", async () => {
+    const id = await buildServiceSink().createVerificationRequest();
+    expect(id).toBe(5);
+    expect(mockedAxios.post).toHaveBeenCalledWith(
+      `${URL}/rest/v1/glints_verification`,
+      [{ status: "requested" }],
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          apikey: SERVICE_KEY,
+          Authorization: `Bearer ${SERVICE_KEY}`,
+          "Accept-Profile": "scrape",
+          "Content-Profile": "scrape",
+        }),
+      })
+    );
+  });
+
+  it("reads the newest verification request for the rate cap", async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: [{ id: 9, requested_at: "2026-08-20T14:00:00Z", status: "requested" }],
+    } as never);
+
+    const latest = await buildServiceSink().latestVerificationRequest();
+    expect(latest).toEqual({ id: 9, requested_at: "2026-08-20T14:00:00Z", status: "requested" });
+    expect(mockedAxios.get).toHaveBeenCalledWith(
+      `${URL}/rest/v1/glints_verification`,
+      expect.objectContaining({
+        params: { select: "id,requested_at,status", order: "requested_at.desc", limit: 1 },
+      })
+    );
+  });
+
+  it("normalizes a blank code to null while polling and trims a real one", async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: [{ code: "  ", status: "requested" }] } as never);
+    await expect(buildServiceSink().readVerificationRequest(9)).resolves.toEqual({
+      code: null,
+      status: "requested",
+    });
+
+    mockedAxios.get.mockResolvedValueOnce({ data: [{ code: " 123456 ", status: "requested" }] } as never);
+    await expect(buildServiceSink().readVerificationRequest(9)).resolves.toEqual({
+      code: "123456",
+      status: "requested",
+    });
+  });
+
+  it("settles a verification row with status and submitted_at", async () => {
+    await buildServiceSink().settleVerificationRequest(9, "consumed", "2026-08-20T14:05:00Z");
+    expect(mockedAxios.patch).toHaveBeenCalledWith(
+      `${URL}/rest/v1/glints_verification?id=eq.9`,
+      { status: "consumed", submitted_at: "2026-08-20T14:05:00Z" },
+      expect.objectContaining({
+        headers: expect.objectContaining({ apikey: SERVICE_KEY }),
+      })
+    );
+  });
+
+  it("downloads a private object and maps a missing one to null", async () => {
+    mockedAxios.get.mockResolvedValueOnce({ data: Buffer.from('{"cookies":[]}') } as never);
+    const bytes = await buildServiceSink().downloadPrivateObject("glints/session/current.json");
+    expect(bytes?.toString("utf8")).toBe('{"cookies":[]}');
+    expect(mockedAxios.get).toHaveBeenCalledWith(
+      `${URL}/storage/v1/object/${BUCKET}/glints/session/current.json`,
+      expect.objectContaining({ responseType: "arraybuffer" })
+    );
+
+    mockedAxios.isAxiosError.mockReturnValueOnce(true as never);
+    mockedAxios.get.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: { status: 404, data: { message: "Object not found" } },
+    } as never);
+    await expect(
+      buildServiceSink().downloadPrivateObject("glints/session/current.json")
+    ).resolves.toBeNull();
+  });
+
+  it("uploads a private object with x-upsert so re-persisting overwrites", async () => {
+    await buildServiceSink().uploadPrivateObject(
+      "glints/session/current.json",
+      Buffer.from("{}"),
+      "application/json"
+    );
+    expect(mockedAxios.post).toHaveBeenCalledWith(
+      `${URL}/storage/v1/object/${BUCKET}/glints/session/current.json`,
+      expect.anything(),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          apikey: SERVICE_KEY,
+          Authorization: `Bearer ${SERVICE_KEY}`,
+          "x-upsert": "true",
+        }),
+      })
+    );
+  });
+});
+
 function expectNoPii(serialized: string): void {
   expect(serialized).not.toContain(ANON_KEY);
   expect(serialized).not.toContain("leaked@example.com");

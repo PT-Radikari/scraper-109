@@ -1,4 +1,6 @@
 import {
+  GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR,
+  GLINTS_VERIFICATION_METHOD_SELECTOR,
   Glints,
   GlintsConfigJson,
   classifyGlintsLoginResult,
@@ -32,10 +34,20 @@ class FakeLoginPage {
   visibleText = "Alamat Email Password Lupa password? Masuk";
   hasChallengeElement = false;
   hasOtpElement = false;
+  hasVerificationMethodElement = false;
   dashboardMarkerCount = 0;
+  /** Rendered verification-code inputs (0 until the email-code click). */
+  codeInputCount = 0;
+  /** Rendered submit buttons reachable via locator (0 forces the Enter path). */
+  submitButtonCount = 0;
   fills: Record<string, string> = {};
+  codeFills: string[] = [];
+  pressedKeys: string[] = [];
   clicked: string[] = [];
   onSubmit: (() => void) | null = null;
+  onClick: ((selector: string) => void) | null = null;
+  /** Fires when the typed verification code gets submitted (click or Enter). */
+  onCodeSubmit: (() => void) | null = null;
   onPoll: (() => void) | null = null;
   fillError: Error | null = null;
   locatorError: Error | null = null;
@@ -54,6 +66,7 @@ class FakeLoginPage {
   }
   async click(selector: string): Promise<void> {
     this.clicked.push(selector);
+    this.onClick?.(selector);
     this.onSubmit?.();
   }
   async waitForTimeout(_ms: number): Promise<void> {
@@ -66,22 +79,66 @@ class FakeLoginPage {
   async content(): Promise<string> {
     return this.pageHtml;
   }
-  locator(_selector: string) {
+  locator(selector: string) {
+    // The verification-code input locator is the only one naming the
+    // one-time-code autocomplete; the code-entry submit locator is the only
+    // one targeting button[type="submit"].
+    if (selector.includes("one-time-code")) {
+      return {
+        count: async () => this.codeInputCount,
+        first: () => ({
+          fill: async (value: string) => {
+            this.codeFills[0] = value;
+          },
+          press: async (key: string) => {
+            this.pressedKeys.push(key);
+            this.onCodeSubmit?.();
+          },
+        }),
+        nth: (index: number) => ({
+          fill: async (value: string) => {
+            this.codeFills[index] = value;
+          },
+        }),
+      };
+    }
+    if (selector.includes('button[type="submit"]')) {
+      return {
+        count: async () => this.submitButtonCount,
+        first: () => ({
+          click: async () => {
+            this.clicked.push(selector);
+            this.onCodeSubmit?.();
+          },
+        }),
+      };
+    }
     return {
       textContent: async () => this.visibleText,
       count: async () => {
         if (this.locatorError) throw this.locatorError;
         return this.dashboardMarkerCount;
       },
+      first: () => ({
+        fill: async () => {},
+        press: async () => {},
+        click: async () => {},
+      }),
+      nth: () => ({ fill: async () => {} }),
     };
   }
   async evaluate(fn: unknown, arg?: unknown): Promise<any> {
     const source = String(fn);
     if (source.includes("innerText")) return this.visibleText;
     if (source.includes("getBoundingClientRect")) {
-      // The element probes pass their selector list as the evaluate argument;
-      // the OTP probe is the one naming the one-time-code autocomplete.
-      return String(arg).includes("one-time-code")
+      // The element probes pass their selector list as the evaluate argument:
+      // the verification-method probe names the send-email data-cy hook, the
+      // OTP probe names the one-time-code autocomplete.
+      const probed = String(arg);
+      if (probed.includes("send-email-verification")) {
+        return this.hasVerificationMethodElement;
+      }
+      return probed.includes("one-time-code")
         ? this.hasOtpElement
         : this.hasChallengeElement;
     }
@@ -100,6 +157,79 @@ class FakeDebugSink {
     return `scrape-artifacts/${key}`;
   }
 }
+
+/**
+ * Stands in for the real SupabaseSink across the device-verification flow:
+ * the glints_verification hand-off rows and the private session object.
+ */
+class FakeVerificationSink extends FakeDebugSink {
+  serviceAccess = true;
+  nextRequestId = 41;
+  created: number[] = [];
+  /** Codes served back per row id; null simulates "human has not typed it yet". */
+  codes: Record<number, string | null> = {};
+  /** Reads until the code "arrives" (each read of a row decrements this). */
+  readsUntilCode = 0;
+  reads = 0;
+  settles: { id: number; status: string; submittedAt?: string }[] = [];
+  latest: { id: number; requested_at: string; status: string } | null = null;
+  sessionObjects: Record<string, Buffer> = {};
+
+  hasServiceAccess(): boolean {
+    return this.serviceAccess;
+  }
+  async latestVerificationRequest() {
+    return this.latest;
+  }
+  async createVerificationRequest(): Promise<number> {
+    const id = ++this.nextRequestId;
+    this.created.push(id);
+    return id;
+  }
+  async readVerificationRequest(id: number) {
+    this.reads += 1;
+    if (this.reads <= this.readsUntilCode) return { code: null, status: "requested" };
+    return { code: this.codes[id] ?? null, status: "requested" };
+  }
+  async settleVerificationRequest(id: number, status: string, submittedAt?: string) {
+    this.settles.push({ id, status, submittedAt });
+  }
+  async downloadPrivateObject(key: string): Promise<Buffer | null> {
+    return this.sessionObjects[key] ?? null;
+  }
+  async uploadPrivateObject(key: string, bytes: Buffer, _contentType: string): Promise<void> {
+    this.sessionObjects[key] = bytes;
+  }
+}
+
+/**
+ * The "Verifikasi diri Anda" interstitial as captured from production
+ * (scrape-artifacts/glints/login-debug/2026-08-20T13-56-29-719Z/page.html,
+ * account email scrubbed): the DOM contract the selectors and the classifier
+ * text below are built against.
+ */
+const VERIFICATION_FIXTURE_HTML = `
+<div class="CardStyle__StyledCardContainer-sc-tpku8j-0 CDtEg card-container">
+  <div class="TypographyStyles__StyledTypography-sc-ro16eu-0 dBheRE">Verifikasi diri Anda</div>
+  <p>Untuk menjaga keamanan akun Anda, kami ingin memastikan bahwa akun tersebut benar-benar milik Anda.</p>
+  <span>account@example.com</span>
+  <p>Silakan pilih metode verifikasi untuk melanjutkan.</p>
+  <div><p>Verifikasi dengan WhatsApp</p>
+    <p>Kode OTP akan dikirimkan ke Nomor WhatsApp Anda yang telah diverifikasi.</p>
+    <button data-cy="send-whatsApp-verification-btn"><p> Kirim kode OTP</p></button></div>
+  <div><p>Verifikasi dengan Email</p>
+    <p>Kode verifikasi login akan dikirimkan ke email Anda.</p>
+    <button data-cy="send-email-verification-btn"><p> Kirim kode verifikasi</p></button></div>
+</div>`;
+
+/** The interstitial's visible text, as innerText would surface it. */
+const VERIFICATION_VISIBLE_TEXT =
+  "Verifikasi diri Anda Untuk menjaga keamanan akun Anda, kami ingin memastikan " +
+  "bahwa akun tersebut benar-benar milik Anda. account@example.com Silakan pilih " +
+  "metode verifikasi untuk melanjutkan. Verifikasi dengan WhatsApp Kode OTP akan " +
+  "dikirimkan ke Nomor WhatsApp Anda yang telah diverifikasi. Kirim kode OTP " +
+  "Verifikasi dengan Email Kode verifikasi login akan dikirimkan ke email Anda. " +
+  "Kirim kode verifikasi";
 
 const fakeContext = {
   cookies: async () => [{ name: "session", value: "fresh", domain: ".glints.id", path: "/" }],
@@ -580,5 +710,282 @@ describe("Glints.waitForDashboardOrLogin", () => {
     page.currentUrl = "https://employers.glints.id/dashboard";
 
     await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
+  });
+});
+
+describe("device-verification classification", () => {
+  it("keeps the selectors aligned with the captured interstitial DOM", () => {
+    expect(VERIFICATION_FIXTURE_HTML).toContain('data-cy="send-email-verification-btn"');
+    expect(VERIFICATION_FIXTURE_HTML).toContain('data-cy="send-whatsApp-verification-btn"');
+    expect(GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR).toBe(
+      '[data-cy="send-email-verification-btn"]',
+    );
+    expect(GLINTS_VERIFICATION_METHOD_SELECTOR).toContain(
+      '[data-cy="send-email-verification-btn"]',
+    );
+    expect(GLINTS_VERIFICATION_METHOD_SELECTOR).toContain(
+      '[data-cy="send-whatsApp-verification-btn"]',
+    );
+  });
+
+  it("classifies the captured interstitial as device_verification", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login?next=/dashboard",
+        visibleText: VERIFICATION_VISIBLE_TEXT,
+        hasChallengeElement: false,
+        hasOtpElement: false,
+        hasVerificationMethodElement: true,
+      }),
+    ).toBe("device_verification");
+  });
+
+  it("never arms device_verification from the wording alone", () => {
+    // The exact production shape before this state existed: interstitial
+    // wording, no code input, no method element detected → pending.
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login?next=/dashboard",
+        visibleText: VERIFICATION_VISIBLE_TEXT,
+        hasChallengeElement: false,
+        hasOtpElement: false,
+        hasVerificationMethodElement: false,
+      }),
+    ).toBe("pending");
+  });
+
+  it("classifies device_verification even when the interstitial leaves /login", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/security-check",
+        visibleText: VERIFICATION_VISIBLE_TEXT,
+        hasChallengeElement: false,
+        hasOtpElement: false,
+        hasVerificationMethodElement: true,
+      }),
+    ).toBe("device_verification");
+  });
+
+  it("keeps classifier call sites without the new field compiling and pending", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/login",
+        visibleText: "Alamat Email Password Masuk",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("pending");
+  });
+});
+
+describe("Glints device-verification flow", () => {
+  const CODE = "123456";
+
+  let sink: FakeVerificationSink;
+  let scraper: Glints;
+
+  function makeVerificationScraper(): Glints {
+    const s = new Glints(makeConfig());
+    (s as any).sink = sink;
+    // Shrink the bounded waits; FakeLoginPage.waitForTimeout is instant.
+    (s as any).VERIFICATION_CODE_WAIT_MS = 5;
+    (s as any).VERIFICATION_POLL_INTERVAL_MS = 1;
+    return s;
+  }
+
+  /** A login page whose credential submit lands on the captured interstitial. */
+  function interstitialPage(): FakeLoginPage {
+    const page = new FakeLoginPage();
+    page.onSubmit = () => {
+      page.visibleText = VERIFICATION_VISIBLE_TEXT;
+      page.hasVerificationMethodElement = true;
+    };
+    return page;
+  }
+
+  beforeEach(() => {
+    resetGlintsLoginState();
+    process.env.GLINTS_EMAIL = EMAIL;
+    process.env.GLINTS_PASSWORD = PASSWORD;
+    sink = new FakeVerificationSink();
+    scraper = makeVerificationScraper();
+  });
+
+  afterEach(() => {
+    delete process.env.GLINTS_EMAIL;
+    delete process.env.GLINTS_PASSWORD;
+    resetGlintsLoginState();
+  });
+
+  it("requests the EMAIL code, consumes the hand-off row, and persists the session", async () => {
+    const page = interstitialPage();
+    page.onClick = (selector) => {
+      if (selector.includes("send-email-verification")) page.codeInputCount = 1;
+    };
+    page.onCodeSubmit = () => {
+      page.currentUrl = "https://employers.glints.id/dashboard";
+      page.dashboardMarkerCount = 1;
+    };
+    sink.readsUntilCode = 2;
+    sink.codes[42] = CODE;
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    let logged = "";
+    try {
+      await scraper.ensureAuthenticated(page, fakeContext);
+      logged = errorSpy.mock.calls.flat().join("\n");
+    } finally {
+      errorSpy.mockRestore();
+    }
+
+    // The email option was clicked; the WhatsApp option never was.
+    expect(page.clicked).toContain(GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR);
+    expect(page.clicked.join(" ")).not.toMatch(/whatsapp/i);
+    // The operator log names the inbox and the hand-off row.
+    expect(logged).toContain("GLINTS_VERIFICATION_CODE_NEEDED");
+    expect(logged).toContain(EMAIL);
+    expect(logged).toContain("scrape.glints_verification row 42");
+    expect(logged).not.toContain(CODE);
+    // The human-entered code was typed and the row settled as consumed.
+    expect(page.codeFills[0]).toBe(CODE);
+    expect(sink.settles).toEqual([
+      { id: 42, status: "consumed", submittedAt: expect.any(String) },
+    ]);
+    // The verified session is held in memory and persisted to the bucket.
+    expect(glintsSessionStore.get()).not.toBeNull();
+    const persisted = sink.sessionObjects["glints/session/current.json"];
+    expect(persisted).toBeDefined();
+    const snapshot = JSON.parse(persisted.toString("utf8"));
+    expect(snapshot.cookies).toEqual([
+      { name: "session", value: "fresh", domain: ".glints.id", path: "/" },
+    ]);
+  });
+
+  it("splits the code across single-character boxes and clicks an explicit submit", async () => {
+    const page = interstitialPage();
+    page.onClick = (selector) => {
+      if (selector.includes("send-email-verification")) {
+        page.codeInputCount = 6;
+        page.submitButtonCount = 1;
+      }
+    };
+    page.onCodeSubmit = () => {
+      page.currentUrl = "https://employers.glints.id/dashboard";
+      page.dashboardMarkerCount = 1;
+    };
+    sink.codes[42] = "654321";
+
+    await scraper.ensureAuthenticated(page, fakeContext);
+
+    expect(page.codeFills).toEqual(["6", "5", "4", "3", "2", "1"]);
+    expect(page.pressedKeys).toHaveLength(0);
+  });
+
+  it("caps code requests on the durable row timestamp without consuming the attempt budget", async () => {
+    sink.latest = {
+      id: 7,
+      requested_at: new Date().toISOString(),
+      status: "requested",
+    };
+    const page = interstitialPage();
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_WAITING/,
+    );
+    expect(sink.created).toHaveLength(0);
+    expect(page.clicked.join(" ")).not.toContain("send-email");
+
+    // Waiting is not a failed attempt: the next cycle still logs in and
+    // re-enters the flow instead of being skipped by the attempt guard.
+    const next = interstitialPage();
+    await expect(scraper.ensureAuthenticated(next, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_WAITING/,
+    );
+    expect(next.fills['input[name="email"]']).toBe(EMAIL);
+  });
+
+  it("treats a future requested_at (DB clock ahead of the host) as within-cadence", async () => {
+    sink.latest = {
+      id: 7,
+      requested_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      status: "requested",
+    };
+    const page = interstitialPage();
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_WAITING/,
+    );
+    expect(sink.created).toHaveLength(0);
+    expect(page.clicked.join(" ")).not.toContain("send-email");
+  });
+
+  it("requests a fresh code once the previous request left the cadence window", async () => {
+    sink.latest = {
+      id: 7,
+      requested_at: new Date(Date.now() - 31 * 60_000).toISOString(),
+      status: "expired",
+    };
+    const page = interstitialPage();
+
+    // No code ever arrives, so the bounded wait times out — but the request
+    // itself went through and the row was settled as expired.
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_CODE_TIMEOUT/,
+    );
+    expect(sink.created).toEqual([42]);
+    expect(sink.settles).toEqual([{ id: 42, status: "expired", submittedAt: undefined }]);
+
+    // A timeout is not a failed attempt either.
+    const next = interstitialPage();
+    sink.latest = { id: 42, requested_at: new Date().toISOString(), status: "expired" };
+    await expect(scraper.ensureAuthenticated(next, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_WAITING/,
+    );
+    expect(next.fills['input[name="email"]']).toBe(EMAIL);
+  });
+
+  it("parks the attempt budget when no service key can carry the hand-off", async () => {
+    sink.serviceAccess = false;
+    const page = interstitialPage();
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_UNAVAILABLE/,
+    );
+
+    const next = new FakeLoginPage();
+    await expect(scraper.ensureAuthenticated(next, fakeContext)).rejects.toThrow(/skipped/);
+    expect(Object.keys(next.fills)).toHaveLength(0);
+  });
+
+  it("settles the row as rejected when the portal refuses the code, never leaking it", async () => {
+    const page = interstitialPage();
+    page.onClick = (selector) => {
+      if (selector.includes("send-email-verification")) page.codeInputCount = 1;
+    };
+    // No onCodeSubmit: the page stays on /login after the code is submitted.
+    sink.codes[42] = CODE;
+
+    let thrown: Error | null = null;
+    await scraper.ensureAuthenticated(page, fakeContext).catch((e) => (thrown = e));
+
+    expect(thrown).not.toBeNull();
+    expect(thrown!.message).toContain("GLINTS_VERIFICATION_CODE_REJECTED");
+    expect(thrown!.message).not.toContain(CODE);
+    expect(sink.settles).toEqual([
+      { id: 42, status: "rejected", submittedAt: expect.any(String) },
+    ]);
+    expect(sink.uploads.length).toBeGreaterThan(0);
+  });
+
+  it("fails loudly with debug artifacts when no code input renders after the click", async () => {
+    const page = interstitialPage();
+    // onClick never renders a code input — DOM drift after the email click.
+    sink.codes[42] = CODE;
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /no code input ever rendered/,
+    );
+    expect(sink.uploads.length).toBeGreaterThan(0);
+    expect(sink.settles).toEqual([{ id: 42, status: "expired", submittedAt: undefined }]);
   });
 });
