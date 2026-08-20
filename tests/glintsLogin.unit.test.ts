@@ -224,6 +224,39 @@ describe("classifyGlintsLoginResult", () => {
     ).toBe("otp_required");
   });
 
+  it("never classifies otp_required from verification-ish words in the query string", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/dashboard?redirect=/verify",
+        visibleText: "Dashboard",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("success");
+  });
+
+  it("never classifies otp_required from ordinary path segments that merely contain a token", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/settings/devices",
+        visibleText: "Device settings",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("success");
+  });
+
+  it("classifies device-verification route segments as otp_required", () => {
+    expect(
+      classifyGlintsLoginResult({
+        url: "https://employers.glints.id/authorize/device-verification",
+        visibleText: "",
+        hasChallengeElement: false,
+        hasOtpElement: false,
+      }),
+    ).toBe("otp_required");
+  });
+
   it("never classifies otp_required from bare OTP wording without a code input", () => {
     expect(
       classifyGlintsLoginResult({
@@ -453,6 +486,20 @@ describe("Glints.ensureAuthenticated", () => {
       /GLINTS_LOGIN_FAILED/,
     );
     expect(sink.uploads.length).toBeGreaterThan(0);
+  });
+
+  it("uploads debug artifacts when the login flow itself throws mid-attempt", async () => {
+    const sink = new FakeDebugSink();
+    (scraper as any).sink = sink;
+    const page = new FakeLoginPage();
+    // A bot-check/block page served instead of the form makes the fill throw.
+    page.fillError = new Error("input[name=\"email\"] not found");
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED: credential login errored/,
+    );
+    const keys = sink.uploads.map((u) => u.key);
+    expect(keys.some((k) => k.endsWith("page.html"))).toBe(true);
   });
 
   it("keeps the original failure when the debug upload itself fails", async () => {

@@ -220,6 +220,37 @@ describe("captureLoginDebugArtifacts", () => {
     expect(capture!.finalUrl).toContain("/login");
   });
 
+  it("masks HTML-entity-escaped and percent-encoded forms of the password", async () => {
+    const trickyPassword = 'p&ss<w>"x';
+    const uploader = new FakeUploader();
+    const page = {
+      // Browsers reflect the password percent-encoded in URLs...
+      url: () => `https://employers.glints.id/login?pw=${encodeURIComponent(trickyPassword)}`,
+      screenshot: async () => Buffer.from("png-bytes"),
+      // ...and page.content() serializes reflected values entity-escaped.
+      content: async () =>
+        '<html><body><input value="p&amp;ss&lt;w&gt;&quot;x">Masuk</body></html>',
+    };
+
+    const capture = await captureLoginDebugArtifacts({
+      page,
+      portal: "glints",
+      reason: "unclassified login outcome",
+      getUploader: () => uploader,
+      secrets: [trickyPassword],
+      log: () => {},
+      now: () => new Date("2026-08-20T09:30:45.123Z"),
+    });
+
+    const html = uploader.uploads.find((u) => u.key.endsWith("page.html"))!;
+    expect(html.bytes.toString("utf8")).not.toContain("p&amp;ss&lt;w&gt;&quot;x");
+    expect(html.bytes.toString("utf8")).toContain("***");
+    expect(capture!.finalUrl).not.toContain(encodeURIComponent(trickyPassword));
+
+    const meta = uploader.uploads.find((u) => u.key.endsWith("meta.json"))!;
+    expect(meta.bytes.toString("utf8")).not.toContain(encodeURIComponent(trickyPassword));
+  });
+
   it("returns null and warns when the uploader cannot be constructed", async () => {
     const warns: string[] = [];
 

@@ -156,6 +156,39 @@ export class LoginAttemptGuard {
   }
 }
 
+/** HTML-entity-escapes text the way serialized attribute/text values appear. */
+function escapeHtmlEntities(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Expands each secret with the encoded forms it can take in captured page
+ * state: `page.content()` serializes reflected values HTML-entity-escaped, and
+ * URLs carry them percent-encoded — a literal-only mask would let those
+ * variants through.
+ */
+export function expandSecretVariants(
+  secrets: Array<string | undefined | null>,
+): string[] {
+  const expanded: string[] = [];
+  for (const secret of secrets) {
+    if (!secret) continue;
+    expanded.push(secret);
+    const html = escapeHtmlEntities(secret);
+    if (html !== secret) expanded.push(html);
+    const htmlHexQuote = html.replace(/&#39;/g, "&#x27;");
+    if (htmlHexQuote !== html) expanded.push(htmlHexQuote);
+    const encoded = encodeURIComponent(secret);
+    if (encoded !== secret) expanded.push(encoded);
+  }
+  return expanded;
+}
+
 /** Where debug artifacts land; SupabaseSink.uploadDebugArtifact satisfies it. */
 export interface LoginDebugUploader {
   /** Uploads bytes under an explicit key and returns the bucket-qualified path. */
@@ -203,7 +236,8 @@ export async function captureLoginDebugArtifacts(options: {
 }): Promise<LoginDebugCapture | null> {
   const log = options.log ?? console.error;
   const warn = options.warn ?? console.warn;
-  const mask = (text: string) => maskSecrets(text, options.secrets);
+  const secretVariants = expandSecretVariants(options.secrets);
+  const mask = (text: string) => maskSecrets(text, secretVariants);
   const tag = `[${options.portal.toUpperCase()}]`;
 
   let finalUrl: string;

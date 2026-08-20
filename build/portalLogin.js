@@ -21,7 +21,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.InMemorySessionStore = exports.captureLoginDebugArtifacts = exports.LoginAttemptGuard = exports.maskSecrets = exports.escapeRegExp = exports.loadPortalCredentials = void 0;
+exports.InMemorySessionStore = exports.captureLoginDebugArtifacts = exports.expandSecretVariants = exports.LoginAttemptGuard = exports.maskSecrets = exports.escapeRegExp = exports.loadPortalCredentials = void 0;
 /**
  * Reads `${prefix}_EMAIL` / `${prefix}_PASSWORD` from the environment.
  * @param prefix Portal env prefix, e.g. `GLINTS`.
@@ -131,6 +131,40 @@ class LoginAttemptGuard {
     }
 }
 exports.LoginAttemptGuard = LoginAttemptGuard;
+/** HTML-entity-escapes text the way serialized attribute/text values appear. */
+function escapeHtmlEntities(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+/**
+ * Expands each secret with the encoded forms it can take in captured page
+ * state: `page.content()` serializes reflected values HTML-entity-escaped, and
+ * URLs carry them percent-encoded — a literal-only mask would let those
+ * variants through.
+ */
+function expandSecretVariants(secrets) {
+    const expanded = [];
+    for (const secret of secrets) {
+        if (!secret)
+            continue;
+        expanded.push(secret);
+        const html = escapeHtmlEntities(secret);
+        if (html !== secret)
+            expanded.push(html);
+        const htmlHexQuote = html.replace(/&#39;/g, "&#x27;");
+        if (htmlHexQuote !== html)
+            expanded.push(htmlHexQuote);
+        const encoded = encodeURIComponent(secret);
+        if (encoded !== secret)
+            expanded.push(encoded);
+    }
+    return expanded;
+}
+exports.expandSecretVariants = expandSecretVariants;
 /**
  * Self-documenting evidence for login failures the classifier could not name:
  * uploads a screenshot, the full page HTML and a small meta record to
@@ -150,7 +184,8 @@ function captureLoginDebugArtifacts(options) {
         var _a, _b, _c, _d;
         const log = (_a = options.log) !== null && _a !== void 0 ? _a : console.error;
         const warn = (_b = options.warn) !== null && _b !== void 0 ? _b : console.warn;
-        const mask = (text) => maskSecrets(text, options.secrets);
+        const secretVariants = expandSecretVariants(options.secrets);
+        const mask = (text) => maskSecrets(text, secretVariants);
         const tag = `[${options.portal.toUpperCase()}]`;
         let finalUrl;
         try {

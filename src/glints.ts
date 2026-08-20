@@ -186,11 +186,28 @@ const GLINTS_OTP_PATTERN =
   /one[\s-]?time (password|code)|\botp\b|kode (otp|verifikasi)|verification code|two[\s-]?factor|\b2fa\b|verifikasi (email|perangkat|akun)|verify (your )?(email|device|identity|account)|dikirim ke (email|alamat|perangkat)|sent (a code )?to your email|\d+[\s-]?digit (code|kode)|(enter|masukkan) (the )?(kode|code)/i;
 
 /**
- * Routes the portal parks a submit on when it wants device/email verification.
- * Only consulted once the URL has left /login, so a Cloudflare interstitial
- * (which keeps the original URL) can never match.
+ * Path segments the portal parks a submit on when it wants device/email
+ * verification. Matched segment-anchored against the pathname only (query and
+ * hash never reach it), because a false positive here parks the whole login
+ * attempt budget: `/dashboard?redirect=/verify` and `/settings/devices` must
+ * classify as success. Only consulted once the URL has left /login, so a
+ * Cloudflare interstitial (which keeps the original URL) can never match.
  */
-const GLINTS_OTP_URL_PATTERN = /\/(verify|verification|otp|device|two[-_]?factor|2fa|mfa)/i;
+const GLINTS_OTP_URL_SEGMENT_PATTERN =
+  /^(verify|verification|two[-_]?factor|2fa|mfa)([-_][a-z0-9]+)*$|(^|[-_])otp([-_]|$)|^device[-_](verification|verify|confirm(ation)?|check)$/i;
+
+/** True when any pathname segment of `url` is a verification route segment. */
+function glintsUrlLooksLikeVerification(url: string): boolean {
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    pathname = url.split(/[?#]/)[0].replace(/^[a-z]+:\/\/[^/]+/i, "");
+  }
+  return pathname
+    .split("/")
+    .some((segment) => segment !== "" && GLINTS_OTP_URL_SEGMENT_PATTERN.test(segment));
+}
 
 const GLINTS_INVALID_CREDENTIALS_PATTERN =
   /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
@@ -236,8 +253,9 @@ export function classifyGlintsLoginResult(observation: {
   const otpFormRendered =
     observation.hasOtpElement && GLINTS_OTP_PATTERN.test(observation.visibleText);
   if (!observation.url.includes("/login")) {
-    const path = observation.url.replace(/^[a-z]+:\/\/[^/]+/i, "");
-    if (GLINTS_OTP_URL_PATTERN.test(path) || otpFormRendered) return "otp_required";
+    if (glintsUrlLooksLikeVerification(observation.url) || otpFormRendered) {
+      return "otp_required";
+    }
     return "success";
   }
   if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
@@ -502,6 +520,14 @@ export class Glints {
       outcome = await this.attemptCredentialLogin(page, credentials);
     } catch (error) {
       glintsLoginGuard.recordFailure("error");
+      // A blocked or never-rendered login form (e.g. a bot-check page served
+      // to the datacenter IP) surfaces here — capture what was on screen so
+      // this server-only shape self-documents too.
+      await this.captureLoginDebug(
+        page,
+        "credential login threw mid-attempt",
+        credentials,
+      );
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
         `[GLINTS] GLINTS_LOGIN_FAILED: credential login errored: ${maskSecrets(message, [credentials.password, credentials.email])}`,
