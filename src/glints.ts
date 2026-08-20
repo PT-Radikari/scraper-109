@@ -1213,7 +1213,9 @@ export class Glints {
         // cell row of applicant
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
 
-        const modalDetailButtonBelumSelesai = await page.getByText('Belum Sesuai', { exact: true });
+        // .last(): the stage tab bar behind the modal also reads "Belum
+        // Sesuai"; the modal is portaled to the end of the DOM.
+        const modalDetailButtonBelumSelesai = await page.getByText('Belum Sesuai', { exact: true }).last();
         await modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
         const modalDetail = await modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
 
