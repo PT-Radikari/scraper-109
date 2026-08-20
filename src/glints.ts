@@ -1111,7 +1111,13 @@ export class Glints {
         break;
       }
 
-      await page.goto(it.link);
+      // Some job cards now link to manage-candidates with
+      // atsTab=RECOMMENDED_TALENT, which opens the (usually empty) AI
+      // recommendations tab instead of the applicant pipeline — strip it so
+      // the page opens on the default applicants view.
+      const vacancyUrl = new URL(it.link, "https://employers.glints.id");
+      vacancyUrl.searchParams.delete("atsTab");
+      await page.goto(vacancyUrl.toString());
 
       // The candidate table hydrates well after domcontentloaded (the page
       // shows "Memuat..." for many seconds); poll until either the empty-state
