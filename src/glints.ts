@@ -1601,7 +1601,13 @@ export class Glints {
     let wa = "";
     if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").count() > 0) {
       await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").hover();
-      wa = await page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent();
+      try {
+        // Short timeout + fallback: the tooltip's inner layout drifts between
+        // dashboard revisions and a missing element must not stall the row.
+        wa = (await page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent({ timeout: 5000 })) ?? "";
+      } catch {
+        wa = "";
+      }
     }
 
 
@@ -1620,7 +1626,11 @@ export class Glints {
     let email = "";
     if (await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").count() > 0) {
       await modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").hover();
-      email = await page.getByText("Email").locator("..").locator('div > p').textContent();
+      try {
+        email = (await page.getByText("Email").locator("..").locator('div > p').textContent({ timeout: 5000 })) ?? "";
+      } catch {
+        email = "";
+      }
     }
 
     return email
