@@ -294,7 +294,9 @@ export class Glints {
     const ubahLocator = page.locator('p').filter({ hasText: GLINTS_UBAH_REGEX });
 
     const pollIntervalMs = 1000;
-    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 15000) / pollIntervalMs));
+    // A cold dashboard can hold the sidebar's company block on "Memuat..." well
+    // past 15s (observed live 2026-08); give it the run's timeout up to 45s.
+    const attempts = Math.max(1, Math.ceil(Math.min(this.TIMEOUT, 45000) / pollIntervalMs));
     for (let i = 0; i < attempts; i++) {
       try {
         if (await alreadySelected.count() > 0) return "target-selected";
@@ -354,8 +356,19 @@ export class Glints {
       return;
     }
     if (controls === "absent") {
+      // Name what actually rendered so the log alone can diagnose a redesign,
+      // an interstitial, or a renamed company.
+      let seen: string[] = [];
+      try {
+        seen = (await page.locator('p').allInnerTexts())
+          .map((t: string) => t.trim())
+          .filter(Boolean)
+          .slice(0, 20);
+      } catch {
+        // Diagnostics only — never mask the real failure.
+      }
       throw new Error(
-        `[GLINTS] target_company "${TARGET}" is configured but the dashboard rendered neither the target as the active company nor the UBAH company switcher — cannot confirm which company this session would scrape`,
+        `[GLINTS] target_company "${TARGET}" is configured but the dashboard rendered neither the target as the active company nor the UBAH company switcher — cannot confirm which company this session would scrape; paragraphs seen: ${JSON.stringify(seen)}`,
       );
     }
 
@@ -1100,7 +1113,16 @@ export class Glints {
 
       await page.goto(it.link);
 
-      await page.waitForTimeout(2000);
+      // The candidate table hydrates well after domcontentloaded (the page
+      // shows "Memuat..." for many seconds); poll until either the empty-state
+      // marker or the first applicant row renders before deciding to skip.
+      const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+      const applicantRows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
+      const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+      for (let i = 0; i < settleAttempts; i++) {
+        await page.waitForTimeout(1000);
+        if ((await emptyMarker.count()) > 0 || (await applicantRows.count()) > 0) break;
+      }
 
       // Skip job if no candidates in this stage
       if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
@@ -1267,7 +1289,7 @@ export class Glints {
     // Check if the photo element exists in the first table cell
     if (await this.applicantCells(row).nth(1).locator('//div/span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await this.applicantCells(row).nth(1).locator('//div/span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//div/span/img').first().getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
       if (linkPhoto) {
@@ -1278,7 +1300,7 @@ export class Glints {
     // Check if the photo element exists in the first table cell
     if (await this.applicantCells(row).nth(1).locator('//span/img').count() > 0) {
       // Extract the photo URL from the photo element
-      const linkPhoto = await this.applicantCells(row).nth(1).locator('//span/img').getAttribute('src');
+      const linkPhoto = await this.applicantCells(row).nth(1).locator('//span/img').first().getAttribute('src');
 
       // If the photo URL is not empty, fetch and store the photo
       if (linkPhoto) {
@@ -1298,7 +1320,8 @@ export class Glints {
    *          If the age element is empty or the input is invalid, it returns "0".
    */
   async extractDateOfBirth(row: any): Promise<string> {
-    const age = (await this.applicantCells(row).nth(2).locator('//div[2]/span').textContent())?.trim() ?? "";
+    // .first(): the cell can render several spans (badges, tooltips); the age is the first
+    const age = (await this.applicantCells(row).nth(2).locator('//div[2]/span').first().textContent())?.trim() ?? "";
 
     // If the age element is empty, return '0'
     if (age == "") {
@@ -1370,7 +1393,7 @@ export class Glints {
    *          The location is trimmed of leading and trailing spaces.
    */
   async extractLocation(row: any): Promise<string> {
-    const locationText = (await this.applicantCells(row).nth(2).locator('//div[2]/div').textContent())?.trim() ?? "";
+    const locationText = (await this.applicantCells(row).nth(2).locator('//div[2]/div').first().textContent())?.trim() ?? "";
 
     return locationText;
   }
@@ -1901,7 +1924,11 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
       const extension = mimeTypes[contentType];
 
       // Generate a file path for the stored image
-      const filePath = path.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
+      const storageDir = path.join(__dirname, "../storage/");
+      if (!fs.existsSync(storageDir)) {
+        fs.mkdirSync(storageDir, { recursive: true });
+      }
+      const filePath = path.join(storageDir, `${Date.now()}.${extension}`);
 
       // Write the image data to the file
       await fs.promises.writeFile(filePath, response.data);

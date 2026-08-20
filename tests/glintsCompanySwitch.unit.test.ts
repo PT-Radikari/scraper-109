@@ -68,6 +68,7 @@ class FakeDashboardPage {
       return this.entryLocator("option", this.entries);
     }
     return {
+      allInnerTexts: async () => ["DASHBOARD", "PT Someone Else", "Terverifikasi"],
       filter({ hasText }: { hasText: RegExp }) {
         const isUbah = /ubah/i.test(hasText.source);
         const queue = isUbah ? page.ubahCounts : page.targetCounts;
@@ -215,7 +216,7 @@ describe("Glints.selectTargetCompany", () => {
     const page = new FakeDashboardPage([0], [0]);
 
     await expect(scraper.selectTargetCompany(page as any)).rejects.toThrow(
-      /target_company "PT RADIKARI".*UBAH/s,
+      /target_company "PT RADIKARI".*UBAH.*PT Someone Else/s,
     );
   });
 
