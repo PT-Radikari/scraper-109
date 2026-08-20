@@ -33,6 +33,11 @@ export function loadPortalCredentials(
   return { email, password };
 }
 
+/** Escapes regex metacharacters so `text` can be embedded in a RegExp literally. */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * Replaces every occurrence of every secret in `text` with `***`.
  * Run this over any message that could have touched the credentials before
@@ -45,8 +50,7 @@ export function maskSecrets(
   let masked = text;
   for (const secret of secrets) {
     if (!secret) continue;
-    const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    masked = masked.replace(new RegExp(escaped, "g"), "***");
+    masked = masked.replace(new RegExp(escapeRegExp(secret), "g"), "***");
   }
   return masked;
 }

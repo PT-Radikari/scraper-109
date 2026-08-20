@@ -196,10 +196,11 @@ describe("Glints.ensureAuthenticated", () => {
     expect(Object.keys(page.fills)).toHaveLength(0);
   });
 
-  it("logs in and stores the refreshed session in memory on success", async () => {
+  it("logs in and stores the refreshed session in memory once the dashboard renders", async () => {
     const page = new FakeLoginPage();
     page.onSubmit = () => {
       page.currentUrl = "https://employers.glints.id/dashboard";
+      page.dashboardMarkerCount = 1;
     };
 
     await scraper.ensureAuthenticated(page, fakeContext);
@@ -212,6 +213,31 @@ describe("Glints.ensureAuthenticated", () => {
       { name: "session", value: "fresh", domain: ".glints.id", path: "/" },
     ]);
     expect(snapshot!.localStorage).toEqual([{ key: "glintsEmployersApp", value: "{}" }]);
+  });
+
+  it("records a failure instead of success when the submit lands on an interstitial", async () => {
+    const interstitialPage = () => {
+      const page = new FakeLoginPage();
+      page.onSubmit = () => {
+        page.currentUrl = "https://employers.glints.id/verify-otp";
+      };
+      return page;
+    };
+
+    await expect(scraper.ensureAuthenticated(interstitialPage(), fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED/,
+    );
+    expect(glintsSessionStore.get()).toBeNull();
+
+    // The guard was not reset: a second interstitial failure exhausts the cap,
+    // so the third cycle skips the attempt instead of retrying forever.
+    await expect(scraper.ensureAuthenticated(interstitialPage(), fakeContext)).rejects.toThrow(
+      /GLINTS_LOGIN_FAILED/,
+    );
+    const third = interstitialPage();
+    await expect(scraper.ensureAuthenticated(third, fakeContext)).rejects.toThrow(/skipped/);
+    expect(Object.keys(third.fills)).toHaveLength(0);
+    expect(glintsSessionStore.get()).toBeNull();
   });
 
   it("fails loudly with GLINTS_LOGIN_FAILED on rejected credentials, without leaking them", async () => {

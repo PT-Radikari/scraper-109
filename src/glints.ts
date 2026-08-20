@@ -13,6 +13,7 @@ import {
   InMemorySessionStore,
   LoginAttemptGuard,
   PortalCredentials,
+  escapeRegExp,
   loadPortalCredentials,
   maskSecrets,
 } from "./portalLogin";
@@ -166,6 +167,9 @@ const GLINTS_CHALLENGE_PATTERN =
 const GLINTS_INVALID_CREDENTIALS_PATTERN =
   /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
 
+const GLINTS_DASHBOARD_MARKER_SELECTOR =
+  '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")';
+
 const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
   'iframe[src*="captcha"]',
   'iframe[src*="geetest"]',
@@ -271,7 +275,7 @@ export class Glints {
   async waitForCompanyControls(
     page: playwright.Page,
   ): Promise<"target-selected" | "switcher" | "absent"> {
-    const TARGET_REGEX_ESCAPED = this.TARGETCOMPANY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const TARGET_REGEX_ESCAPED = escapeRegExp(this.TARGETCOMPANY);
     const alreadySelected = page.locator('p').filter({ hasText: new RegExp(`^${TARGET_REGEX_ESCAPED}$`) });
     const ubahLocator = page.locator('p').filter({ hasText: /^Ubah$/ });
 
@@ -298,7 +302,7 @@ export class Glints {
     if (!this.TARGETCOMPANY) return;
 
     const TARGET = this.TARGETCOMPANY;
-    const TARGET_REGEX_ESCAPED = TARGET.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const TARGET_REGEX_ESCAPED = escapeRegExp(TARGET);
 
     const controls = await this.waitForCompanyControls(page);
     if (controls === "target-selected") {
@@ -358,10 +362,13 @@ export class Glints {
   /**
    * Recovers from an expired/absent session by logging in with the
    * GLINTS_EMAIL / GLINTS_PASSWORD env credentials. Called when the dashboard
-   * redirected to /login. On success the refreshed cookies + localStorage are
-   * held in memory (glintsSessionStore) for the following cycles; on failure
-   * this throws one loud, credential-free error and lets the cycle fail — the
-   * continuous loop keeps cycling on its normal schedule.
+   * redirected to /login. Leaving /login alone is not success: the portal can
+   * park a submit on an interstitial (OTP route, forced password reset,
+   * onboarding), so the dashboard is re-verified first, and only then are the
+   * refreshed cookies + localStorage held in memory (glintsSessionStore) for
+   * the following cycles and the attempt guard reset. On failure this throws
+   * one loud, credential-free error and lets the cycle fail — the continuous
+   * loop keeps cycling on its normal schedule.
    *
    * Every failure path is throttled by the module-level attempt guard so a
    * wrong password or a captcha wall never becomes a login retry storm.
@@ -401,6 +408,17 @@ export class Glints {
 
     switch (outcome) {
       case "success": {
+        await page.goto("https://employers.glints.id/dashboard", {
+          waitUntil: "domcontentloaded",
+          timeout: this.TIMEOUT,
+        });
+        const landing = await this.waitForDashboardOrLogin(page);
+        if (landing !== "dashboard" || !(await this.hasDashboardMarker(page))) {
+          glintsLoginGuard.recordFailure("error");
+          throw new Error(
+            "[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (OTP, password reset, onboarding) that needs a human login",
+          );
+        }
         glintsLoginGuard.recordSuccess();
         glintsSessionStore.set({
           cookies: await context.cookies(),
@@ -517,9 +535,7 @@ export class Glints {
       try {
         if (page.url().includes("/login")) return "login";
         const markerCount = await page
-          .locator(
-            '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")',
-          )
+          .locator(GLINTS_DASHBOARD_MARKER_SELECTOR)
           .count();
         if (markerCount > 0) return "dashboard";
       } catch {
@@ -527,6 +543,21 @@ export class Glints {
       }
     }
     return page.url().includes("/login") ? "login" : "dashboard";
+  }
+
+  /**
+   * Single-shot check that a dashboard-only marker is currently rendered.
+   * Distinguishes a settle poll that actually saw the dashboard from one that
+   * timed out on an interstitial and fell back to the URL.
+   */
+  private async hasDashboardMarker(page: any): Promise<boolean> {
+    try {
+      return (
+        (await page.locator(GLINTS_DASHBOARD_MARKER_SELECTOR).count()) > 0
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** Snapshots the page's localStorage for in-memory session reuse. */
