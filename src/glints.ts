@@ -264,6 +264,18 @@ const GLINTS_VERIFICATION_CODE_INPUT_SELECTOR = [
   'input[maxlength="1"]',
 ].join(", ");
 
+/**
+ * Submits the typed code on the verification page. Captured live 2026-08-21
+ * (scrape-artifacts/glints/login-debug/2026-08-21T03-56-04-452Z/): the page
+ * carries NO `button[type="submit"]` — the blue "Verifikasi" button is a
+ * plain button behind this data-cy hook, so the credential-login submit
+ * selector silently matches nothing here and the code is never sent. The
+ * sibling `otp-resend-button-btn` / `otp-back-btn` buttons must never be
+ * clicked, which is why the text fallback is anchored on "Verifikasi" alone.
+ */
+export const GLINTS_VERIFICATION_SUBMIT_SELECTOR = '[data-cy="otp-verify-btn"]';
+export const GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = 'button:has-text("Verifikasi")';
+
 /** Private bucket object holding the persisted session snapshot. */
 const GLINTS_SESSION_OBJECT_KEY = "glints/session/current.json";
 
@@ -925,8 +937,9 @@ export class Glints {
   /**
    * Types the human-supplied code into whatever input shape the portal
    * rendered after the email-code click: one input gets the whole code, a
-   * row of single-character boxes gets one digit each. Submits via an
-   * explicit submit button when one exists, otherwise Enter on the input.
+   * row of single-character boxes gets one digit each. Submits by clicking
+   * the page's own "Verifikasi" button (GLINTS_VERIFICATION_SUBMIT_SELECTOR,
+   * text-locator fallback), and only presses Enter when neither renders.
    * The code value itself is a one-time secret and never reaches a log line.
    */
   private async enterVerificationCode(
@@ -968,22 +981,37 @@ export class Glints {
       }
     }
 
-    const submit = page.locator(GLINTS_LOGIN_SUBMIT_SELECTOR);
-    let submitCount = 0;
-    try {
-      submitCount = await submit.count();
-    } catch {
-      submitCount = 0;
-    }
-    if (submitCount > 0) {
-      await submit.first().click();
-    } else {
-      // Many OTP forms auto-submit on the last character; Enter covers the rest.
-      try {
-        await inputs.first().press("Enter");
-      } catch {
-        // Auto-submit already navigated — nothing left to press.
+    // The verification page has its own submit button (never a
+    // button[type="submit"]); the data-cy hook is the contract, the
+    // "Verifikasi" text locator covers a data-cy rename. Typing the code
+    // without clicking this leaves the page on /login and the row is then
+    // mis-settled as rejected even for a correct code.
+    for (const selector of [
+      GLINTS_VERIFICATION_SUBMIT_SELECTOR,
+      GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR,
+    ]) {
+      const submit = page.locator(selector);
+      let submitCount = 0;
+      for (let i = 0; i < 5; i++) {
+        try {
+          submitCount = await submit.count();
+        } catch {
+          submitCount = 0;
+        }
+        if (submitCount > 0) break;
+        await page.waitForTimeout(1000);
       }
+      if (submitCount === 0) continue;
+      await submit.first().click();
+      return;
+    }
+
+    // No verification submit button at all: many OTP forms auto-submit on the
+    // last character, and Enter covers the rest.
+    try {
+      await inputs.first().press("Enter");
+    } catch {
+      // Auto-submit already navigated — nothing left to press.
     }
   }
 

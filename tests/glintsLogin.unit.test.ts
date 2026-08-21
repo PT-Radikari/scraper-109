@@ -1,6 +1,8 @@
 import {
   GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR,
   GLINTS_VERIFICATION_METHOD_SELECTOR,
+  GLINTS_VERIFICATION_SUBMIT_SELECTOR,
+  GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR,
   Glints,
   GlintsConfigJson,
   classifyGlintsLoginResult,
@@ -38,8 +40,12 @@ class FakeLoginPage {
   dashboardMarkerCount = 0;
   /** Rendered verification-code inputs (0 until the email-code click). */
   codeInputCount = 0;
-  /** Rendered submit buttons reachable via locator (0 forces the Enter path). */
+  /** Rendered `button[type="submit"]` — 0 on the real verification page. */
   submitButtonCount = 0;
+  /** Rendered `[data-cy="otp-verify-btn"]` ("Verifikasi"). */
+  verifyButtonCount = 0;
+  /** Rendered `button:has-text("Verifikasi")` — the data-cy-drift fallback. */
+  verifyTextButtonCount = 0;
   fills: Record<string, string> = {};
   codeFills: string[] = [];
   pressedKeys: string[] = [];
@@ -102,13 +108,36 @@ class FakeLoginPage {
         }),
       };
     }
+    if (selector.includes("otp-verify-btn")) {
+      return {
+        count: async () => this.verifyButtonCount,
+        first: () => ({
+          click: async () => {
+            this.clicked.push(selector);
+            this.onCodeSubmit?.();
+          },
+        }),
+      };
+    }
+    if (selector.includes('has-text("Verifikasi")')) {
+      return {
+        count: async () => this.verifyTextButtonCount,
+        first: () => ({
+          click: async () => {
+            this.clicked.push(selector);
+            this.onCodeSubmit?.();
+          },
+        }),
+      };
+    }
     if (selector.includes('button[type="submit"]')) {
+      // The real verification page has none of these; clicking one submits
+      // nothing, which is exactly how the production bug looked.
       return {
         count: async () => this.submitButtonCount,
         first: () => ({
           click: async () => {
             this.clicked.push(selector);
-            this.onCodeSubmit?.();
           },
         }),
       };
@@ -861,24 +890,79 @@ describe("Glints device-verification flow", () => {
     ]);
   });
 
-  it("splits the code across single-character boxes and clicks an explicit submit", async () => {
+  /** The captured production verification page: 6 boxes + "Verifikasi". */
+  function verificationPage(overrides: (page: FakeLoginPage) => void = () => {}): FakeLoginPage {
     const page = interstitialPage();
     page.onClick = (selector) => {
-      if (selector.includes("send-email-verification")) {
-        page.codeInputCount = 6;
-        page.submitButtonCount = 1;
-      }
+      if (!selector.includes("send-email-verification")) return;
+      page.codeInputCount = 6;
+      page.verifyButtonCount = 1;
+      page.verifyTextButtonCount = 1;
+      // The real page carries no button[type="submit"] at all.
+      page.submitButtonCount = 0;
+      overrides(page);
     };
     page.onCodeSubmit = () => {
       page.currentUrl = "https://employers.glints.id/dashboard";
       page.dashboardMarkerCount = 1;
     };
+    return page;
+  }
+
+  it("splits the code across boxes and submits by clicking the Verifikasi button", async () => {
+    const page = verificationPage();
     sink.codes[42] = "654321";
 
     await scraper.ensureAuthenticated(page, fakeContext);
 
     expect(page.codeFills).toEqual(["6", "5", "4", "3", "2", "1"]);
+    // The data-cy verify button is what submitted — not the credential-login
+    // submit selector (absent here), and not a bare Enter press.
+    // The code was submitted by the verify button; the only
+    // button[type="submit"] click in the run is the earlier credential login.
+    expect(page.clicked.at(-1)).toBe(GLINTS_VERIFICATION_SUBMIT_SELECTOR);
+    expect(page.clicked.filter((s) => s.includes('type="submit"'))).toHaveLength(1);
+    expect(page.clicked.join(" ")).not.toMatch(/otp-resend|otp-back/);
     expect(page.pressedKeys).toHaveLength(0);
+  });
+
+  it("regression: a stray button[type=submit] never stands in for Verifikasi", async () => {
+    const page = verificationPage((p) => {
+      p.verifyButtonCount = 1;
+      p.submitButtonCount = 1;
+    });
+    sink.codes[42] = CODE;
+
+    await scraper.ensureAuthenticated(page, fakeContext);
+
+    // Only the credential login clicked button[type="submit"]; the code went
+    // out through the verify button even though a submit button was present.
+    expect(page.clicked.at(-1)).toBe(GLINTS_VERIFICATION_SUBMIT_SELECTOR);
+    expect(page.clicked.filter((s) => s.includes('type="submit"'))).toHaveLength(1);
+  });
+
+  it("falls back to the Verifikasi text locator when the data-cy hook drifts", async () => {
+    const page = verificationPage((p) => {
+      p.verifyButtonCount = 0;
+    });
+    sink.codes[42] = CODE;
+
+    await scraper.ensureAuthenticated(page, fakeContext);
+
+    expect(page.clicked).toContain(GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR);
+    expect(page.pressedKeys).toHaveLength(0);
+  });
+
+  it("falls back to Enter only when no verification submit button exists", async () => {
+    const page = verificationPage((p) => {
+      p.verifyButtonCount = 0;
+      p.verifyTextButtonCount = 0;
+    });
+    sink.codes[42] = CODE;
+
+    await scraper.ensureAuthenticated(page, fakeContext);
+
+    expect(page.pressedKeys).toEqual(["Enter"]);
   });
 
   it("caps code requests on the durable row timestamp without consuming the attempt budget", async () => {
@@ -975,6 +1059,21 @@ describe("Glints device-verification flow", () => {
       { id: 42, status: "rejected", submittedAt: expect.any(String) },
     ]);
     expect(sink.uploads.length).toBeGreaterThan(0);
+  });
+
+  it("still settles rejected when Verifikasi was clicked but the page stays on /login", async () => {
+    const page = verificationPage();
+    // A genuinely wrong code: the button is clicked, the page does not move.
+    page.onCodeSubmit = null;
+    sink.codes[42] = CODE;
+
+    await expect(scraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_VERIFICATION_CODE_REJECTED/,
+    );
+    expect(page.clicked).toContain(GLINTS_VERIFICATION_SUBMIT_SELECTOR);
+    expect(sink.settles).toEqual([
+      { id: 42, status: "rejected", submittedAt: expect.any(String) },
+    ]);
   });
 
   it("fails loudly with debug artifacts when no code input renders after the click", async () => {
