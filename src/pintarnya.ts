@@ -405,7 +405,7 @@ export class Pintarnya {
     console.info("Loaded email %s", this.EMAIL);
 
     this.PASSWORD = config.password;
-    console.info("Loaded password %s", this.PASSWORD);
+    console.info("Loaded password %s", this.PASSWORD ? "(set)" : "(empty)");
 
     this.LIMIT = config.limit;
     console.info("Loaded limit %O", this.LIMIT);
