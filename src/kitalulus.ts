@@ -1078,6 +1078,7 @@ export class KitaLulus {
 
       const blacklist = [
         /^lihat detail$/i,
+        /^chat$/i,
         /^belum diproses$/i,
         /^diproses$/i,
         /^ditolak$/i,
