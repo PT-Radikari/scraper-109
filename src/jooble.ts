@@ -279,7 +279,7 @@ export class Jooble {
     // SQLite path is bypassed entirely (mirrors glints).
     this.getSink();
 
-    const browser = trackBrowser(await playwright.firefox.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
     }));
