@@ -1251,23 +1251,33 @@ export class KitaLulusV2 {
    * @returns A promise that resolves when the actions are completed.
    */
   async tooltipsDashbaord(page: any): Promise<void> {
-    // tooltips dashboard
-    for (let i = 0; i < 3; i++) {
-      await page.getByRole("button", { name: "Lanjut" }).click();
+    // tooltips dashboard - click through however many "Lanjut" steps the live
+    // onboarding tour has (the step count has drifted from a hardcoded 3
+    // before and hung waiting on a step that no longer exists).
+    const lanjut = page.getByRole("button", { name: "Lanjut" });
+    while ((await lanjut.count()) > 0) {
+      await lanjut.click();
       console.info("Do lanjut...");
+      await page.waitForTimeout(300);
     }
-    await page.getByRole("button", { name: "OK" }).click();
-    console.info("Do OK...");
+    if (await page.getByRole("button", { name: "OK" }).count() > 0) {
+      await page.getByRole("button", { name: "OK" }).click();
+      console.info("Do OK...");
+    }
   }
 
   async tooltipsLowongan(page: any): Promise<void> {
-    // tooltips menu lowongan page
-    await page.getByRole("button", { name: "Lanjut" }).click();
-    console.info("Do lanjut...");
-    await page.getByRole("button", { name: "Lanjut" }).click();
-    console.info("Do lanjut...");
-    await page.getByRole("button", { name: "SELESAI" }).click();
-    console.info("Do selesai...");
+    // tooltips menu lowongan page - same drift-tolerant approach as above.
+    const lanjut = page.getByRole("button", { name: "Lanjut" });
+    while ((await lanjut.count()) > 0) {
+      await lanjut.click();
+      console.info("Do lanjut...");
+      await page.waitForTimeout(300);
+    }
+    if (await page.getByRole("button", { name: "SELESAI" }).count() > 0) {
+      await page.getByRole("button", { name: "SELESAI" }).click();
+      console.info("Do selesai...");
+    }
     if (await page.getByRole("button", { name: "OK" }).count() > 0) {
       await page.getByRole("button", { name: "OK" }).click();
       console.info("Do OK...");
