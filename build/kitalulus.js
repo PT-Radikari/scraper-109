@@ -123,6 +123,7 @@ class KitaLulus {
                 vacancy_raw: {
                     location: vacancy.location,
                     expires_at: vacancy.expiresAt,
+                    description: vacancy.description,
                 },
                 name: param.name,
                 email: param.email,
@@ -617,9 +618,45 @@ class KitaLulus {
                     pendingLink: url.toString(),
                     location,
                     expiresAt,
+                    description: null,
                 });
             }
             return vacancies;
+        });
+    }
+    /**
+     * Visits the vacancy's own detail page (`/vacancy/{vacancyId}`, reached in
+     * the dashboard via each row's "Tindakan" menu -> "Lihat detail lowongan")
+     * to read its job description — the "Lowongan" listing card and the
+     * pending-applicants view only expose title/location/expiry, never the
+     * description text. The description lives in a disabled MUI multiline
+     * textarea, so the visible "Deskripsi pekerjaan" label's associated
+     * textarea is read via `inputValue()` (its content is the field's value,
+     * not rendered child text, so `innerText()` on the label's container comes
+     * back empty). Verified live against three real vacancies (2026-09-07).
+     * Any navigation or selector failure is swallowed so a detail-page layout
+     * change degrades to a missing description instead of failing the whole
+     * vacancy.
+     */
+    extractVacancyDescription(page, vacancy) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const detailUrl = new URL(`/vacancy/${vacancy.vacancyId}`, this.BASE_URL);
+            try {
+                yield page.goto(detailUrl.toString(), { waitUntil: "domcontentloaded" });
+                yield this.dismissMarketingOverlay(page).catch(() => undefined);
+                const label = page.getByText("Deskripsi pekerjaan", { exact: true }).first();
+                if ((yield label.count()) === 0) {
+                    console.warn(`[VACANCY] No description field found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
+                    return null;
+                }
+                const textarea = label.locator("xpath=following::textarea[1]");
+                const text = ((yield textarea.inputValue().catch(() => "")) || "").trim();
+                return text || null;
+            }
+            catch (error) {
+                console.warn(`[VACANCY] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);
+                return null;
+            }
         });
     }
     // Methods of the product (optional)
@@ -678,6 +715,7 @@ class KitaLulus {
                         break;
                     }
                     console.info(`[VACANCY] Processing "${vacancy.title}" (${vacancy.vacancyId})...`);
+                    vacancy.description = yield this.extractVacancyDescription(page, vacancy);
                     yield page.goto(vacancy.pendingLink, { waitUntil: "domcontentloaded" });
                     yield page.waitForTimeout(1500);
                     console.info("[TOOLTIP] Handling pelamar page tooltips...");
