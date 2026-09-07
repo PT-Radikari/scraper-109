@@ -2,6 +2,7 @@ import playwright from "playwright";
 import fs from "fs";
 import axios from "axios";
 import path from "path";
+import crypto from "crypto";
 import FormData from "form-data";
 import type sqlite3 from 'sqlite3';
 import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
@@ -279,7 +280,7 @@ export class Jooble {
     // SQLite path is bypassed entirely (mirrors glints).
     this.getSink();
 
-    const browser = trackBrowser(await playwright.firefox.launch({
+    const browser = trackBrowser(await playwright.chromium.launch({
       headless: this.HEADLESS,
       slowMo: this.SLOWMO,
     }));
@@ -319,6 +320,24 @@ export class Jooble {
     }
 
     for (const it of listVacancyPage) {
+      // Write the job posting itself, independent of whether it has any
+      // applicants yet. Description isn't captured yet - the vacancy list
+      // only exposes title+link, and the linked page is the applicant list,
+      // not a job-description view; a real description selector needs
+      // verifying against a live vacancy before it's added here.
+      try {
+        await this.getSink().upsertVacancy({
+          portal: "jooble",
+          portal_vacancy_id: crypto.createHash("sha1").update(`jooble${it.link}`).digest("hex"),
+          title: it.title,
+          link: it.link,
+          status: "open",
+          raw: { type: "vacancy", description: null },
+        });
+      } catch (error) {
+        console.error("[JOOBLE] Failed to upsert vacancy posting:", error instanceof Error ? error.message : error);
+      }
+
       if (this.LIMIT != 0) {
         if (this.COLLECTED >= this.LIMIT) {
           break;

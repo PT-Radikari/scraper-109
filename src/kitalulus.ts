@@ -1078,6 +1078,7 @@ export class KitaLulus {
 
       const blacklist = [
         /^lihat detail$/i,
+        /^chat$/i,
         /^belum diproses$/i,
         /^diproses$/i,
         /^ditolak$/i,
@@ -1568,8 +1569,11 @@ export class KitaLulus {
    *                              If the email address is not found, an empty string is returned.
    */
   async extractEmail(page: any): Promise<string> {
+    // The applicant detail page currently renders both the email and the phone
+    // number under the same lbApplicantEmailText test-id; the email is always
+    // the first match.
     if (await page.locator(this.APPLICANT_EMAIL_SELECTOR).count() > 0) {
-      return await page.locator(this.APPLICANT_EMAIL_SELECTOR).textContent();
+      return await page.locator(this.APPLICANT_EMAIL_SELECTOR).first().textContent();
     }
     return "";
   }

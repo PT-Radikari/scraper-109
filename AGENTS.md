@@ -37,6 +37,11 @@ This file is the project's committed home for project-intrinsic agent knowledge:
 - The direct sink path deliberately does **not** mirror rows into the central Supabase ingestion: `src/central/portalBridge.ts` stays wired only to the legacy SQLite insert path. Do not re-add `ingestPortalApplicant`/`ingestPortalVacancy` calls to the sink path.
 - The mirrored `talent_scraping` tables are populated database-side: a SECURITY DEFINER trigger on `scrape.portal_candidates` (`atlas/migrations/20260818090000_project_talent_scraping.sql`) projects each candidate write. Client code never touches the `talent_scraping` schema and anon has no grants there — do not add client-side writes to it.
 
+## Local smoke-testing the portals
+
+- A fresh worktree has no `.env` (only `.env.sample`), so `SCORING_SUPABASE_URL`/`ANON_KEY`/`SERVICE_KEY` are unset. Glints, Jooble, SEEK, Pintarnya and kitalulus-v1 all call `getSink()` (`new SupabaseSink()`) as the *first* line of `Scrape()` by design ("fail fast... mirrors glints" — see each portal's `Scrape()`), so all five throw `SupabaseSink: SCORING_SUPABASE_URL is required` before launching a browser or attempting login. This is not a portal auth/selector problem; it needs a real `.env` (not committed, and none of the git-ignored runtime files carry it either) before any of those five portals can be smoke-tested end to end.
+- kitalulus-v2 is the exception (still on the legacy `api_destination`, no Supabase gate) and does launch a real browser. Its post-login flow assumes an onboarding product tour of exactly 3 "Lanjut" clicks then "OK" (`tooltipsDashbaord`, `src/kitalulus-v2.ts:1253-1261`) and a second tooltip flow of 2 "Lanjut" + "SELESAI" (`tooltipsLowongan`, same file ~1263-1274). A 2026-09-05 smoke run got through login and 2 of the 3 first-tour clicks, then hung on `getByRole('button', { name: 'Lanjut' })` for the full 120s Playwright timeout — i.e. auth succeeded and the dashboard loaded, but the tour selector count no longer matches the live UI. Treat a hang here as tour-selector drift, not a credential problem, and check the click count against the current dashboard before assuming the session is dead.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.
