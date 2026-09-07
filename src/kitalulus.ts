@@ -114,9 +114,10 @@ type VacancyPage = { title: string; link: string, link_recommendation: string };
 
 /**
  * One open vacancy with pending applicants, read from the "Lowongan"
- * dashboard listing. `location`/`expiresAt` are the only free-text fields the
- * card exposes; the employer dashboard's list/recommendation views carry no
- * job-description field reachable read-only (see AGENTS.md sharp edges).
+ * dashboard listing. `location`/`expiresAt` come from the card itself;
+ * `description` is filled in separately from the vacancy's own detail page
+ * (see `extractVacancyDescription`), since the card only carries title,
+ * location and expiry.
  */
 type OpenVacancy = {
   vacancyId: string;
@@ -124,6 +125,7 @@ type OpenVacancy = {
   pendingLink: string;
   location: string | null;
   expiresAt: string | null;
+  description: string | null;
 };
 
 /**
@@ -239,6 +241,7 @@ export class KitaLulus {
       vacancy_raw: {
         location: vacancy.location,
         expires_at: vacancy.expiresAt,
+        description: vacancy.description,
       },
       name: param.name,
       email: param.email,
@@ -769,10 +772,43 @@ export class KitaLulus {
         pendingLink: url.toString(),
         location,
         expiresAt,
+        description: null,
       });
     }
 
     return vacancies;
+  }
+
+  /**
+   * Visits the vacancy's own detail page to read its job description — the
+   * "Lowongan" listing card and the pending-applicants view only expose
+   * title/location/expiry, never the description text. Looks for the
+   * "Deskripsi Pekerjaan" ("Job Description") heading the detail page
+   * renders and reads the text block right after it; any navigation or
+   * selector failure is swallowed so a detail-page layout change degrades to
+   * a missing description instead of failing the whole vacancy.
+   */
+  async extractVacancyDescription(page: playwright.Page, vacancy: OpenVacancy): Promise<string | null> {
+    const detailUrl = new URL("/lowongan/detail", this.BASE_URL);
+    detailUrl.searchParams.set("vacancy_id", vacancy.vacancyId);
+
+    try {
+      await page.goto(detailUrl.toString(), { waitUntil: "domcontentloaded" });
+      await this.dismissMarketingOverlay(page).catch(() => undefined);
+
+      const heading = page.getByText(/deskripsi pekerjaan|job description/i).first();
+      if ((await heading.count()) === 0) {
+        console.warn(`[VACANCY] No description heading found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
+        return null;
+      }
+
+      const container = heading.locator("xpath=following::*[1]");
+      const text = ((await container.innerText().catch(() => "")) || "").trim();
+      return text || null;
+    } catch (error) {
+      console.warn(`[VACANCY] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);
+      return null;
+    }
   }
 
   // Methods of the product (optional)
@@ -838,6 +874,7 @@ export class KitaLulus {
         }
 
         console.info(`[VACANCY] Processing "${vacancy.title}" (${vacancy.vacancyId})...`);
+        vacancy.description = await this.extractVacancyDescription(page, vacancy);
         await page.goto(vacancy.pendingLink, { waitUntil: "domcontentloaded" });
         await page.waitForTimeout(1500);
 
