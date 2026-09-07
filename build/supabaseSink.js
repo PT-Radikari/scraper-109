@@ -87,10 +87,13 @@ const MIME_TYPES = {
  */
 class SupabaseSink {
     constructor(config) {
-        var _a, _b, _c, _d, _e, _f;
+        var _a, _b, _c, _d, _e, _f, _g, _h;
         this.url = ((_b = (_a = config === null || config === void 0 ? void 0 : config.url) !== null && _a !== void 0 ? _a : process.env.SCORING_SUPABASE_URL) !== null && _b !== void 0 ? _b : "").replace(/\/+$/, "");
         this.anonKey = (_d = (_c = config === null || config === void 0 ? void 0 : config.anonKey) !== null && _c !== void 0 ? _c : process.env.SCORING_SUPABASE_ANON_KEY) !== null && _d !== void 0 ? _d : "";
         this.bucket = (_f = (_e = config === null || config === void 0 ? void 0 : config.bucket) !== null && _e !== void 0 ? _e : process.env.SCORING_SUPABASE_BUCKET) !== null && _f !== void 0 ? _f : "scrape-artifacts";
+        this.serviceKey = (_h = (_g = config === null || config === void 0 ? void 0 : config.serviceKey) !== null && _g !== void 0 ? _g : process.env.SCORING_SUPABASE_SERVICE_KEY) !== null && _h !== void 0 ? _h : null;
+        if (this.serviceKey === "")
+            this.serviceKey = null;
         if (!this.url) {
             throw new Error("SupabaseSink: SCORING_SUPABASE_URL is required");
         }
@@ -101,6 +104,25 @@ class SupabaseSink {
     headers(extra = {}) {
         return Object.assign({ apikey: this.anonKey, Authorization: `Bearer ${this.anonKey}`, "Content-Type": "application/json", "Accept-Profile": "scrape", "Content-Profile": "scrape" }, extra);
     }
+    /**
+     * Whether the service-only surfaces (verification hand-off, session-object
+     * persistence) are usable. Callers must check this instead of letting a
+     * missing key surface as a request failure mid-flow.
+     */
+    hasServiceAccess() {
+        return this.serviceKey !== null;
+    }
+    /**
+     * Headers for the service-only surfaces. The service key bypasses RLS, so
+     * nothing here may ever be reachable from scraped-content code paths;
+     * keep its use confined to the verification table and the session object.
+     */
+    serviceHeaders(extra = {}) {
+        if (!this.serviceKey) {
+            throw new SupabaseSinkError("SupabaseSink: SCORING_SUPABASE_SERVICE_KEY is required for this operation");
+        }
+        return Object.assign({ apikey: this.serviceKey, Authorization: `Bearer ${this.serviceKey}`, "Content-Type": "application/json", "Accept-Profile": "scrape", "Content-Profile": "scrape" }, extra);
+    }
     guard(operation, run) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
@@ -108,6 +130,34 @@ class SupabaseSink {
             }
             catch (error) {
                 throw sanitizeSinkError(error, operation);
+            }
+        });
+    }
+    /**
+     * Retries an idempotent request a few times on a transient gateway error
+     * (502/503/504) before giving up. Storage uploads are content-addressed
+     * (uploadArtifactBytes) or timestamp-keyed (uploadDebugArtifact), so a
+     * retried POST is safe: it either recreates the same object or is rejected
+     * as a duplicate by the bucket's own dedupe check.
+     */
+    withTransientRetry(run_1) {
+        return __awaiter(this, arguments, void 0, function* (run, attempts = 3) {
+            var _a;
+            for (let attempt = 1;; attempt++) {
+                try {
+                    return yield run();
+                }
+                catch (error) {
+                    // Duck-typed rather than axios.isAxiosError(): callers' own duplicate-
+                    // detection also inspects this same error afterwards, and axios's real
+                    // check is a mocked one-shot in tests, so a second call here would
+                    // consume it before that later check runs.
+                    const status = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.status;
+                    const transient = status !== undefined && [502, 503, 504].includes(status);
+                    if (!transient || attempt >= attempts)
+                        throw error;
+                    yield new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+                }
             }
         });
     }
@@ -292,18 +342,20 @@ class SupabaseSink {
     uploadArtifactBytes(portal, kind, bytes, extension) {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("uploadArtifact", () => __awaiter(this, void 0, void 0, function* () {
-                var _a;
                 const digest = crypto_1.default.createHash("sha256").update(bytes).digest("hex");
                 const ext = extension.replace(/^\./, "").toLowerCase();
                 const month = new Date().toISOString().slice(0, 7).replace("-", "");
                 const key = `${portal}/${month}/${digest}.${ext}`;
                 try {
-                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-                        headers: {
-                            apikey: this.anonKey,
-                            Authorization: `Bearer ${this.anonKey}`,
-                            "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
-                        },
+                    yield this.withTransientRetry(() => {
+                        var _a;
+                        return axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                            headers: {
+                                apikey: this.anonKey,
+                                Authorization: `Bearer ${this.anonKey}`,
+                                "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
+                            },
+                        });
                     });
                 }
                 catch (error) {
@@ -329,13 +381,13 @@ class SupabaseSink {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("uploadDebugArtifact", () => __awaiter(this, void 0, void 0, function* () {
                 try {
-                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                    yield this.withTransientRetry(() => axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
                         headers: {
                             apikey: this.anonKey,
                             Authorization: `Bearer ${this.anonKey}`,
                             "Content-Type": contentType,
                         },
-                    });
+                    }));
                 }
                 catch (error) {
                     const response = axios_1.default.isAxiosError(error) ? error.response : undefined;
@@ -389,6 +441,130 @@ class SupabaseSink {
                 patch.finished_at = (_a = meta.finished_at) !== null && _a !== void 0 ? _a : new Date().toISOString();
                 yield axios_1.default.patch(`${this.url}/rest/v1/scrape_runs?id=eq.${runId}`, patch, {
                     headers: this.headers({ Prefer: "return=representation" }),
+                });
+            }));
+        });
+    }
+    /**
+     * Opens one device-verification hand-off: inserts a `requested` row into
+     * scrape.glints_verification for a human to fill with the emailed code.
+     * Service-key only — the table has no anon grants.
+     * @returns the numeric id of the new row, for the operator log line.
+     */
+    createVerificationRequest() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("createVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/glints_verification`, [{ status: "requested" }], { headers: this.serviceHeaders({ Prefer: "return=representation" }) });
+                return Number(response.data[0].id);
+            }));
+        });
+    }
+    /**
+     * The most recently opened verification request, regardless of status.
+     * Drives the code-request rate cap: a recent row means a code email went
+     * out not long ago, so the scraper must not click "send code" again yet —
+     * and the DB timestamp survives container restarts where module state
+     * would not.
+     */
+    latestVerificationRequest() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("latestVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.get(`${this.url}/rest/v1/glints_verification`, {
+                    headers: this.serviceHeaders(),
+                    params: { select: "id,requested_at,status", order: "requested_at.desc", limit: 1 },
+                });
+                const row = response.data[0];
+                if (!row)
+                    return null;
+                return {
+                    id: Number(row.id),
+                    requested_at: String(row.requested_at),
+                    status: String(row.status),
+                };
+            }));
+        });
+    }
+    /**
+     * Reads back one verification row while polling for the human-entered code.
+     * The code value is a one-time secret: callers submit it to the portal and
+     * must never write it into a log line or an error message.
+     */
+    readVerificationRequest(id) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("readVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.get(`${this.url}/rest/v1/glints_verification`, {
+                    headers: this.serviceHeaders(),
+                    params: { select: "code,status", id: `eq.${id}`, limit: 1 },
+                });
+                const row = response.data[0];
+                if (!row)
+                    return null;
+                return {
+                    code: typeof row.code === "string" && row.code.trim() !== "" ? row.code.trim() : null,
+                    status: String(row.status),
+                };
+            }));
+        });
+    }
+    /**
+     * Settles one verification row: `consumed` once its code logged the scraper
+     * in, `rejected` when the portal refused the code, `expired` when the
+     * bounded wait ran out. submitted_at records when the code was used.
+     */
+    settleVerificationRequest(id, status, submittedAt) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("settleVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const patch = { status };
+                if (submittedAt !== undefined)
+                    patch.submitted_at = submittedAt;
+                yield axios_1.default.patch(`${this.url}/rest/v1/glints_verification?id=eq.${id}`, patch, {
+                    headers: this.serviceHeaders({ Prefer: "return=minimal" }),
+                });
+            }));
+        });
+    }
+    /**
+     * Downloads one private object from the artifact bucket (the persisted
+     * session snapshot). Service-key only: the bucket deliberately has no anon
+     * SELECT policy. A missing object resolves to null instead of throwing so
+     * first boot falls through to the credential login path.
+     */
+    downloadPrivateObject(key) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("downloadPrivateObject", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                try {
+                    const response = yield axios_1.default.get(`${this.url}/storage/v1/object/${this.bucket}/${key}`, {
+                        headers: this.serviceHeaders(),
+                        responseType: "arraybuffer",
+                    });
+                    return Buffer.from(response.data);
+                }
+                catch (error) {
+                    const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
+                    if (status === 404 || status === 400)
+                        return null;
+                    throw error;
+                }
+            }));
+        });
+    }
+    /**
+     * Uploads (and overwrites) one private object in the artifact bucket.
+     * x-upsert makes re-persisting the session snapshot idempotent; anon cannot
+     * do this because overwrite needs UPDATE, which only the service key has.
+     */
+    uploadPrivateObject(key, bytes, contentType) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("uploadPrivateObject", () => __awaiter(this, void 0, void 0, function* () {
+                const auth = this.serviceHeaders();
+                yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                    headers: {
+                        apikey: auth.apikey,
+                        Authorization: auth.Authorization,
+                        "Content-Type": contentType,
+                        "x-upsert": "true",
+                    },
                 });
             }));
         });
