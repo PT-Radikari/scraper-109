@@ -48,6 +48,13 @@ export interface SinkApplicant {
   url_profile?: string | null;
   /** The page URL shared by every candidate row on the vacancy page. */
   vacancy_url?: string | null;
+  /**
+   * Extra portal-native vacancy metadata (e.g. location, expiry) spread into
+   * `portal_vacancies.raw` alongside the generic `{type: "applicant"}` marker.
+   * `raw.description` is the agreed slot for a real job-description string
+   * once a portal can source one; omit the key entirely when it can't.
+   */
+  vacancy_raw?: Record<string, unknown> | null;
   name?: string | null;
   email?: string | null;
   phone?: string | null;
@@ -129,7 +136,7 @@ export async function sendApplicantToSink(
       title: a.applied_for,
       link: a.vacancy_link ?? a.vacancy_url ?? null,
       status: "new",
-      raw: { type: "applicant" },
+      raw: { type: "applicant", ...(a.vacancy_raw ?? {}) },
     });
 
     const candidateRowId = await sink.upsertCandidate({
