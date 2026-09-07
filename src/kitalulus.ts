@@ -780,30 +780,34 @@ export class KitaLulus {
   }
 
   /**
-   * Visits the vacancy's own detail page to read its job description — the
-   * "Lowongan" listing card and the pending-applicants view only expose
-   * title/location/expiry, never the description text. Looks for the
-   * "Deskripsi Pekerjaan" ("Job Description") heading the detail page
-   * renders and reads the text block right after it; any navigation or
-   * selector failure is swallowed so a detail-page layout change degrades to
-   * a missing description instead of failing the whole vacancy.
+   * Visits the vacancy's own detail page (`/vacancy/{vacancyId}`, reached in
+   * the dashboard via each row's "Tindakan" menu -> "Lihat detail lowongan")
+   * to read its job description — the "Lowongan" listing card and the
+   * pending-applicants view only expose title/location/expiry, never the
+   * description text. The description lives in a disabled MUI multiline
+   * textarea, so the visible "Deskripsi pekerjaan" label's associated
+   * textarea is read via `inputValue()` (its content is the field's value,
+   * not rendered child text, so `innerText()` on the label's container comes
+   * back empty). Verified live against three real vacancies (2026-09-07).
+   * Any navigation or selector failure is swallowed so a detail-page layout
+   * change degrades to a missing description instead of failing the whole
+   * vacancy.
    */
   async extractVacancyDescription(page: playwright.Page, vacancy: OpenVacancy): Promise<string | null> {
-    const detailUrl = new URL("/lowongan/detail", this.BASE_URL);
-    detailUrl.searchParams.set("vacancy_id", vacancy.vacancyId);
+    const detailUrl = new URL(`/vacancy/${vacancy.vacancyId}`, this.BASE_URL);
 
     try {
       await page.goto(detailUrl.toString(), { waitUntil: "domcontentloaded" });
       await this.dismissMarketingOverlay(page).catch(() => undefined);
 
-      const heading = page.getByText(/deskripsi pekerjaan|job description/i).first();
-      if ((await heading.count()) === 0) {
-        console.warn(`[VACANCY] No description heading found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
+      const label = page.getByText("Deskripsi pekerjaan", { exact: true }).first();
+      if ((await label.count()) === 0) {
+        console.warn(`[VACANCY] No description field found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
         return null;
       }
 
-      const container = heading.locator("xpath=following::*[1]");
-      const text = ((await container.innerText().catch(() => "")) || "").trim();
+      const textarea = label.locator("xpath=following::textarea[1]");
+      const text = ((await textarea.inputValue().catch(() => "")) || "").trim();
       return text || null;
     } catch (error) {
       console.warn(`[VACANCY] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);

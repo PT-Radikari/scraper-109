@@ -222,18 +222,18 @@ describe("KitaLulus — pure helper functions", () => {
       description: null,
     };
 
-    function makeMockPage(overlayVisible: boolean, headingCount: number, innerText: string) {
+    function makeMockPage(overlayVisible: boolean, labelCount: number, textareaValue: string) {
       const registerText = { count: jest.fn().mockResolvedValue(overlayVisible ? 1 : 0) };
-      const heading = {
-        count: jest.fn().mockResolvedValue(headingCount),
-        locator: jest.fn().mockReturnValue({ innerText: jest.fn().mockResolvedValue(innerText) }),
+      const label = {
+        count: jest.fn().mockResolvedValue(labelCount),
+        locator: jest.fn().mockReturnValue({ inputValue: jest.fn().mockResolvedValue(textareaValue) }),
       };
-      const headingWrapper = { first: jest.fn().mockReturnValue(heading) };
+      const labelWrapper = { first: jest.fn().mockReturnValue(label) };
 
       return {
         goto: jest.fn().mockResolvedValue(undefined),
         getByRole: jest.fn().mockReturnValue({ count: jest.fn().mockResolvedValue(0) }),
-        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(headingWrapper),
+        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(labelWrapper),
         keyboard: { press: jest.fn().mockResolvedValue(undefined) },
       } as unknown as playwright.Page;
     }
@@ -248,13 +248,13 @@ describe("KitaLulus — pure helper functions", () => {
       const description = await detailScraper.extractVacancyDescription(page, vacancy);
 
       expect(page.goto).toHaveBeenCalledWith(
-        "https://kitalulus.example.com/lowongan/detail?vacancy_id=abc123",
+        "https://kitalulus.example.com/vacancy/abc123",
         { waitUntil: "domcontentloaded" },
       );
       expect(description).toBe("Real job description text");
     });
 
-    it("returns null when no description heading is found on the detail page", async () => {
+    it("returns null when no description field is found on the detail page", async () => {
       const page = makeMockPage(false, 0, "");
 
       const description = await detailScraper.extractVacancyDescription(page, vacancy);
