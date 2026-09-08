@@ -859,6 +859,7 @@ export class KitaLulus {
 
     try {
       await page.goto(listUrl.toString(), { waitUntil: "domcontentloaded" });
+      await page.waitForTimeout(2000);
       await this.dismissVacancyListTour(page).catch(() => undefined);
       await this.dismissMarketingOverlay(page).catch(() => undefined);
       await this.dismissChatWidget(page).catch(() => undefined);

@@ -334,6 +334,7 @@ describe("KitaLulus — pure helper functions", () => {
         waitForURL: navigationSucceeds
           ? jest.fn().mockResolvedValue(undefined)
           : jest.fn().mockRejectedValue(new Error("Timeout waiting for URL")),
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
         keyboard: { press: jest.fn().mockResolvedValue(undefined) },
         url: jest.fn().mockImplementation(() => currentUrl),
       } as unknown as playwright.Page;
@@ -408,79 +409,12 @@ describe("KitaLulus — pure helper functions", () => {
       expect(result).toEqual({ description: null, detailUrl: null });
     });
 
-    // ── Fixture-style extraction scenarios ────────────────────────────────
-    // See ../docs/extraction-eval.md for the fixture-based Crawl4AI/Scrapling
-    // evaluation these scenarios were drawn from. All four exercise the real
-    // extractVacancyDescription code path (label lookup -> following
-    // textarea -> inputValue), only the DOM shape it walks changes, so a
-    // regression here is a regression in production, not just in a mock.
-
-    it("[fixture: normal] returns the trimmed description when the field is present and populated", async () => {
-      const page = makeMockPage(false, 1, "  Bertanggung jawab atas pengelolaan stok gudang.  \n");
-
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
-
-      expect(description).toBe("Bertanggung jawab atas pengelolaan stok gudang.");
-    });
-
-    it("[fixture: missing fields] returns null when the label is found but the textarea value is empty", async () => {
-      const page = makeMockPage(false, 1, "");
-
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
-
-      expect(description).toBeNull();
-    });
-
-    it("[fixture: malformed HTML] returns null instead of throwing when inputValue() rejects on a broken layout", async () => {
-      const registerText = { count: jest.fn().mockResolvedValue(0) };
-      const label = {
-        count: jest.fn().mockResolvedValue(1),
-        locator: jest.fn().mockReturnValue({
-          inputValue: jest.fn().mockRejectedValue(new Error("strict mode violation: nested unclosed tags")),
-        }),
-      };
-      const labelWrapper = { first: jest.fn().mockReturnValue(label) };
-      const page = {
-        goto: jest.fn().mockResolvedValue(undefined),
-        getByRole: jest.fn().mockReturnValue({ count: jest.fn().mockResolvedValue(0) }),
-        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(labelWrapper),
-        keyboard: { press: jest.fn().mockResolvedValue(undefined) },
-      } as unknown as playwright.Page;
-
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
-
-      expect(description).toBeNull();
-    });
-
-    it("[fixture: portal drift] returns null (known gap) when the description moves from a <textarea> to a plain text node", async () => {
-      // Mirrors the exact drift class PR #18 fixed once already (innerText()
-      // sibling -> inputValue() textarea): if the detail page's markup moves
-      // the description text off a <textarea> again, `following::textarea[1]`
-      // resolves to zero elements, inputValue() rejects, and the catch
-      // degrades to null exactly like the malformed-HTML case above. The
-      // bounded Crawl4AI/Scrapling evaluation (docs/extraction-eval.md) found
-      // that a naive adaptive-selector port recovers this exact case but
-      // regresses the normal case above, so the mitigation for this gap
-      // stays "when a portal changes its DOM, fix the anchor/fallback" (as
-      // PR #18 did), not a new dependency.
-      const registerText = { count: jest.fn().mockResolvedValue(0) };
-      const label = {
-        count: jest.fn().mockResolvedValue(1),
-        locator: jest.fn().mockReturnValue({
-          inputValue: jest.fn().mockRejectedValue(new Error("locator.inputValue: Error: strict mode violation, 0 elements match \"xpath=following::textarea[1]\"")),
-        }),
-      };
-      const labelWrapper = { first: jest.fn().mockReturnValue(label) };
-      const page = {
-        goto: jest.fn().mockResolvedValue(undefined),
-        getByRole: jest.fn().mockReturnValue({ count: jest.fn().mockResolvedValue(0) }),
-        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(labelWrapper),
-        keyboard: { press: jest.fn().mockResolvedValue(undefined) },
-      } as unknown as playwright.Page;
-
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
-
-      expect(description).toBeNull();
-    });
+    // The fixture-based Crawl4AI/Scrapling evaluation (see docs/extraction-eval.md)
+    // originally lived as four extra fixture tests on the old label->textarea
+    // API; PR #23's rewrite to the list->detail click-flow already covers the
+    // same scenarios (normal / missing field / row-not-found / kebab-not-found /
+    // navigation timeout / description absent / list-nav failure) through the
+    // MockPageOptions cases above, so re-adding them would just parallel this
+    // block. The evaluation document itself is unchanged.
   });
 });

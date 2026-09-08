@@ -124,6 +124,8 @@ class KitaLulus {
                     location: vacancy.location,
                     expires_at: vacancy.expiresAt,
                     description: vacancy.description,
+                    detail_url: vacancy.detailUrl,
+                    pending_applicant_count: vacancy.pendingApplicantCount,
                 },
                 name: param.name,
                 email: param.email,
@@ -618,44 +620,127 @@ class KitaLulus {
                     pendingLink: url.toString(),
                     location,
                     expiresAt,
+                    pendingApplicantCount: pendingCount,
                     description: null,
+                    detailUrl: null,
                 });
             }
             return vacancies;
         });
     }
     /**
-     * Visits the vacancy's own detail page (`/vacancy/{vacancyId}`, reached in
-     * the dashboard via each row's "Tindakan" menu -> "Lihat detail lowongan")
-     * to read its job description — the "Lowongan" listing card and the
-     * pending-applicants view only expose title/location/expiry, never the
-     * description text. The description lives in a disabled MUI multiline
-     * textarea, so the visible "Deskripsi pekerjaan" label's associated
-     * textarea is read via `inputValue()` (its content is the field's value,
-     * not rendered child text, so `innerText()` on the label's container comes
-     * back empty). Verified live against three real vacancies (2026-09-07).
-     * Any navigation or selector failure is swallowed so a detail-page layout
-     * change degrades to a missing description instead of failing the whole
-     * vacancy.
+     * Dismisses the "Lowongan" (vacancy list) page's own onboarding tour
+     * (react-joyride, rendered as an MUI `role="alertdialog"` box: 3x
+     * "Lanjut" then "SELESAI" then "OK" on a first-ever visit this session —
+     * verified live 2026-09-08). Distinct from `dismissMarketingOverlay`'s
+     * "HR LEADER GATHERING" promo and from `tooltipsDashbaord`'s dashboard
+     * tour: this one only appears after navigating to `/vacancy` and blocks
+     * every click on the page (a full-viewport `[data-test-id="overlay"]`)
+     * until it is dismissed via its own buttons — never remove that overlay
+     * node directly, it is React-owned and forcing it out from under a live
+     * component crashes the app's error boundary ("Terjadi Kendala Teknis").
+     * Bounded to a handful of iterations so a page with no tour, or a tour
+     * whose step count changes, doesn't loop forever.
+     */
+    dismissVacancyListTour(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            for (let i = 0; i < 6; i++) {
+                const dialog = page.locator('[role="alertdialog"]').first();
+                if ((yield dialog.count()) === 0)
+                    return;
+                yield dialog.getByRole("button").last().click({ timeout: 3000 }).catch(() => undefined);
+                yield page.waitForTimeout(500);
+            }
+        });
+    }
+    /**
+     * Closes the "Chat Kandidat" marketing widget (a `<getsitecontrol-widget>`
+     * custom element with an open shadow root) that floats over the bottom
+     * of every dashboard page and can sit on top of a vacancy row's action
+     * menu. Playwright's CSS engine pierces open shadow roots, so the real
+     * `button.close` inside it is reachable directly — no need to reach into
+     * the shadow root manually or force-remove the element.
+     */
+    dismissChatWidget(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const closeButton = page.locator("button.close").first();
+            if ((yield closeButton.count()) > 0) {
+                yield closeButton.click({ timeout: 3000 }).catch(() => undefined);
+            }
+        });
+    }
+    /**
+     * Reads a vacancy's real job description, and confirms its real detail
+     * URL, by clicking through the dashboard's own UI exactly as an employer
+     * would: open the "Lowongan" list, open this vacancy row's "Tindakan"
+     * action menu (an unlabeled MUI icon button — its accessible name is the
+     * following menu, not the button itself, so it's found positionally as
+     * the row's last button, scoped to the row found via this vacancy's own
+     * pending-applicants link), and click the menu's "Lihat detail lowongan"
+     * item via its accessible role+text (`role="menuitem"`, exact text —
+     * verified live 2026-09-08, also carries `data-test-id="btnVacancyListDetailVacancy"`
+     * as a secondary anchor, but the accessible locator is primary per the
+     * requirement to avoid brittle generated CSS classes). This replaces the
+     * prior direct `page.goto('/vacancy/{id}')` (correct URL shape, but never
+     * verified as the *real*, currently-generated detail link, and blind to a
+     * row whose detail action moves or is removed) with navigation the UI
+     * itself produced. The "Lowongan" listing card and the pending-applicants
+     * view never expose the description text — the "Deskripsi pekerjaan"
+     * label's associated textarea is read via `inputValue()`, since its
+     * content is the field's value, not rendered child text.
+     *
+     * Any missing row, missing action, missing description field, or
+     * navigation timeout degrades to a null description (and null detailUrl)
+     * instead of failing the whole vacancy — a detail-page or list-page
+     * layout change should cost one vacancy's description, never the run.
      */
     extractVacancyDescription(page, vacancy) {
         return __awaiter(this, void 0, void 0, function* () {
-            const detailUrl = new URL(`/vacancy/${vacancy.vacancyId}`, this.BASE_URL);
+            const empty = { description: null, detailUrl: null };
+            const listUrl = new URL("/vacancy", this.BASE_URL);
             try {
-                yield page.goto(detailUrl.toString(), { waitUntil: "domcontentloaded" });
+                yield page.goto(listUrl.toString(), { waitUntil: "domcontentloaded" });
+                yield page.waitForTimeout(2000);
+                yield this.dismissVacancyListTour(page).catch(() => undefined);
+                yield this.dismissMarketingOverlay(page).catch(() => undefined);
+                yield this.dismissChatWidget(page).catch(() => undefined);
+                const pendingLink = page
+                    .locator(`a[href*="vacancy_id=${vacancy.vacancyId}"][href*="active_tab_secondary=PENDING"]`)
+                    .first();
+                if ((yield pendingLink.count()) === 0) {
+                    console.warn(`[VACANCY] Vacancy ${vacancy.vacancyId} not found on the Lowongan list; leaving raw.description empty.`);
+                    return empty;
+                }
+                const row = pendingLink.locator("xpath=ancestor::tr[1]");
+                const kebab = row.locator("td").last().locator("button").last();
+                if ((yield kebab.count()) === 0) {
+                    console.warn(`[VACANCY] No action menu found on vacancy ${vacancy.vacancyId}'s row; leaving raw.description empty.`);
+                    return empty;
+                }
+                yield kebab.scrollIntoViewIfNeeded();
+                yield kebab.click({ timeout: 5000 });
+                const detailAction = page.getByRole("menuitem", { name: "Lihat detail lowongan", exact: true });
+                if ((yield detailAction.count()) === 0) {
+                    console.warn(`[VACANCY] No "Lihat detail lowongan" action found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
+                    return empty;
+                }
+                yield detailAction.click({ timeout: 5000 });
+                yield page.waitForURL((url) => url.toString().includes(`/vacancy/${vacancy.vacancyId}`), {
+                    timeout: this.TIMEOUT,
+                });
                 yield this.dismissMarketingOverlay(page).catch(() => undefined);
                 const label = page.getByText("Deskripsi pekerjaan", { exact: true }).first();
                 if ((yield label.count()) === 0) {
                     console.warn(`[VACANCY] No description field found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
-                    return null;
+                    return { description: null, detailUrl: page.url() };
                 }
                 const textarea = label.locator("xpath=following::textarea[1]");
                 const text = ((yield textarea.inputValue().catch(() => "")) || "").trim();
-                return text || null;
+                return { description: text || null, detailUrl: page.url() };
             }
             catch (error) {
                 console.warn(`[VACANCY] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);
-                return null;
+                return empty;
             }
         });
     }
@@ -715,7 +800,9 @@ class KitaLulus {
                         break;
                     }
                     console.info(`[VACANCY] Processing "${vacancy.title}" (${vacancy.vacancyId})...`);
-                    vacancy.description = yield this.extractVacancyDescription(page, vacancy);
+                    const detail = yield this.extractVacancyDescription(page, vacancy);
+                    vacancy.description = detail.description;
+                    vacancy.detailUrl = detail.detailUrl;
                     yield page.goto(vacancy.pendingLink, { waitUntil: "domcontentloaded" });
                     yield page.waitForTimeout(1500);
                     console.info("[TOOLTIP] Handling pelamar page tooltips...");
