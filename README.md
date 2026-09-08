@@ -148,6 +148,17 @@ Toggle "Auto (hourly)" to have the viewer re-run every scraper once an hour inst
 
 The dashboard also embeds a PageAgent AI chat panel backed by `/api/ai/*`, a loopback-only proxy to `https://9router.aryahanif.xyz/v1` that keeps the upstream API key off the client. Set `NINE_ROUTER_KEY` (or `API_KEY`) in `.env` to enable it.
 
+The same page also renders a **scraping-progress dashboard** (`src/dashboardData.ts`, `/api/dashboard/*`) that reads the central `scrape.*` schema over PostgREST with the anon key — a read-only view independent of the local start/stop controls above, unaffected by which portals this machine happens to be running. It needs `SCORING_SUPABASE_URL`/`SCORING_SUPABASE_ANON_KEY` in `.env`; without them the section shows a "not configured" state instead of erroring. It covers:
+
+- **Portal overview**: Kitalulus, Glints and Jobstreet/SEEK as active; Jooble and Pintarnya always listed and explicitly marked disabled, never hidden.
+- **Per-portal status** (queued/running/completed/partial/auth_expired/failed) derived from the latest `scrape.scrape_runs` row — the writer only ever records `running`/`success`/`failed`, so `partial`/`auth_expired` are inferred from that row's error text, not a richer stored enum.
+- **Per-portal metrics**: last run, next run, duration, vacancies seen, descriptions captured, candidates seen, applications linked, CVs downloaded/uploaded, errors.
+- **Job postings and candidate tables**, each with its own search/filter and a per-portal failure that doesn't block the other sections; job descriptions only ever expose a computed present/absent badge, never the raw jsonb payload, and candidate identity is masked email/phone before it leaves the server.
+- **Run detail view**: `scrape_runs` timeline for a portal with per-stage errors and retry count.
+- A signed-CV-link action that mints the URL server-side only (`POST /api/dashboard/sign-url`): the route re-validates the object key against the candidate row with the anon key before calling Storage with the service key, so the service key never reaches the browser.
+
+Each section polls independently with an in-flight guard so overlapping requests are dropped rather than queued.
+
 ---
 
 ### Individual Scrapers (development mode)

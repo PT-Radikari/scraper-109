@@ -196,6 +196,15 @@ describe("getCandidates", () => {
     expect(rows[0].cvStatus).toBe("captured");
     expect(rows[0].applicationStatus).toBe("linked");
   });
+
+  it("sends a PostgREST-valid parenthesized or= filter when searching", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValue({ data: [] } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    await getCandidates(config, { search: "Ada" });
+    const callParams = mockedAxios.get.mock.calls[0][1]?.params as Record<string, string>;
+    expect(callParams.or).toBe("(name.ilike.*Ada*,email.ilike.*Ada*)");
+  });
 });
 
 describe("getSignedUrl", () => {
