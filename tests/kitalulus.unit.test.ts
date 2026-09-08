@@ -209,70 +209,203 @@ describe("KitaLulus — pure helper functions", () => {
     });
   });
 
-  // ── extractVacancyDescription ────────────────────────────────────────────
+  // ── extractVacancyDescription (list -> detail click-flow) ─────────────────
+  //
+  // Captain correction (2026-09-08): the prior version of this method
+  // constructed `/vacancy/{vacancyId}` directly. It now clicks through the
+  // real employer UI — open the Lowongan list, open the vacancy row's
+  // "Tindakan" action menu, click the accessible "Lihat detail lowongan"
+  // menu item, and land on whatever detail URL the UI itself produces —
+  // verified live against real vacancies on 2026-09-08 (see
+  // docs/kitalulus-description-flow.md). These mocks model that same
+  // sequence: goto(list) -> dismiss list tour/overlay/chat widget -> find
+  // the row via its pending-applicants link -> click its kebab -> click the
+  // menuitem -> waitForURL -> read the "Deskripsi pekerjaan" textarea.
 
   describe("extractVacancyDescription", () => {
     let detailScraper: KitaLulus;
-    const vacancy = {
+    const vacancy: {
+      vacancyId: string;
+      title: string;
+      pendingLink: string;
+      location: string | null;
+      expiresAt: string | null;
+      pendingApplicantCount: number | null;
+      description: string | null;
+      detailUrl: string | null;
+    } = {
       vacancyId: "abc123",
       title: "Sales Executive",
       pendingLink: "https://kitalulus.example.com/pending?vacancy_id=abc123",
       location: "Jakarta",
       expiresAt: "2026-12-31",
+      pendingApplicantCount: 5,
       description: null,
+      detailUrl: null,
     };
 
-    function makeMockPage(overlayVisible: boolean, labelCount: number, textareaValue: string) {
-      const registerText = { count: jest.fn().mockResolvedValue(overlayVisible ? 1 : 0) };
+    type MockPageOptions = {
+      /** Row for this vacancy exists on the Lowongan list. */
+      rowFound?: boolean;
+      /** The row's action-menu (kebab) button exists. */
+      kebabFound?: boolean;
+      /** The opened menu has a "Lihat detail lowongan" item. */
+      detailActionFound?: boolean;
+      /** waitForURL after clicking the detail action resolves vs. times out. */
+      navigationSucceeds?: boolean;
+      /** "Deskripsi pekerjaan" label exists on the detail page. */
+      labelFound?: boolean;
+      textareaValue?: string;
+      /** goto(list) itself rejects (e.g. connection refused). */
+      listNavigationFails?: boolean;
+    };
+
+    function makeMockPage(opts: MockPageOptions = {}) {
+      const {
+        rowFound = true,
+        kebabFound = true,
+        detailActionFound = true,
+        navigationSucceeds = true,
+        labelFound = true,
+        textareaValue = "  Real job description text  \n",
+        listNavigationFails = false,
+      } = opts;
+
+      let currentUrl = "https://kitalulus.example.com/vacancy";
+
+      const kebab = {
+        count: jest.fn().mockResolvedValue(kebabFound ? 1 : 0),
+        scrollIntoViewIfNeeded: jest.fn().mockResolvedValue(undefined),
+        click: jest.fn().mockResolvedValue(undefined),
+      };
+      // row.locator("td") -> lastTd.locator("button") -> kebab, mirroring the
+      // real `row.locator("td").last().locator("button").last()` chain.
+      const buttonLocator = { last: jest.fn().mockReturnValue(kebab) };
+      const lastTd = { locator: jest.fn().mockReturnValue(buttonLocator) };
+      const tdLocator = { last: jest.fn().mockReturnValue(lastTd) };
+      const row = {
+        locator: jest.fn().mockReturnValue(tdLocator),
+      };
+      const pendingLink = {
+        count: jest.fn().mockResolvedValue(rowFound ? 1 : 0),
+        locator: jest.fn().mockReturnValue(row),
+      };
+      const pendingLinkWrapper = { first: jest.fn().mockReturnValue(pendingLink) };
+
+      const detailAction = {
+        count: jest.fn().mockResolvedValue(detailActionFound ? 1 : 0),
+        click: jest.fn().mockImplementation(async () => {
+          currentUrl = `https://kitalulus.example.com/vacancy/${vacancy.vacancyId}`;
+        }),
+      };
+
       const label = {
-        count: jest.fn().mockResolvedValue(labelCount),
+        count: jest.fn().mockResolvedValue(labelFound ? 1 : 0),
         locator: jest.fn().mockReturnValue({ inputValue: jest.fn().mockResolvedValue(textareaValue) }),
       };
       const labelWrapper = { first: jest.fn().mockReturnValue(label) };
 
-      return {
-        goto: jest.fn().mockResolvedValue(undefined),
-        getByRole: jest.fn().mockReturnValue({ count: jest.fn().mockResolvedValue(0) }),
-        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(labelWrapper),
+      const alertdialog = { count: jest.fn().mockResolvedValue(0) };
+      const alertdialogWrapper = { first: jest.fn().mockReturnValue(alertdialog) };
+      const chatWidgetClose = { count: jest.fn().mockResolvedValue(0), click: jest.fn().mockResolvedValue(undefined) };
+      const chatWidgetCloseWrapper = { first: jest.fn().mockReturnValue(chatWidgetClose) };
+      const registerText = { count: jest.fn().mockResolvedValue(0) };
+      const emptyLocator = { count: jest.fn().mockResolvedValue(0), first: jest.fn() };
+      emptyLocator.first.mockReturnValue(emptyLocator);
+
+      const page = {
+        goto: listNavigationFails
+          ? jest.fn().mockRejectedValue(new Error("net::ERR_CONNECTION_REFUSED"))
+          : jest.fn().mockResolvedValue(undefined),
+        locator: jest.fn().mockImplementation((selector: string) => {
+          if (selector === '[role="alertdialog"]') return alertdialogWrapper;
+          if (selector === "button.close") return chatWidgetCloseWrapper;
+          if (selector.startsWith(`a[href*="vacancy_id=${vacancy.vacancyId}"]`)) return pendingLinkWrapper;
+          return emptyLocator;
+        }),
+        getByRole: jest.fn().mockImplementation((role: string, opts2?: { name?: string }) => {
+          if (role === "menuitem" && opts2?.name === "Lihat detail lowongan") return detailAction;
+          return { count: jest.fn().mockResolvedValue(0) };
+        }),
+        getByText: jest.fn().mockImplementation((matcher: unknown) => {
+          if (matcher === "Deskripsi pekerjaan") return labelWrapper;
+          return registerText;
+        }),
+        waitForURL: navigationSucceeds
+          ? jest.fn().mockResolvedValue(undefined)
+          : jest.fn().mockRejectedValue(new Error("Timeout waiting for URL")),
         keyboard: { press: jest.fn().mockResolvedValue(undefined) },
+        url: jest.fn().mockImplementation(() => currentUrl),
       } as unknown as playwright.Page;
+
+      return page;
     }
 
     beforeAll(() => {
       detailScraper = new KitaLulus({ ...makeConfig(tempDir), base_url: "https://kitalulus.example.com" });
     });
 
-    it("navigates to the vacancy's own detail page and returns its trimmed description text", async () => {
-      const page = makeMockPage(false, 1, "  Real job description text  \n");
+    it("[fixture: normal] clicks list -> kebab -> 'Lihat detail lowongan' and returns the trimmed description plus the real detail URL", async () => {
+      const page = makeMockPage();
 
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
 
-      expect(page.goto).toHaveBeenCalledWith(
-        "https://kitalulus.example.com/vacancy/abc123",
-        { waitUntil: "domcontentloaded" },
-      );
-      expect(description).toBe("Real job description text");
+      expect(page.goto).toHaveBeenCalledWith("https://kitalulus.example.com/vacancy", { waitUntil: "domcontentloaded" });
+      expect(result).toEqual({
+        description: "Real job description text",
+        detailUrl: "https://kitalulus.example.com/vacancy/abc123",
+      });
     });
 
-    it("returns null when no description field is found on the detail page", async () => {
-      const page = makeMockPage(false, 0, "");
+    it("[fixture: missing detail link] returns nulls when the row's action menu has no 'Lihat detail lowongan' item", async () => {
+      const page = makeMockPage({ detailActionFound: false });
 
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
 
-      expect(description).toBeNull();
+      expect(result).toEqual({ description: null, detailUrl: null });
     });
 
-    it("returns null instead of throwing when navigation fails", async () => {
-      const page = {
-        goto: jest.fn().mockRejectedValue(new Error("net::ERR_CONNECTION_REFUSED")),
-        getByRole: jest.fn(),
-        getByText: jest.fn(),
-        keyboard: { press: jest.fn() },
-      } as unknown as playwright.Page;
+    it("[fixture: missing detail link] returns nulls when the vacancy's row is not found on the list at all", async () => {
+      const page = makeMockPage({ rowFound: false });
 
-      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
 
-      expect(description).toBeNull();
+      expect(result).toEqual({ description: null, detailUrl: null });
+    });
+
+    it("[fixture: missing detail link] returns nulls when the row has no action-menu (kebab) button", async () => {
+      const page = makeMockPage({ kebabFound: false });
+
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(result).toEqual({ description: null, detailUrl: null });
+    });
+
+    it("[fixture: navigation timeout] returns nulls when the detail page never finishes navigating", async () => {
+      const page = makeMockPage({ navigationSucceeds: false });
+
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(result).toEqual({ description: null, detailUrl: null });
+    });
+
+    it("[fixture: description absent] returns a null description but a confirmed detailUrl when the detail page has no description field", async () => {
+      const page = makeMockPage({ labelFound: false });
+
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(result).toEqual({
+        description: null,
+        detailUrl: "https://kitalulus.example.com/vacancy/abc123",
+      });
+    });
+
+    it("returns nulls instead of throwing when navigating to the Lowongan list itself fails", async () => {
+      const page = makeMockPage({ listNavigationFails: true });
+
+      const result = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(result).toEqual({ description: null, detailUrl: null });
     });
 
     // ── Fixture-style extraction scenarios ────────────────────────────────
