@@ -629,6 +629,12 @@ export class Seek {
       });
       await this.checkLazyLoadedElement(page, "body");
       await page.waitForLoadState("networkidle", { timeout: this.TIMEOUT }).catch(() => {});
+      if (await this.isLoginPage(page)) {
+        const loginSucceeded = await this.loginWithCredentials(page);
+        if (!loginSucceeded) {
+          throw new Error("[SEEK] Session expired while returning to candidates page after vacancy enumeration — refresh cookies/local_storage or credentials in seek.json");
+        }
+      }
 
       const applicants = await this.extractVisibleApplicants(page, vacancies.map((v) => v.title));
       console.info(`[SEEK] Extracted ${applicants.length} visible applicant(s) from ${page.url()}.`);
