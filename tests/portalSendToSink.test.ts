@@ -284,4 +284,84 @@ describe("KitaLulus.sendToSink", () => {
     expect(candidate.data.contact.contact_number).toBe("62812000111");
     expect(scraper.getCollectedCount()).toBe(1);
   });
+
+  // Regression test for the portal_vacancies pollution bug: a pre-fix build
+  // of this scraper (main@288de3f) called sendToSink with a bare list-page
+  // URL string instead of a real vacancy, so sendApplicantToSink's
+  // `a.vacancy_id` was always empty and fell back to hashing
+  // `portal + applied_for` — and `applied_for` itself came from the
+  // candidate table row's own text (name/age/city/salary), not a job title.
+  // The result: one portal_vacancies row per CANDIDATE, titled with the
+  // candidate's own summary text, keyed by a 40-hex-char SHA1 instead of
+  // KitaLulus' short alphanumeric vacancy id. Ingesting an applicant must
+  // never be able to reproduce that shape.
+  it("upserts the real vacancy (not a candidate-derived hash row) for every applicant, however candidate-like the applicant's own fields look", async () => {
+    const config: KitaLulusConfigJson = {
+      headless: true,
+      limit: 0,
+      base_url: "https://employer.kitalulus.com",
+      email: "",
+      password: "",
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: dbPathForSource("kitalulus.db"),
+    };
+    const scraper = new KitaLulus(config);
+    const sink = buildMockSink();
+    (scraper as unknown as { sink: unknown }).sink = sink;
+
+    const vacancy = {
+      vacancyId: "N5qqxwo7ONN",
+      title: "Kurir Motor Apotek - Bandung",
+      pendingLink: "https://employer.kitalulus.com/applicants?vacancy_id=N5qqxwo7ONN",
+      location: "Kota Bandung",
+      expiresAt: "07 Oct 2026",
+      description: "Mengantar pesanan obat ke pelanggan menggunakan motor.",
+    } as Parameters<KitaLulus["sendToSink"]>[1];
+
+    // A real applicant row's own cell text looks exactly like the polluted
+    // titles observed in production ("<Name><age> tahun<City>IDR ... / Bulan").
+    await scraper.sendToSink(
+      {
+        portal: "kita_lulus",
+        type: "applicant",
+        applied_for: vacancy.title,
+        applied_date: "2026-09-07",
+        name: "Rahmadewi Roskarlina",
+        nick_name: "",
+        summary: "Rahmadewi Roskarlina28 tahunKota BengkuluKec. Muara Bangka HuluIDR 3.500.000 / Bulan",
+        email: "rahmadewi@example.com",
+        whatapps: { type: "whatsapp", contact_number: "" },
+        age: "28",
+        date_of_birth: "",
+        salary_expectation: "IDR 3.500.000 / Bulan",
+        workExperience: [],
+        education: [],
+        skill: [],
+        location: "Kota Bengkulu",
+        photo: "",
+        cv: "",
+        cv_filename: "",
+        cv_text: "",
+        cv_url: "",
+        cv_ocr_method: "",
+        gender: "FEMALE",
+        reference_link: [],
+        page_url: "https://employer.kitalulus.com/applicant/detail/99",
+      } as Parameters<KitaLulus["sendToSink"]>[0],
+      vacancy,
+    );
+
+    expect(sink.upsertVacancy).toHaveBeenCalledTimes(1);
+    const vacancyRow = sink.upsertVacancy.mock.calls[0][0];
+    // The real, short KitaLulus vacancy id — never the candidate-derived
+    // 40-hex-char SHA1 hash sendApplicantToSink falls back to when
+    // `vacancy_id` is empty.
+    expect(vacancyRow.portal_vacancy_id).toBe("N5qqxwo7ONN");
+    expect(vacancyRow.portal_vacancy_id).not.toMatch(/^[0-9a-f]{40}$/);
+    expect(vacancyRow.title).toBe("Kurir Motor Apotek - Bandung");
+    expect(vacancyRow.title).not.toContain("Rahmadewi");
+    expect(vacancyRow.raw.description).toBe(vacancy.description);
+  });
 });
