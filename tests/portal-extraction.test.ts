@@ -160,7 +160,7 @@ describe("portal extraction helpers", () => {
     };
 
     const page = {
-      evaluate: async (callback: () => unknown) => {
+      evaluate: async (callback: (...args: any[]) => unknown, ...args: any[]) => {
         const previousDocument = (global as any).document;
         const previousLocation = (global as any).location;
         (global as any).document = {
@@ -171,7 +171,7 @@ describe("portal extraction helpers", () => {
           href: "https://id.employer.seek.com/candidates",
         };
         try {
-          return callback();
+          return callback(...args);
         } finally {
           (global as any).document = previousDocument;
           (global as any).location = previousLocation;

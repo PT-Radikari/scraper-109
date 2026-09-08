@@ -45,6 +45,13 @@ export interface SeekConfigJson {
   db_path: string;
   timeout?: number;
   slowmo?: number;
+  /**
+   * Employer dashboard route(s) that list job ad postings, tried in order
+   * until one yields postings with numeric ids. Unverified against a live
+   * session as of this writing (see AGENTS.md) — override here once the
+   * real route is confirmed, without a code change.
+   */
+  job_ads_urls?: string[];
 }
 
 /**
@@ -96,6 +103,23 @@ type Education = {
  */
 type VacancyPage = { title: string; link: string };
 
+/**
+ * One job ad posting read from the employer dashboard's job-postings
+ * listing. `vacancyId` is SEEK's own numeric job id (the same id that
+ * appears in the public `id.jobstreet.com/job/{id}` URL — see AGENTS.md for
+ * why that public URL is a fixture reference only, never a scrape target).
+ * `description` is filled in separately by visiting `detailUrl` on the
+ * employer dashboard itself, since the listing card never carries the full
+ * text.
+ */
+export type OpenVacancy = {
+  vacancyId: string;
+  title: string;
+  location: string | null;
+  detailUrl: string;
+  description: string | null;
+};
+
 export class Seek {
   private HEADLESS: boolean = true;
   private LIMIT: number = 0;
@@ -109,7 +133,13 @@ export class Seek {
   private TIMEOUT: number = 60000;
   private SLOWMO: number = 1000;
   private COLLECTED: number = 0;
+  private VACANCIES_SEEN: number = 0;
   private sink: SupabaseSink | null = null;
+  private JOB_ADS_URLS: string[] = [
+    "https://id.employer.seek.com/jobs",
+    "https://id.employer.seek.com/job-ads",
+    "https://id.employer.seek.com/manage-jobs",
+  ];
 
   /**
    * Represents a Seek object.
@@ -127,6 +157,7 @@ export class Seek {
     this.DB_PATH = path.join(__dirname, config.db_path);
     this.TIMEOUT = config.timeout ?? this.TIMEOUT;
     this.SLOWMO = config.slowmo ?? this.SLOWMO;
+    this.JOB_ADS_URLS = config.job_ads_urls?.length ? config.job_ads_urls : this.JOB_ADS_URLS;
     console.info("CONFIG SEEK LOADED");
   }
 
@@ -201,9 +232,9 @@ export class Seek {
     return this.sink;
   }
 
-  /** Number of vacancy pages discovered by this run (seek scrapes one shared candidates page). */
+  /** Number of job ad postings discovered by this run. */
   getVacanciesSeen(): number {
-    return 0;
+    return this.VACANCIES_SEEN;
   }
 
   /** Number of applicants successfully persisted by this run. */
@@ -216,16 +247,28 @@ export class Seek {
    * direct-sink slice (see src/portalSink.ts). page_url is candidate-specific
    * only when the row carried its own link; passing the shared candidates-page
    * URL as vacancy_url keeps the identity ladder from keying everyone to it.
+   *
+   * When `vacancy` is a real posting matched from `extractJobPostings`, the
+   * applicant is linked to it by SEEK's own numeric id and rides its
+   * `raw.description` along (same vacancy_raw contract kitalulus uses).
+   * Falls back to the shared candidates-page URL as vacancy_url when no
+   * posting could be matched, preserving the previous behavior.
    * @param param - The applicant data to be persisted.
    * @param vacancyUrl - The candidates page URL shared by every row.
+   * @param vacancy - The real job posting this applicant applied for, if matched.
    */
-  async sendToSink(param: Applicant, vacancyUrl: string): Promise<void> {
+  async sendToSink(param: Applicant, vacancyUrl: string, vacancy?: OpenVacancy | null): Promise<void> {
     await sendApplicantToSink(this.getSink(), {
       portal: param.portal,
+      vacancy_id: vacancy?.vacancyId,
       applied_for: param.applied_for,
       applied_date: param.applied_date,
       url_profile: param.page_url,
+      vacancy_link: vacancy?.detailUrl ?? null,
       vacancy_url: vacancyUrl,
+      vacancy_raw: vacancy
+        ? { location: vacancy.location, description: vacancy.description }
+        : null,
       name: param.name,
       email: param.email,
       phone: param.phone,
@@ -237,6 +280,24 @@ export class Seek {
       raw: { type: param.type, salary_expectation: param.salary_expectation },
     });
     this.COLLECTED++;
+  }
+
+  /**
+   * Persists one job posting's `raw.description` independent of any
+   * applicant — the separation contract PR #18 established for kitalulus
+   * (vacancy and candidate/application rows are distinct writes). Safe to
+   * call even for a posting with zero applicants yet.
+   * @param vacancy - The posting to upsert.
+   */
+  async sendVacancyToSink(vacancy: OpenVacancy): Promise<void> {
+    await this.getSink().upsertVacancy({
+      portal: "seek",
+      portal_vacancy_id: vacancy.vacancyId,
+      title: vacancy.title,
+      link: vacancy.detailUrl,
+      status: "new",
+      raw: { type: "vacancy", location: vacancy.location, description: vacancy.description },
+    });
   }
 
   async createApplicantsTable(): Promise<void> {
@@ -364,6 +425,139 @@ export class Seek {
   }
 
   /**
+   * Reads the employer dashboard's job-ads listing and returns every posting
+   * found, keyed by SEEK's own numeric job id (the id also visible in the
+   * public `id.jobstreet.com/job/{id}` URL for that same ad). `JOB_ADS_URLS`
+   * is tried in order and the first route that yields at least one posting
+   * wins; each candidate anchor's href is scanned for a `/job/<digits>`
+   * (or a bare numeric-id) pattern rather than a fixed CSS selector, since
+   * the exact listing markup has not been verified against a live
+   * authenticated session (see AGENTS.md "Local smoke-testing the portals").
+   * Returns an empty array — logging every route tried — rather than
+   * throwing, so an unrecognised dashboard layout degrades the run instead
+   * of failing it outright.
+   */
+  async extractJobPostings(page: playwright.Page): Promise<OpenVacancy[]> {
+    const jobIdPattern = /\/job\/(\d{5,})|[?&]jobId=(\d{5,})|[?&]adId=(\d{5,})/i;
+
+    for (const listingUrl of this.JOB_ADS_URLS) {
+      try {
+        await page.goto(listingUrl, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+      } catch (error) {
+        console.warn(`[SEEK] Could not load job-ads listing at ${listingUrl}: ${String(error)}`);
+        continue;
+      }
+
+      if (await this.isLoginPage(page)) {
+        console.warn(`[SEEK] ${listingUrl} redirected to login; skipping.`);
+        continue;
+      }
+
+      await page.waitForLoadState("networkidle", { timeout: this.TIMEOUT }).catch(() => {});
+
+      const postings = await page.evaluate((pattern: string) => {
+        const idRegex = new RegExp(pattern, "i");
+        const text = (element: Element | null | undefined) => element?.textContent?.replace(/\s+/g, " ").trim() ?? "";
+        const seen = new Set<string>();
+        const results: { vacancyId: string; title: string; location: string | null; href: string }[] = [];
+
+        for (const anchor of Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"))) {
+          const href = anchor.getAttribute("href") ?? "";
+          const match = href.match(idRegex);
+          const vacancyId = match ? (match[1] ?? match[2] ?? match[3]) : null;
+          if (!vacancyId || seen.has(vacancyId)) continue;
+          seen.add(vacancyId);
+
+          const card = anchor.closest("article, li, tr, [class*='card' i], [class*='row' i]") ?? anchor;
+          const cardText = text(card);
+          const anchorText = text(anchor);
+          const lines = cardText.split(/\s{2,}|\n/).map((l) => l.trim()).filter(Boolean);
+          const title = anchorText.length > 0 && anchorText.length <= 120 ? anchorText : (lines[0] ?? "");
+
+          results.push({
+            vacancyId,
+            title: title || `SEEK vacancy ${vacancyId}`,
+            location: lines.find((l) => l !== title && /,|Jakarta|Surabaya|Bandung|Bali|Medan/i.test(l)) ?? null,
+            href,
+          });
+        }
+
+        return results;
+      }, jobIdPattern.source);
+
+      if (postings.length === 0) {
+        console.info(`[SEEK] No job postings with a recognisable id found at ${listingUrl}.`);
+        continue;
+      }
+
+      console.info(`[SEEK] Found ${postings.length} job posting(s) at ${listingUrl}.`);
+      return postings.map((posting) => ({
+        vacancyId: posting.vacancyId,
+        title: posting.title,
+        location: posting.location,
+        detailUrl: new URL(posting.href, listingUrl).toString(),
+        description: null,
+      }));
+    }
+
+    console.warn(
+      `[SEEK] No job postings found via any known listing route (${this.JOB_ADS_URLS.join(", ")}). ` +
+      "Dashboard selectors need live verification (see AGENTS.md); continuing without vacancy enrichment.",
+    );
+    return [];
+  }
+
+  /**
+   * Visits a job posting's own detail page on the employer dashboard and
+   * reads its full description. SEEK's public candidate-facing job pages
+   * (id.jobstreet.com) render the description under
+   * `[data-automation="jobAdDetails"]`; the employer dashboard is expected to
+   * share the same component library, so that selector is tried first, with
+   * a heading-text fallback for a differently-shaped page. Any navigation or
+   * selector failure is swallowed so one posting's layout drift degrades to
+   * a missing description instead of failing the whole run.
+   * @param page - The page to navigate.
+   * @param vacancy - The posting whose detail page should be opened.
+   */
+  async extractVacancyDescription(page: playwright.Page, vacancy: OpenVacancy): Promise<string | null> {
+    try {
+      await page.goto(vacancy.detailUrl, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+
+      const primary = page.locator('[data-automation="jobAdDetails"]').first();
+      if ((await primary.count()) > 0) {
+        const text = ((await primary.innerText().catch(() => "")) || "").trim();
+        if (text) return text;
+      }
+
+      const heading = page.getByText(/job description|deskripsi pekerjaan/i).first();
+      if ((await heading.count()) > 0) {
+        const container = heading.locator("xpath=following::*[1]");
+        const text = ((await container.innerText().catch(() => "")) || "").trim();
+        if (text) return text;
+      }
+
+      console.warn(`[SEEK] No description found on ${vacancy.detailUrl}; leaving raw.description empty.`);
+      return null;
+    } catch (error) {
+      console.warn(`[SEEK] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Best-effort match of a scraped applicant to one of this run's known job
+   * postings, by looking for a posting title inside the applicant's own
+   * `applied_for` text (case-insensitive substring). Returns null rather
+   * than guessing when nothing matches, so an unmatched applicant still
+   * falls back to the shared candidates-page vacancy_url in `sendToSink`.
+   */
+  matchVacancy(appliedFor: string, vacancies: OpenVacancy[]): OpenVacancy | null {
+    if (!appliedFor) return null;
+    const normalized = appliedFor.toLowerCase();
+    return vacancies.find((v) => v.title && normalized.includes(v.title.toLowerCase())) ?? null;
+  }
+
+  /**
    * Scrapes data from the Jooble website.
    * @returns A Promise that resolves when the scraping is complete.
    */
@@ -420,7 +614,23 @@ export class Seek {
         }
       }
 
-      const applicants = await this.extractVisibleApplicants(page);
+      const vacancies = await this.extractJobPostings(page);
+      this.VACANCIES_SEEN = vacancies.length;
+      for (const vacancy of vacancies) {
+        vacancy.description = await this.extractVacancyDescription(page, vacancy);
+        await this.sendVacancyToSink(vacancy);
+      }
+
+      // extractJobPostings/extractVacancyDescription navigate away from the
+      // candidates page; return to it before reading applicants.
+      await page.goto("https://id.employer.seek.com/candidates", {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+      await this.checkLazyLoadedElement(page, "body");
+      await page.waitForLoadState("networkidle", { timeout: this.TIMEOUT }).catch(() => {});
+
+      const applicants = await this.extractVisibleApplicants(page, vacancies.map((v) => v.title));
       console.info(`[SEEK] Extracted ${applicants.length} visible applicant(s) from ${page.url()}.`);
       if (applicants.length === 0) {
         const bodyText = (await page.locator("body").textContent().catch(() => "")) ?? "";
@@ -435,7 +645,8 @@ export class Seek {
 
         // No local-DB dedupe on the sink path: the scoring Supabase's
         // write-once upserts make re-scrapes idempotent.
-        await this.sendToSink(applicant, page.url());
+        const vacancy = this.matchVacancy(applicant.applied_for, vacancies);
+        await this.sendToSink(applicant, page.url(), vacancy);
       }
     } finally {
       await browser.close();
@@ -487,8 +698,15 @@ export class Seek {
     }
   }
 
-  async extractVisibleApplicants(page: playwright.Page): Promise<Applicant[]> {
-    return page.evaluate(() => {
+  /**
+   * `knownTitles` is this run's job postings (see `extractJobPostings`); a
+   * card whose text contains one of them verbatim gets that title as
+   * `applied_for` so `matchVacancy` can link the applicant to its real
+   * posting. A card matching none still comes back with `applied_for: ""`,
+   * same as before this run had any posting titles to check against.
+   */
+  async extractVisibleApplicants(page: playwright.Page, knownTitles: string[] = []): Promise<Applicant[]> {
+    return page.evaluate((titles: string[]) => {
       const text = (element: Element | null | undefined) => element?.textContent?.replace(/\s+/g, " ").trim() ?? "";
       const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
       const phoneRegex = /(?:\+?62|0)[\s-]?\d[\d\s-]{7,}\d/;
@@ -504,11 +722,12 @@ export class Seek {
         const link = element.querySelector<HTMLAnchorElement>('a[href]');
         const lines = bodyText.split(/\s{2,}|\n/).map((line) => line.trim()).filter(Boolean);
         const name = lines.find((line) => !emailRegex.test(line) && !phoneRegex.test(line) && line.length <= 80) ?? "";
+        const matchedTitle = titles.find((title) => title && bodyText.toLowerCase().includes(title.toLowerCase())) ?? "";
 
         return {
           portal: "seek",
           type: "applicant",
-          applied_for: "",
+          applied_for: matchedTitle,
           applied_date: bodyText.match(dateRegex)?.[0] ?? "",
           name,
           email: bodyText.match(emailRegex)?.[0] ?? "",
@@ -522,6 +741,6 @@ export class Seek {
           page_url: link ? new URL(link.getAttribute("href") ?? "", location.origin).toString() : location.href,
         };
       }).filter((applicant) => applicant.name || applicant.email || applicant.phone);
-    });
+    }, knownTitles);
   }
 }
