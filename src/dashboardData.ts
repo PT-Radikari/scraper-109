@@ -345,7 +345,7 @@ export async function getCandidates(
     offset: String(opts.offset ?? 0),
   };
   if (opts.portal) params.portal = `eq.${opts.portal}`;
-  if (opts.search) params.or = `name.ilike.*${opts.search}*,email.ilike.*${opts.search}*`;
+  if (opts.search) params.or = `(name.ilike.*${opts.search}*,email.ilike.*${opts.search}*)`;
   try {
     const response = await axios.get(`${config.url}/rest/v1/portal_candidates`, {
       headers: anonHeaders(config),

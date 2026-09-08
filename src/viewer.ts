@@ -1061,6 +1061,11 @@ const HTML = `<!DOCTYPE html>
       return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
+    function safeHref(url) {
+      if (!/^https?:\\/\\//i.test(String(url || ''))) return '';
+      return esc(url);
+    }
+
     function storageLinkFromPath(filePath) {
       if (!filePath) return '';
       const normalized = String(filePath).replace(/\\\\/g, '/');
@@ -1215,7 +1220,7 @@ const HTML = `<!DOCTYPE html>
               <td>\${esc(v.title || '—')}</td>
               <td>\${v.hasDescription ? '<span class="badge-yes">captured</span>' : '<span class="badge-no">missing</span>'}</td>
               <td>\${v.total_applicant ?? '—'}</td>
-              <td>\${v.link ? '<a href="' + esc(v.link) + '" target="_blank">link</a>' : '—'}</td>
+              <td>\${safeHref(v.link) ? '<a href="' + safeHref(v.link) + '" target="_blank">link</a>' : '—'}</td>
               <td>\${esc(fmtTime(v.last_seen_at))}</td>
             </tr>\`).join('')}</tbody></table>\`;
       } catch (err) {
