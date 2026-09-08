@@ -251,7 +251,7 @@ the others:
 | `scraper-glints` | `npm run start:glints:continuous` | Playwright/xvfb |
 | `scraper-jobstreet` | `npm run start:seek:continuous` | Playwright/xvfb (the codebase calls this portal `seek`) |
 | `scraper-sync` | `npm run start:central-sync` | plain Node, no browser |
-| `scraper-viewer` | `npm run start:viewer` | plain Node, exposes port 4000 |
+| `scraper-viewer` | `npm run dev:viewer` | plain Node (ts-node), exposes port 4000 |
 
 Jooble and Pintarnya are intentionally not included (Jooble is
 classifier-blocked, Pintarnya is deactivated — see AGENTS.md); wire them up

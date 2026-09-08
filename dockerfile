@@ -60,3 +60,10 @@ RUN npm ci
 
 # Build the application using npm
 RUN npm run build
+
+# Only scraper-viewer (src/viewer.ts) listens on a port; the other services
+# built from this same image are headless workers with nothing to expose.
+# EXPOSE is documentation only (Compose's own `ports:` mapping is what
+# actually publishes it) but Dokploy/other orchestrators read it to offer a
+# default container port.
+EXPOSE 4000

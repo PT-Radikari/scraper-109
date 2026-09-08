@@ -86,7 +86,7 @@ services:
   scraper-viewer:
     <<: *scraper
     container_name: scraper-viewer
-    command: npm run start:viewer
+    command: npm run dev:viewer
     ports:
       - "4000:4000"
     healthcheck:

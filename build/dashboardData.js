@@ -280,7 +280,7 @@ function getCandidates(config, opts) {
         if (opts.portal)
             params.portal = `eq.${opts.portal}`;
         if (opts.search)
-            params.or = `name.ilike.*${opts.search}*,email.ilike.*${opts.search}*`;
+            params.or = `(name.ilike.*${opts.search}*,email.ilike.*${opts.search}*)`;
         try {
             const response = yield axios_1.default.get(`${config.url}/rest/v1/portal_candidates`, {
                 headers: anonHeaders(config),
