@@ -265,7 +265,13 @@ describe("KitaLulus.sendToSink", () => {
         reference_link: [],
         page_url: "https://employer.kitalulus.com/applicant/detail/42",
       } as Parameters<KitaLulus["sendToSink"]>[0],
-      "https://employer.kitalulus.com/applicants",
+      {
+        vacancyId: "SM0KEV4C",
+        title: "Admin",
+        pendingLink: "https://employer.kitalulus.com/applicants",
+        location: null,
+        expiresAt: null,
+      } as Parameters<KitaLulus["sendToSink"]>[1],
     );
 
     const candidate = sink.upsertCandidate.mock.calls[0][0];

@@ -1,6 +1,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import playwright from "playwright";
 
 import { KitaLulus, KitaLulusConfigJson } from "../src/kitalulus";
 
@@ -205,6 +206,73 @@ describe("KitaLulus — pure helper functions", () => {
 
     it("returns empty string when no level is found", async () => {
       expect(await scraper.identifyEducationLevel("tidak ada info")).toBe("");
+    });
+  });
+
+  // ── extractVacancyDescription ────────────────────────────────────────────
+
+  describe("extractVacancyDescription", () => {
+    let detailScraper: KitaLulus;
+    const vacancy = {
+      vacancyId: "abc123",
+      title: "Sales Executive",
+      pendingLink: "https://kitalulus.example.com/pending?vacancy_id=abc123",
+      location: "Jakarta",
+      expiresAt: "2026-12-31",
+      description: null,
+    };
+
+    function makeMockPage(overlayVisible: boolean, labelCount: number, textareaValue: string) {
+      const registerText = { count: jest.fn().mockResolvedValue(overlayVisible ? 1 : 0) };
+      const label = {
+        count: jest.fn().mockResolvedValue(labelCount),
+        locator: jest.fn().mockReturnValue({ inputValue: jest.fn().mockResolvedValue(textareaValue) }),
+      };
+      const labelWrapper = { first: jest.fn().mockReturnValue(label) };
+
+      return {
+        goto: jest.fn().mockResolvedValue(undefined),
+        getByRole: jest.fn().mockReturnValue({ count: jest.fn().mockResolvedValue(0) }),
+        getByText: jest.fn().mockReturnValueOnce(registerText).mockReturnValueOnce(labelWrapper),
+        keyboard: { press: jest.fn().mockResolvedValue(undefined) },
+      } as unknown as playwright.Page;
+    }
+
+    beforeAll(() => {
+      detailScraper = new KitaLulus({ ...makeConfig(tempDir), base_url: "https://kitalulus.example.com" });
+    });
+
+    it("navigates to the vacancy's own detail page and returns its trimmed description text", async () => {
+      const page = makeMockPage(false, 1, "  Real job description text  \n");
+
+      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(page.goto).toHaveBeenCalledWith(
+        "https://kitalulus.example.com/vacancy/abc123",
+        { waitUntil: "domcontentloaded" },
+      );
+      expect(description).toBe("Real job description text");
+    });
+
+    it("returns null when no description field is found on the detail page", async () => {
+      const page = makeMockPage(false, 0, "");
+
+      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(description).toBeNull();
+    });
+
+    it("returns null instead of throwing when navigation fails", async () => {
+      const page = {
+        goto: jest.fn().mockRejectedValue(new Error("net::ERR_CONNECTION_REFUSED")),
+        getByRole: jest.fn(),
+        getByText: jest.fn(),
+        keyboard: { press: jest.fn() },
+      } as unknown as playwright.Page;
+
+      const description = await detailScraper.extractVacancyDescription(page, vacancy);
+
+      expect(description).toBeNull();
     });
   });
 });

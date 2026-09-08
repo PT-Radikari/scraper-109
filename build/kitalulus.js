@@ -35,6 +35,7 @@ class KitaLulus {
         this.APIDESTINATION = "";
         this.TIMEOUT = 30000;
         this.COLLECTED = 0;
+        this.VACANCIES_SEEN = 0;
         this.SLOWMO = 10000;
         this.DB_PATH = "";
         this.COOKIES = [];
@@ -83,9 +84,9 @@ class KitaLulus {
         (_a = this.sink) !== null && _a !== void 0 ? _a : (this.sink = new supabaseSink_1.SupabaseSink());
         return this.sink;
     }
-    /** kitalulus v1 walks the flat Pelamar list, not per-vacancy pages. */
+    /** Number of open vacancies (with pending applicants) walked this run. */
     getVacanciesSeen() {
-        return 0;
+        return this.VACANCIES_SEEN;
     }
     /** Number of applicants successfully persisted by this run. */
     getCollectedCount() {
@@ -102,20 +103,28 @@ class KitaLulus {
     /**
      * Writes one applicant straight into the scoring Supabase via the shared
      * direct-sink slice (see src/portalSink.ts). The detail page URL is
-     * candidate-specific only when it differs from the Pelamar list URL, so the
-     * list URL rides along as vacancy_url to keep the identity ladder honest.
+     * candidate-specific only when it differs from the vacancy's pending-applicants
+     * list URL, so that list URL rides along as vacancy_url to keep the identity
+     * ladder honest.
      * @param param - The applicant data to be persisted.
-     * @param listPageUrl - The Pelamar list URL shared by every row.
+     * @param vacancy - The real vacancy this applicant was scraped under.
      */
-    sendToSink(param, listPageUrl) {
+    sendToSink(param, vacancy) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
             yield (0, portalSink_1.sendApplicantToSink)(this.getSink(), {
                 portal: param.portal,
+                vacancy_id: vacancy.vacancyId,
                 applied_for: param.applied_for,
                 applied_date: param.applied_date,
                 url_profile: param.page_url,
-                vacancy_url: listPageUrl,
+                vacancy_link: vacancy.pendingLink,
+                vacancy_url: vacancy.pendingLink,
+                vacancy_raw: {
+                    location: vacancy.location,
+                    expires_at: vacancy.expiresAt,
+                    description: vacancy.description,
+                },
                 name: param.name,
                 email: param.email,
                 phone: (_a = param.whatapps) === null || _a === void 0 ? void 0 : _a.contact_number,
@@ -562,6 +571,94 @@ class KitaLulus {
             return referenceLinks;
         });
     }
+    /**
+     * Reads the "Lowongan" (vacancy management) listing and returns every open
+     * vacancy that still has pending ("Belum Diproses") applicants, keyed by
+     * KitaLulus' own `vacancy_id` (stable, from the "Belum Diproses" applicants
+     * link on each card — the first line of the card is the real job title).
+     * Vacancies with zero pending applicants are skipped since there is nothing
+     * new to scrape for them.
+     */
+    extractOpenVacancies(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c;
+            console.info("[NAV] Navigating to Lowongan (vacancies) page...");
+            yield page.locator('[data-test-id="mnDashboardSidebar[1]"]').click();
+            yield page.waitForTimeout(2000);
+            yield this.dismissMarketingOverlay(page);
+            const pendingLinks = page.locator('a[href*="active_tab_secondary=PENDING"]');
+            const count = yield pendingLinks.count();
+            const seen = new Set();
+            const vacancies = [];
+            for (let i = 0; i < count; i++) {
+                const link = pendingLinks.nth(i);
+                const href = yield link.getAttribute("href");
+                if (!href)
+                    continue;
+                const url = new URL(href, this.BASE_URL);
+                const vacancyId = url.searchParams.get("vacancy_id");
+                if (!vacancyId || seen.has(vacancyId))
+                    continue;
+                const pendingCountText = (_a = (yield link.textContent().catch(() => ""))) !== null && _a !== void 0 ? _a : "";
+                const pendingCount = parseInt(pendingCountText.replace(/\D/g, ""), 10) || 0;
+                if (pendingCount === 0)
+                    continue;
+                seen.add(vacancyId);
+                const card = link.locator("xpath=ancestor::*[4]").first();
+                const cardText = (yield card.innerText().catch(() => "")) || "";
+                const lines = cardText.split("\n").map((l) => l.trim()).filter(Boolean);
+                const title = lines[0] || "Pelamar KitaLulus";
+                const expiryLine = (_b = lines.find((l) => /berakhir pada/i.test(l))) !== null && _b !== void 0 ? _b : null;
+                const expiresAt = expiryLine ? expiryLine.replace(/^.*berakhir pada\s*/i, "").trim() : null;
+                const nonLocationLines = new Set([title, "Diposting Ulang", "Dibuka", "Ditutup"]);
+                const location = (_c = lines.find((l) => l !== expiryLine && !nonLocationLines.has(l) && !/^Lihat/i.test(l))) !== null && _c !== void 0 ? _c : null;
+                vacancies.push({
+                    vacancyId,
+                    title,
+                    pendingLink: url.toString(),
+                    location,
+                    expiresAt,
+                    description: null,
+                });
+            }
+            return vacancies;
+        });
+    }
+    /**
+     * Visits the vacancy's own detail page (`/vacancy/{vacancyId}`, reached in
+     * the dashboard via each row's "Tindakan" menu -> "Lihat detail lowongan")
+     * to read its job description — the "Lowongan" listing card and the
+     * pending-applicants view only expose title/location/expiry, never the
+     * description text. The description lives in a disabled MUI multiline
+     * textarea, so the visible "Deskripsi pekerjaan" label's associated
+     * textarea is read via `inputValue()` (its content is the field's value,
+     * not rendered child text, so `innerText()` on the label's container comes
+     * back empty). Verified live against three real vacancies (2026-09-07).
+     * Any navigation or selector failure is swallowed so a detail-page layout
+     * change degrades to a missing description instead of failing the whole
+     * vacancy.
+     */
+    extractVacancyDescription(page, vacancy) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const detailUrl = new URL(`/vacancy/${vacancy.vacancyId}`, this.BASE_URL);
+            try {
+                yield page.goto(detailUrl.toString(), { waitUntil: "domcontentloaded" });
+                yield this.dismissMarketingOverlay(page).catch(() => undefined);
+                const label = page.getByText("Deskripsi pekerjaan", { exact: true }).first();
+                if ((yield label.count()) === 0) {
+                    console.warn(`[VACANCY] No description field found for vacancy ${vacancy.vacancyId}; leaving raw.description empty.`);
+                    return null;
+                }
+                const textarea = label.locator("xpath=following::textarea[1]");
+                const text = ((yield textarea.inputValue().catch(() => "")) || "").trim();
+                return text || null;
+            }
+            catch (error) {
+                console.warn(`[VACANCY] Failed to extract description for vacancy ${vacancy.vacancyId}: ${String(error)}`);
+                return null;
+            }
+        });
+    }
     // Methods of the product (optional)
     /**
      * Scrapes data from the Kita Lulus website.
@@ -609,78 +706,86 @@ class KitaLulus {
                 console.info("[TOOLTIP] Handling dashboard tooltips...");
                 yield this.tooltipsDashbaord(page);
                 console.info("[TOOLTIP] Dashboard tooltips done.");
-                console.info("[NAV] Navigating to Pelamar (applicants) page...");
-                yield page.locator('[data-test-id="mnDashboardSidebar[2]"]').click();
-                console.info("[TOOLTIP] Handling pelamar page tooltips...");
-                yield this.tooltipsPelamar(page);
-                console.info("[TOOLTIP] Pelamar tooltips done.");
-                yield this.removeButtonOK(page);
-                yield this.dismissMarketingOverlay(page);
-                yield this.removeAllFilterApplicant(page);
-                let pageNumber = 1;
-                let hasNextPage = true;
-                while (hasNextPage) {
-                    let newOnPage = 0;
+                const vacancies = yield this.extractOpenVacancies(page);
+                console.info(`[NAV] Found ${vacancies.length} open vacancy(ies) with pending applicants.`);
+                this.VACANCIES_SEEN = vacancies.length;
+                for (const vacancy of vacancies) {
                     if (this.LIMIT > 0 && this.COLLECTED >= this.LIMIT) {
                         console.info(`[DONE] Limit ${this.LIMIT} reached. Stopping.`);
                         break;
                     }
-                    console.info(`[CANDIDATE] Loading applicant page ${pageNumber}...`);
-                    yield this.checkLazyLoadedElement(page, this.APPLICANT_TABLE_ROW_SELECTOR);
-                    const rows = page.locator(this.APPLICANT_TABLE_ROW_SELECTOR);
-                    const rowCount = yield rows.count();
-                    console.info(`[CANDIDATE] Found ${rowCount} row(s) on applicant page ${pageNumber}.`);
-                    if (rowCount === 0) {
-                        console.info("[CANDIDATE] No applicant rows visible. Stopping.");
-                        break;
-                    }
-                    for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+                    console.info(`[VACANCY] Processing "${vacancy.title}" (${vacancy.vacancyId})...`);
+                    vacancy.description = yield this.extractVacancyDescription(page, vacancy);
+                    yield page.goto(vacancy.pendingLink, { waitUntil: "domcontentloaded" });
+                    yield page.waitForTimeout(1500);
+                    console.info("[TOOLTIP] Handling pelamar page tooltips...");
+                    yield this.tooltipsPelamar(page);
+                    yield this.removeButtonOK(page);
+                    yield this.dismissMarketingOverlay(page);
+                    yield this.removeAllFilterApplicant(page);
+                    let pageNumber = 1;
+                    let hasNextPage = true;
+                    while (hasNextPage) {
+                        let newOnPage = 0;
                         if (this.LIMIT > 0 && this.COLLECTED >= this.LIMIT) {
                             console.info(`[DONE] Limit ${this.LIMIT} reached. Stopping.`);
                             break;
                         }
-                        const row = rows.nth(rowIndex);
-                        const appliedFor = yield this.extractAppliedForFromRow(row);
-                        console.info(`[CANDIDATE] Opening row ${rowIndex + 1}/${rowCount}${appliedFor ? ` for "${appliedFor}"` : ""}...`);
-                        let detailHandle = null;
-                        try {
-                            detailHandle = yield this.openApplicantDetailPage(page, rowIndex);
-                            console.info("[CANDIDATE] Detail page opened.");
-                            yield this.dismissMarketingOverlay(detailHandle.page);
-                            const applicant = yield this.scrapeApplicantDetails("applicant", detailHandle.page, appliedFor);
-                            if (applicant.whatapps.contact_number === "" && applicant.email === "") {
-                                console.info("[SKIP] No phone number and no email. Skipping send.");
-                                continue;
+                        console.info(`[CANDIDATE] Loading applicant page ${pageNumber} for "${vacancy.title}"...`);
+                        yield this.checkLazyLoadedElement(page, this.APPLICANT_TABLE_ROW_SELECTOR);
+                        const rows = page.locator(this.APPLICANT_TABLE_ROW_SELECTOR);
+                        const rowCount = yield rows.count();
+                        console.info(`[CANDIDATE] Found ${rowCount} row(s) on applicant page ${pageNumber}.`);
+                        if (rowCount === 0) {
+                            console.info("[CANDIDATE] No applicant rows visible. Stopping.");
+                            break;
+                        }
+                        for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+                            if (this.LIMIT > 0 && this.COLLECTED >= this.LIMIT) {
+                                console.info(`[DONE] Limit ${this.LIMIT} reached. Stopping.`);
+                                break;
                             }
-                            console.info(`[CANDIDATE] Name: "${applicant.name}", Phone: ${applicant.whatapps.contact_number}`);
-                            const collectedBefore = this.COLLECTED;
-                            yield this.sendToSink(applicant, page.url());
-                            if (this.COLLECTED > collectedBefore) {
-                                newOnPage++;
+                            console.info(`[CANDIDATE] Opening row ${rowIndex + 1}/${rowCount} for "${vacancy.title}"...`);
+                            let detailHandle = null;
+                            try {
+                                detailHandle = yield this.openApplicantDetailPage(page, rowIndex);
+                                console.info("[CANDIDATE] Detail page opened.");
+                                yield this.dismissMarketingOverlay(detailHandle.page);
+                                const applicant = yield this.scrapeApplicantDetails("applicant", detailHandle.page, vacancy.title);
+                                if (applicant.whatapps.contact_number === "" && applicant.email === "") {
+                                    console.info("[SKIP] No phone number and no email. Skipping send.");
+                                    continue;
+                                }
+                                console.info(`[CANDIDATE] Name: "${applicant.name}", Phone: ${applicant.whatapps.contact_number}`);
+                                const collectedBefore = this.COLLECTED;
+                                yield this.sendToSink(applicant, vacancy);
+                                if (this.COLLECTED > collectedBefore) {
+                                    newOnPage++;
+                                }
+                            }
+                            catch (error) {
+                                console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
+                                if (error instanceof supabaseSink_1.SupabaseSinkError)
+                                    throw error;
+                            }
+                            finally {
+                                yield this.removePendingTempFiles();
+                                if (detailHandle) {
+                                    yield detailHandle.cleanup();
+                                }
                             }
                         }
-                        catch (error) {
-                            console.error(`[ERROR] Failed to process applicant row ${rowIndex + 1}:`, error);
-                            if (error instanceof supabaseSink_1.SupabaseSinkError)
-                                throw error;
+                        if (newOnPage === 0) {
+                            console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
+                            break;
                         }
-                        finally {
-                            yield this.removePendingTempFiles();
-                            if (detailHandle) {
-                                yield detailHandle.cleanup();
-                            }
+                        hasNextPage = yield this.nextApplicantListPage(page);
+                        if (hasNextPage) {
+                            pageNumber++;
                         }
-                    }
-                    if (newOnPage === 0) {
-                        console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
-                        break;
-                    }
-                    hasNextPage = yield this.nextApplicantListPage(page);
-                    if (hasNextPage) {
-                        pageNumber++;
                     }
                 }
-                console.info(`[DONE] Pelamar scraping finished. Total collected: ${this.COLLECTED}`);
+                console.info(`[DONE] Pelamar scraping finished. Vacancies: ${vacancies.length}. Total collected: ${this.COLLECTED}`);
             }
             catch (error) {
                 // Rethrow so the retry loop and the continuous scheduler see the
@@ -838,11 +943,42 @@ class KitaLulus {
             }
         });
     }
+    /**
+     * Closes any visible MUI dialog/backdrop left open from a previous row
+     * (e.g. the Filter dialog not fully dismissed) so it can't intercept the
+     * next row click — leaving it open made row.click() retry blindly into the
+     * overlay for the full action timeout instead of failing fast.
+     */
+    closeAnyOpenDialog(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const openDialog = page.locator(".MuiDialog-root:not(.MuiModal-hidden)");
+                if ((yield openDialog.count()) === 0) {
+                    return;
+                }
+                console.info("[CANDIDATE] Closing a leftover open dialog before the next row click...");
+                yield page.keyboard.press("Escape").catch(() => undefined);
+                yield page.waitForTimeout(300);
+                if ((yield openDialog.count()) === 0) {
+                    return;
+                }
+                const backdrop = page.locator(".MuiBackdrop-root").first();
+                if ((yield backdrop.count()) > 0) {
+                    yield backdrop.click({ force: true }).catch(() => undefined);
+                    yield page.waitForTimeout(300);
+                }
+            }
+            catch (error) {
+                console.error("[WARN] Failed to close leftover dialog:", error);
+            }
+        });
+    }
     openApplicantDetailPage(page, rowIndex) {
         return __awaiter(this, void 0, void 0, function* () {
             const row = page.locator(this.APPLICANT_TABLE_ROW_SELECTOR).nth(rowIndex);
             const listUrl = page.url();
             yield this.dismissMarketingOverlay(page);
+            yield this.closeAnyOpenDialog(page);
             yield row.click();
             yield page.waitForTimeout(500);
             if ((yield page.locator(this.APPLICANT_DETAIL_NAME_SELECTOR).count()) > 0) {
@@ -919,37 +1055,6 @@ class KitaLulus {
                 console.error("[ERROR] Failed to paginate applicant list:", error);
                 return false;
             }
-        });
-    }
-    extractAppliedForFromRow(row) {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                const texts = (yield row.locator("td").allTextContents())
-                    .map((item) => item.replace(/\s+/g, " ").trim())
-                    .filter(Boolean);
-                const blacklist = [
-                    /^lihat detail$/i,
-                    /^belum diproses$/i,
-                    /^diproses$/i,
-                    /^ditolak$/i,
-                    /^diterima$/i,
-                    /^\d+$/,
-                    /^\d{4}-\d{2}-\d{2}$/,
-                ];
-                for (const value of texts) {
-                    if (value.length < 4) {
-                        continue;
-                    }
-                    if (blacklist.some((pattern) => pattern.test(value))) {
-                        continue;
-                    }
-                    return value;
-                }
-            }
-            catch (error) {
-                console.error("[WARN] Failed to derive applied_for from applicant row:", error);
-            }
-            return "Pelamar KitaLulus";
         });
     }
     tooltipsDashbaord(page) {
@@ -1250,70 +1355,58 @@ class KitaLulus {
    */
     extractCV(page) {
         return __awaiter(this, void 0, void 0, function* () {
-            /*
             let filePath = "";
-            await this.dismissMarketingOverlay(page);
-        
+            yield this.dismissMarketingOverlay(page);
             const cvTab = page.getByRole('tab', { name: 'CV' });
-            if ((await cvTab.count()) > 0) {
-              console.info("[CV] Clicking CV tab...");
-              await cvTab.click();
-              await page.waitForTimeout(1000);
-        
-              if (await page.locator("id=imgApplicantDetailCVEmptyState").count() > 0) {
-                console.info("[CV] No CV uploaded on the CV tab.");
-              } else {
-                const cvDownloadButton = await this.findFirstVisibleLocator([
-                  page.locator('[data-test-id="btnApplicantDetailDownloadCV"]'),
-                  page.getByRole("button", { name: /Unduh CV/i }),
-                  page.getByText("Unduh CV", { exact: true }),
-                  page.locator("button").filter({ hasText: /Unduh CV/i }),
-                  page.locator("a").filter({ hasText: /Unduh CV/i }),
-                ], 5000);
-        
-                if (cvDownloadButton) {
-                  console.info("[CV] Found CV download button.");
-                  filePath = await this.captureFileFromPopupOrCurrentPage(page, cvDownloadButton, "CV");
-                } else {
-                  console.info("[CV] CV download button not present on CV tab.");
+            if ((yield cvTab.count()) > 0) {
+                console.info("[CV] Clicking CV tab...");
+                yield cvTab.click();
+                yield page.waitForTimeout(1000);
+                if ((yield page.locator("id=imgApplicantDetailCVEmptyState").count()) > 0) {
+                    console.info("[CV] No CV uploaded on the CV tab.");
                 }
-              }
+                else {
+                    const cvDownloadButton = yield this.findFirstVisibleLocator([
+                        page.locator('[data-test-id="btnApplicantDetailDownloadCV"]'),
+                        page.getByRole("button", { name: /Unduh CV/i }),
+                        page.getByText("Unduh CV", { exact: true }),
+                        page.locator("button").filter({ hasText: /Unduh CV/i }),
+                        page.locator("a").filter({ hasText: /Unduh CV/i }),
+                    ], 5000);
+                    if (cvDownloadButton) {
+                        console.info("[CV] Found CV download button.");
+                        filePath = yield this.captureFileFromPopupOrCurrentPage(page, cvDownloadButton, "CV");
+                    }
+                    else {
+                        console.info("[CV] CV download button not present on CV tab.");
+                    }
+                }
             }
-        
             if (filePath === "") {
-              const profileTab = page.getByRole('tab', { name: 'Profil' });
-              const profileDownloadButton = page.getByText('Unduh Profil', { exact: true });
-        
-              if ((await profileTab.count()) > 0) {
-                console.info("[CV] Trying Profil tab fallback...");
-                await profileTab.click();
-                await page.waitForTimeout(1000);
-              }
-        
-              if (await this.waitForLocatorVisible(profileDownloadButton, 3000)) {
-                console.info("[CV] Found 'Unduh Profil' fallback.");
-                filePath = await this.captureFileFromPopupOrCurrentPage(page, profileDownloadButton, "Profil");
-              }
+                const profileTab = page.getByRole('tab', { name: 'Profil' });
+                const profileDownloadButton = page.getByText('Unduh Profil', { exact: true });
+                if ((yield profileTab.count()) > 0) {
+                    console.info("[CV] Trying Profil tab fallback...");
+                    yield profileTab.click();
+                    yield page.waitForTimeout(1000);
+                }
+                if (yield this.waitForLocatorVisible(profileDownloadButton, 3000)) {
+                    console.info("[CV] Found 'Unduh Profil' fallback.");
+                    filePath = yield this.captureFileFromPopupOrCurrentPage(page, profileDownloadButton, "Profil");
+                }
             }
-        
             if (filePath === "") {
-              console.info("[CV] No downloadable CV/Profile document found for this applicant.");
-              return { filePath, filename: "", text: "", publicUrl: "", method: "" };
+                console.info("[CV] No downloadable CV/Profile document found for this applicant.");
+                return { filePath, filename: "", text: "", publicUrl: "", method: "" };
             }
-        
-            const extracted = await this.extractTextFromCV(filePath);
+            const extracted = yield this.extractTextFromCV(filePath);
             return {
-              filePath,
-              filename: path.basename(filePath),
-              text: extracted.text,
-              publicUrl: this.buildStoragePublicUrl(filePath),
-              method: extracted.method,
+                filePath,
+                filename: path_1.default.basename(filePath),
+                text: extracted.text,
+                publicUrl: this.buildStoragePublicUrl(filePath),
+                method: extracted.method,
             };
-            */
-            // CV/profile download is intentionally disabled for now.
-            // The scraper will only collect data visible in the applicant profile preview/detail.
-            console.info("[CV] Skipping CV/Profile download. Scraping profile preview data only.");
-            return { filePath: "", filename: "", text: "", publicUrl: "", method: "" };
         });
     }
     waitForLocatorVisible(locator, timeoutMs) {
@@ -1355,8 +1448,21 @@ class KitaLulus {
     captureFileFromPopupOrCurrentPage(page, trigger, label) {
         return __awaiter(this, void 0, void 0, function* () {
             const popupPromise = page.waitForEvent("popup", { timeout: 5000 }).catch(() => null);
+            const downloadPromise = page.waitForEvent("download", { timeout: 5000 }).catch(() => null);
             const currentUrl = page.url();
             yield trigger.click();
+            const download = yield downloadPromise;
+            if (download) {
+                const storageDir = path_1.default.join(__dirname, "../storage/");
+                yield fs_1.default.promises.mkdir(storageDir, { recursive: true });
+                const suggested = download.suggestedFilename();
+                const extension = path_1.default.extname(suggested).replace(".", "") || "pdf";
+                const filePath = path_1.default.join(storageDir, `${Date.now()}.${extension}`);
+                yield download.saveAs(filePath);
+                console.info(`[CV] ${label} captured via browser download: ${suggested}`);
+                this.pendingTempFiles.push(filePath);
+                return filePath;
+            }
             const popupPage = yield popupPromise;
             if (popupPage) {
                 yield popupPage.waitForLoadState("domcontentloaded").catch(() => undefined);
@@ -1412,8 +1518,11 @@ class KitaLulus {
      */
     extractEmail(page) {
         return __awaiter(this, void 0, void 0, function* () {
+            // The applicant detail page currently renders both the email and the phone
+            // number under the same lbApplicantEmailText test-id; the email is always
+            // the first match.
             if ((yield page.locator(this.APPLICANT_EMAIL_SELECTOR).count()) > 0) {
-                return yield page.locator(this.APPLICANT_EMAIL_SELECTOR).textContent();
+                return yield page.locator(this.APPLICANT_EMAIL_SELECTOR).first().textContent();
             }
             return "";
         });
@@ -1507,7 +1616,9 @@ class KitaLulus {
                 };
                 const contentType = String((_a = response.headers['content-type']) !== null && _a !== void 0 ? _a : '').split(";")[0];
                 const extension = (_b = mimeTypes[contentType]) !== null && _b !== void 0 ? _b : (path_1.default.extname(new URL(imageUrl).pathname).replace(".", "") || "bin");
-                const filePath = path_1.default.join(__dirname, "../storage/", `${Date.now()}.${extension}`);
+                const storageDir = path_1.default.join(__dirname, "../storage/");
+                const filePath = path_1.default.join(storageDir, `${Date.now()}.${extension}`);
+                yield fs_1.default.promises.mkdir(storageDir, { recursive: true });
                 yield fs_1.default.promises.writeFile(filePath, response.data);
                 this.pendingTempFiles.push(filePath);
                 return filePath;

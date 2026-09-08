@@ -46,8 +46,11 @@ app.post("/api/ai/*", async (req, res) => {
 
 const DB_DIR = path.join(__dirname, "../db");
 const ROOT_DIR = path.join(__dirname, "../");
-const TS_NODE = path.join(__dirname, "../node_modules/.bin/ts-node");
-const SERVER = path.join(__dirname, "server.ts");
+const TS_NODE = path.join(ROOT_DIR, "node_modules/.bin/ts-node");
+// Resolved from ROOT_DIR (not __dirname) so this keeps working when viewer.js
+// runs compiled from build/ (no .ts files there) as well as via ts-node from
+// src/: either way ROOT_DIR is the repo root, where src/server.ts always is.
+const SERVER = path.join(ROOT_DIR, "src/server.ts");
 
 const SCRAPERS = ["glints", "jooble", "seek", "pintarnya", "kitalulus"];
 

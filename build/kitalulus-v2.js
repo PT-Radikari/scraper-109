@@ -1061,24 +1061,34 @@ class KitaLulusV2 {
      */
     tooltipsDashbaord(page) {
         return __awaiter(this, void 0, void 0, function* () {
-            // tooltips dashboard
-            for (let i = 0; i < 3; i++) {
-                yield page.getByRole("button", { name: "Lanjut" }).click();
+            // tooltips dashboard - click through however many "Lanjut" steps the live
+            // onboarding tour has (the step count has drifted from a hardcoded 3
+            // before and hung waiting on a step that no longer exists).
+            const lanjut = page.getByRole("button", { name: "Lanjut" });
+            while ((yield lanjut.count()) > 0) {
+                yield lanjut.click();
                 console.info("Do lanjut...");
+                yield page.waitForTimeout(300);
             }
-            yield page.getByRole("button", { name: "OK" }).click();
-            console.info("Do OK...");
+            if ((yield page.getByRole("button", { name: "OK" }).count()) > 0) {
+                yield page.getByRole("button", { name: "OK" }).click();
+                console.info("Do OK...");
+            }
         });
     }
     tooltipsLowongan(page) {
         return __awaiter(this, void 0, void 0, function* () {
-            // tooltips menu lowongan page
-            yield page.getByRole("button", { name: "Lanjut" }).click();
-            console.info("Do lanjut...");
-            yield page.getByRole("button", { name: "Lanjut" }).click();
-            console.info("Do lanjut...");
-            yield page.getByRole("button", { name: "SELESAI" }).click();
-            console.info("Do selesai...");
+            // tooltips menu lowongan page - same drift-tolerant approach as above.
+            const lanjut = page.getByRole("button", { name: "Lanjut" });
+            while ((yield lanjut.count()) > 0) {
+                yield lanjut.click();
+                console.info("Do lanjut...");
+                yield page.waitForTimeout(300);
+            }
+            if ((yield page.getByRole("button", { name: "SELESAI" }).count()) > 0) {
+                yield page.getByRole("button", { name: "SELESAI" }).click();
+                console.info("Do selesai...");
+            }
             if ((yield page.getByRole("button", { name: "OK" }).count()) > 0) {
                 yield page.getByRole("button", { name: "OK" }).click();
                 console.info("Do OK...");

@@ -212,6 +212,30 @@ export class SupabaseSink {
     }
   }
 
+  /**
+   * Retries an idempotent request a few times on a transient gateway error
+   * (502/503/504) before giving up. Storage uploads are content-addressed
+   * (uploadArtifactBytes) or timestamp-keyed (uploadDebugArtifact), so a
+   * retried POST is safe: it either recreates the same object or is rejected
+   * as a duplicate by the bucket's own dedupe check.
+   */
+  private async withTransientRetry<T>(run: () => Promise<T>, attempts = 3): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await run();
+      } catch (error) {
+        // Duck-typed rather than axios.isAxiosError(): callers' own duplicate-
+        // detection also inspects this same error afterwards, and axios's real
+        // check is a mocked one-shot in tests, so a second call here would
+        // consume it before that later check runs.
+        const status = (error as { response?: { status?: number } } | undefined)?.response?.status;
+        const transient = status !== undefined && [502, 503, 504].includes(status);
+        if (!transient || attempt >= attempts) throw error;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      }
+    }
+  }
+
   private async findId(
     table: string,
     filters: Record<string, string>,
@@ -425,13 +449,15 @@ export class SupabaseSink {
       const key = `${portal}/${month}/${digest}.${ext}`;
 
       try {
-        await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-          headers: {
-            apikey: this.anonKey,
-            Authorization: `Bearer ${this.anonKey}`,
-            "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
-          },
-        });
+        await this.withTransientRetry(() =>
+          axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+            headers: {
+              apikey: this.anonKey,
+              Authorization: `Bearer ${this.anonKey}`,
+              "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
+            },
+          }),
+        );
       } catch (error) {
         const response = axios.isAxiosError(error) ? error.response : undefined;
         const duplicate =
@@ -455,13 +481,15 @@ export class SupabaseSink {
   async uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string> {
     return this.guard("uploadDebugArtifact", async () => {
       try {
-        await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-          headers: {
-            apikey: this.anonKey,
-            Authorization: `Bearer ${this.anonKey}`,
-            "Content-Type": contentType,
-          },
-        });
+        await this.withTransientRetry(() =>
+          axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+            headers: {
+              apikey: this.anonKey,
+              Authorization: `Bearer ${this.anonKey}`,
+              "Content-Type": contentType,
+            },
+          }),
+        );
       } catch (error) {
         const response = axios.isAxiosError(error) ? error.response : undefined;
         const duplicate =

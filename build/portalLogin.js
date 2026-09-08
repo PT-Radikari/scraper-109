@@ -21,7 +21,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.InMemorySessionStore = exports.captureLoginDebugArtifacts = exports.expandSecretVariants = exports.LoginAttemptGuard = exports.maskSecrets = exports.escapeRegExp = exports.loadPortalCredentials = void 0;
+exports.BucketSessionStore = exports.InMemorySessionStore = exports.captureLoginDebugArtifacts = exports.expandSecretVariants = exports.LoginAttemptGuard = exports.maskSecrets = exports.escapeRegExp = exports.loadPortalCredentials = void 0;
 /**
  * Reads `${prefix}_EMAIL` / `${prefix}_PASSWORD` from the environment.
  * @param prefix Portal env prefix, e.g. `GLINTS`.
@@ -259,3 +259,69 @@ class InMemorySessionStore {
     }
 }
 exports.InMemorySessionStore = InMemorySessionStore;
+/**
+ * Durable session persistence in a private bucket object, so a verified
+ * session survives container restarts (the in-memory store above does not).
+ * Session material is a credential-equivalent secret: it exists only in the
+ * bucket object and in process memory, and no method here ever logs, throws,
+ * or returns any of its contents in an error path — failures degrade to
+ * "no stored session" (restore) or a key-only warning (persist), and the
+ * caller falls back to the credential login path.
+ */
+class BucketSessionStore {
+    constructor(storage, key, warn = console.warn) {
+        this.storage = storage;
+        this.key = key;
+        this.warn = warn;
+    }
+    /**
+     * Loads the persisted snapshot, or null when the object is missing,
+     * unreadable, or structurally not a session snapshot (staleness of the
+     * *content* — expired cookies — is discovered later by the dashboard
+     * redirecting to login, which the caller already handles).
+     */
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let bytes;
+            try {
+                bytes = yield this.storage.downloadPrivateObject(this.key);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                this.warn(`session restore from ${this.key} failed: ${message}`);
+                return null;
+            }
+            if (bytes === null)
+                return null;
+            try {
+                const parsed = JSON.parse(bytes.toString("utf8"));
+                if (!Array.isArray(parsed === null || parsed === void 0 ? void 0 : parsed.cookies) || !Array.isArray(parsed === null || parsed === void 0 ? void 0 : parsed.localStorage)) {
+                    this.warn(`session object ${this.key} is not a session snapshot — ignoring it`);
+                    return null;
+                }
+                return parsed;
+            }
+            catch (_a) {
+                this.warn(`session object ${this.key} holds unparseable JSON — ignoring it`);
+                return null;
+            }
+        });
+    }
+    /**
+     * Overwrites the persisted snapshot. Never throws: persistence is an
+     * optimization on top of a login that already succeeded, and a storage
+     * outage must not fail the scrape run that produced the fresh session.
+     */
+    persist(snapshot) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield this.storage.uploadPrivateObject(this.key, Buffer.from(JSON.stringify(snapshot), "utf8"), "application/json");
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                this.warn(`session persist to ${this.key} failed: ${message}`);
+            }
+        });
+    }
+}
+exports.BucketSessionStore = BucketSessionStore;
