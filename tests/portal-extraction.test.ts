@@ -82,10 +82,12 @@ describe("portal extraction helpers", () => {
       {
         title: "Trainer Contact Center",
         link: "https://employers.glints.id/manage-candidates?jid=job-a",
+        jobId: "job-a",
       },
       {
         title: "Contact Center Agent",
         link: "https://employers.glints.id/manage-candidates?jid=job-b",
+        jobId: "job-b",
       },
     ]);
   });
@@ -126,7 +128,7 @@ describe("portal extraction helpers", () => {
       throw new Error("stop row after recording processing order");
     };
 
-    await scraper.ExtractApplicantDetail(page, "Software Engineer");
+    await scraper.ExtractApplicantDetail(page, "Software Engineer", "job-id-unused", "https://employers.glints.id/manage-candidates?jid=job-id-unused");
 
     expect(processedOrder).toEqual([1, 2, 0]);
   });

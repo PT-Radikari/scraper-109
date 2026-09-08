@@ -39,13 +39,12 @@ exports.Glints = exports.normalizeGlintsApplicantName = exports.stripGlintsConta
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
-const crypto_1 = __importDefault(require("crypto"));
 const form_data_1 = __importDefault(require("form-data"));
 const path_1 = __importDefault(require("path"));
 const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
 const supabaseSink_1 = require("./supabaseSink");
-const candidateIdentity_1 = require("./candidateIdentity");
+const portalSink_1 = require("./portalSink");
 const portalLogin_1 = require("./portalLogin");
 exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
 const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
@@ -111,7 +110,14 @@ function glintsUrlLooksLikeVerification(url) {
         .some((segment) => segment !== "" && GLINTS_OTP_URL_SEGMENT_PATTERN.test(segment));
 }
 const GLINTS_INVALID_CREDENTIALS_PATTERN = /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
-const GLINTS_DASHBOARD_MARKER_SELECTOR = '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")';
+// The account's dashboard UI language is a per-account server-side setting,
+// independent of the browser's pinned id-ID locale — observed live: an
+// authenticated dashboard with zero job posts (nothing to trip the
+// job-card-listed branch) rendering entirely in English ("Post A Job",
+// "Change") instead of Indonesian ("Pasang Loker", "Ubah"). Matching only the
+// Indonesian strings then misclassified a genuinely authenticated session as
+// still logged out. Cover both languages so the marker is locale-agnostic.
+const GLINTS_DASHBOARD_MARKER_SELECTOR = '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Post A Job"), p:text("Ubah"), p:text("Change")';
 const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
     'iframe[src*="captcha"]',
     'iframe[src*="geetest"]',
@@ -943,7 +949,14 @@ class Glints {
                     continue;
                 }
             }
-            return page.url().includes("/login") ? "login" : "dashboard";
+            // Timeout: an unauthenticated session can land on a marketing/landing
+            // page whose URL never contains "/login" (observed live: the employer
+            // homepage, with "LOGIN"/"JOB SEEKER" nav text, at a URL that doesn't
+            // match), so the URL substring alone is not a safe "dashboard" signal —
+            // require the dashboard marker to actually be present, else fall back to
+            // "login" so ensureAuthenticated runs instead of selectTargetCompany
+            // failing on marketing-page content.
+            return (yield this.hasDashboardMarker(page)) ? "dashboard" : "login";
         });
     }
     /**
@@ -1055,78 +1068,56 @@ class Glints {
      */
     sendToSink(param) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a, _b, _c, _d, _e, _f;
-            const vacancyId = crypto_1.default
-                .createHash("sha1")
-                .update(`${param.portal}${param.applied_for}`)
-                .digest("hex");
-            const identity = (0, candidateIdentity_1.resolveCandidateIdentity)({
-                portalCandidateId: param.portal_candidate_id,
-                urlProfile: param.url_profile,
-                vacancyUrl: param.url_profile,
-                email: param.email,
-                phone: (_a = param.contact) === null || _a === void 0 ? void 0 : _a.contact_number,
-                name: param.name,
-                dateOfBirth: param.date_of_birth,
-                education: param.education,
-                workExperience: param.work_experience,
-            });
+            var _a, _b, _c;
             try {
                 const sink = this.getSink();
-                const appliedDate = param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
-                const cvKey = param.cv !== "" ? yield sink.uploadArtifact(param.portal, "cv", param.cv) : null;
-                const photoKey = param.photo !== "" ? yield sink.uploadArtifact(param.portal, "photo", param.photo) : null;
-                const vacancyRowId = yield sink.upsertVacancy({
+                yield (0, portalSink_1.sendApplicantToSink)(sink, {
                     portal: param.portal,
-                    portal_vacancy_id: vacancyId,
-                    title: param.applied_for,
-                    link: param.url_profile,
-                    status: "new",
-                    raw: { type: param.type },
-                });
-                const candidateRowId = yield sink.upsertCandidate({
-                    portal: param.portal,
-                    portal_candidate_id: identity.portalCandidateId,
-                    email: identity.email,
-                    phone: identity.phone,
-                    name: param.name,
-                    cv_object_key: cvKey,
-                    photo_object_key: photoKey,
-                    data: Object.assign(Object.assign({}, param), { 
-                        // Rows must reference artifacts by bucket object key, never by the
-                        // scraper host's filesystem path (param.photo/param.cv are local
-                        // temp paths that are deleted right after this upload).
-                        photo: photoKey !== null && photoKey !== void 0 ? photoKey : "", cv: cvKey !== null && cvKey !== void 0 ? cvKey : "", contact: {
-                            type: (_c = (_b = param.contact) === null || _b === void 0 ? void 0 : _b.type) !== null && _c !== void 0 ? _c : "WhatsApp",
-                            contact_number: (_f = (_d = identity.phone) !== null && _d !== void 0 ? _d : (_e = param.contact) === null || _e === void 0 ? void 0 : _e.contact_number) !== null && _f !== void 0 ? _f : "",
-                        }, identity: {
-                            source: identity.source,
-                            low_confidence: identity.lowConfidence,
-                            email: identity.email,
-                            phone: identity.phone,
-                        } }),
-                });
-                yield sink.linkApplication(vacancyRowId, candidateRowId, {
+                    // Real Glints job id ("jid" query param on the manage-candidates
+                    // link) when the vacancy loop supplied one; sendApplicantToSink
+                    // falls back to sha1(portal + applied_for) when this is empty, which
+                    // is what every pre-fix row already used.
+                    vacancy_id: param.portal_vacancy_id,
                     applied_for: param.applied_for,
-                    applied_date: appliedDate,
+                    applied_date: param.applied_date,
+                    url_profile: param.url_profile,
+                    vacancy_link: (_a = param.vacancy_link) !== null && _a !== void 0 ? _a : param.url_profile,
+                    vacancy_url: (_b = param.vacancy_link) !== null && _b !== void 0 ? _b : param.url_profile,
+                    vacancy_raw: { type: param.type },
+                    portal_candidate_id: param.portal_candidate_id,
+                    name: param.name,
+                    email: param.email,
+                    phone: (_c = param.contact) === null || _c === void 0 ? void 0 : _c.contact_number,
+                    date_of_birth: param.date_of_birth,
+                    location: param.location,
+                    work_experience: param.work_experience,
+                    education: param.education,
+                    skill: param.skill,
+                    cv_path: param.cv,
+                    photo_path: param.photo,
+                    raw: {
+                        type: param.type,
+                        summary: param.summary,
+                        salary_expectation: param.salary_expectation,
+                        gender: param.gender,
+                    },
                 });
                 console.info("Success writing applicant to Supabase sink", {
                     portal: param.portal,
-                    candidate_id: identity.portalCandidateId,
-                    identity_source: identity.source,
+                    vacancy_id: param.portal_vacancy_id,
                 });
                 this.COLLECTED++;
             }
             catch (error) {
+                // sendApplicantToSink already sanitizes and stamps .portal/.vacancyId/
+                // .candidateId (with its own real-id-or-sha1-fallback vacancyId, and
+                // the identity-resolved candidateId) — sanitizeSinkError passes an
+                // already-sanitized error through unchanged, so those fields survive.
                 const sinkError = (0, supabaseSink_1.sanitizeSinkError)(error, "sendToSink");
-                sinkError.portal = param.portal;
-                sinkError.vacancyId = vacancyId;
-                sinkError.candidateId = identity.portalCandidateId;
                 console.error("Error writing to Supabase sink", {
-                    portal: param.portal,
-                    vacancy_id: vacancyId,
-                    candidate_id: identity.portalCandidateId,
-                    identity_source: identity.source,
+                    portal: sinkError.portal,
+                    vacancy_id: sinkError.vacancyId,
+                    candidate_id: sinkError.candidateId,
                     status: sinkError.status,
                     error: sinkError.message,
                 });
@@ -1242,7 +1233,7 @@ class Glints {
                         byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
                     }
                 }
-                return Array.from(byJobId.values()).map(({ title, link }) => ({ title, link }));
+                return Array.from(byJobId.entries()).map(([jobId, { title, link }]) => ({ title, link, jobId }));
             });
             console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
             return vacancies;
@@ -1579,7 +1570,7 @@ class Glints {
                     if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
                         break;
                     }
-                    yield this.ExtractApplicantDetail(page, it.title);
+                    yield this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString());
                     // Check if there is a next page
                     const nextPage = page.locator('[data-testid="next-page"]');
                     isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
@@ -1605,7 +1596,7 @@ class Glints {
      * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
      *                            If an error occurs during extraction or processing, the promise is rejected.
      */
-    ExtractApplicantDetail(page, job) {
+    ExtractApplicantDetail(page, job, jobId, vacancyLink) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
             const locatorListApplicant = exports.GLINTS_APPLICANT_ROW_SELECTOR;
@@ -1636,13 +1627,23 @@ class Glints {
                     // detail (contact, resume key, applicant id); arm the capture before
                     // the click so the response is never missed.
                     const detailPromise = this.armApplicationDetailCapture(page, name);
-                    // cell row of applicant
-                    yield element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
+                    // Click the name cell to open the applicant detail modal. A column
+                    // shift (observed live: cell 1 now holds the salary-expectation tag,
+                    // not a clickable row target) moved this off cell 1; the name cell
+                    // (index 2, the same cell extractName reads) is what actually opens
+                    // the modal now.
+                    yield element.locator('.Polaris-IndexTable__TableCell, td').nth(2).click();
                     // Scope to the modal: the stage tab bar behind it also reads "Belum
-                    // Sesuai" (the modal itself carries data-testid="modal-wrapper").
+                    // Sesuai"/"NEW" (the modal itself carries
+                    // data-testid="modal-wrapper"). The dashboard's UI language is a
+                    // per-account server-side setting independent of the browser's
+                    // pinned id-ID locale — observed live: an account rendering entirely
+                    // in English, where an un-progressed application's status badge
+                    // reads "NEW" rather than "Belum Sesuai" ("Not yet assessed", not a
+                    // literal "Not Suitable" rejection). Match both.
                     const modalDetailButtonBelumSelesai = yield page
                         .getByTestId('modal-wrapper')
-                        .getByText('Belum Sesuai', { exact: true })
+                        .getByText(/^\s*(Belum Sesuai|NEW)\s*$/i)
                         .last();
                     yield modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
                     const modalDetail = yield modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
@@ -1684,6 +1685,8 @@ class Glints {
                         cv: cv,
                         url_profile: yield page.url(),
                         portal_candidate_id: (_a = detail === null || detail === void 0 ? void 0 : detail.applicantId) !== null && _a !== void 0 ? _a : "",
+                        portal_vacancy_id: jobId,
+                        vacancy_link: vacancyLink,
                     };
                     yield this.sendToSink(applicant);
                     yield page.keyboard.press('Escape');
@@ -1788,21 +1791,29 @@ class Glints {
         });
     }
     /**
-     * Extracts and processes the name from a table row.
+     * Extracts the applicant's name from the name cell.
      *
-     * @param row - The table row from which to extract the name.
-     * @returns A Promise that resolves to the extracted name as a string.
-     *          The name is trimmed of leading and trailing spaces.
+     * The cell packs the name together with age/gender/distance/location tags
+     * and, for some applicants, a "Willing to relocate" badge into one text
+     * block (observed live: "Deni Sahri 26 yo · Male 84km · Cilegon, Banten
+     * Willing to relocate") — a fixed `div[1]/span` XPath used to isolate the
+     * name span, but a UI change moved the name out of that span (or added a
+     * sibling badge span there instead), silently returning the badge text
+     * ("Willing to relocate" or "") in place of the name. Parsing the name out
+     * of the cell's full text is robust to that kind of tag/badge churn.
      */
     extractName(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const elementName = yield this.applicantCells(row).nth(2).locator('//div[1]/span');
-            const elementNameCount = yield elementName.count();
-            let name = "";
-            for (let index = 0; index < elementNameCount; index++) {
-                name += " " + (yield elementName.nth(index).textContent());
-            }
-            return name.trim();
+            const cellText = (yield this.applicantCells(row).nth(2).innerText())
+                .replace(/\s+/g, " ")
+                .trim();
+            // Name ends right before the "<age> yo" tag when an age is shown.
+            const ageMatch = cellText.match(/^(.*?)\s+\d+\s*yo\b/i);
+            if (ageMatch)
+                return ageMatch[1].trim();
+            // No age tag: fall back to the text before the first "·" tag separator.
+            const sepIndex = cellText.indexOf("·");
+            return (sepIndex > 0 ? cellText.slice(0, sepIndex) : cellText).trim();
         });
     }
     /**
