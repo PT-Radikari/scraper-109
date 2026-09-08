@@ -144,4 +144,37 @@ describe("Seek — pure helper functions", () => {
       expect(description).toBeNull();
     });
   });
+
+  // ── isLoginPage ──────────────────────────────────────────────────────
+  // Scrape() re-checks this after every navigation that could land back on
+  // an interstitial (including the post-vacancy-enumeration return to the
+  // candidates page); these fixtures pin what counts as "logged out" so
+  // that guard actually fires instead of silently reading a login page as
+  // "zero applicants".
+
+  describe("isLoginPage", () => {
+    function makeMockPage(opts: { url: string; signInHeadingCount?: number }) {
+      return {
+        url: jest.fn().mockReturnValue(opts.url),
+        getByRole: jest.fn().mockReturnValue({
+          count: jest.fn().mockResolvedValue(opts.signInHeadingCount ?? 0),
+        }),
+      } as unknown as playwright.Page;
+    }
+
+    it("detects the authenticate.seek.com redirect as a login page", async () => {
+      const page = makeMockPage({ url: "https://authenticate.seek.com/oauth/authorize?foo=bar" });
+      expect(await scraper.isLoginPage(page)).toBe(true);
+    });
+
+    it("detects a 'Sign in' heading on an unrecognised URL as a login page", async () => {
+      const page = makeMockPage({ url: "https://id.employer.seek.com/candidates", signInHeadingCount: 1 });
+      expect(await scraper.isLoginPage(page)).toBe(true);
+    });
+
+    it("returns false for the normal candidates dashboard URL with no sign-in heading", async () => {
+      const page = makeMockPage({ url: "https://id.employer.seek.com/candidates" });
+      expect(await scraper.isLoginPage(page)).toBe(false);
+    });
+  });
 });
