@@ -35,7 +35,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Glints = exports.normalizeGlintsApplicantName = exports.stripGlintsContactMask = exports.parseGlintsApplicationDetail = exports.classifyGlintsLoginResult = exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = exports.GLINTS_VERIFICATION_METHOD_SELECTOR = exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
+exports.Glints = exports.normalizeGlintsApplicantName = exports.stripGlintsContactMask = exports.parseGlintsApplicationDetail = exports.classifyGlintsLoginResult = exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = exports.GLINTS_VERIFICATION_METHOD_SELECTOR = exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_PIPELINE_STAGES = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
@@ -47,6 +47,29 @@ const supabaseSink_1 = require("./supabaseSink");
 const portalSink_1 = require("./portalSink");
 const portalLogin_1 = require("./portalLogin");
 exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
+/**
+ * Ordered list of stages the scraper iterates per vacancy. The default stage
+ * comes first so an early LIMIT hit still returns the un-progressed applicants
+ * first (existing behaviour). Terhubung was added to capture unmasked contact
+ * info without progressing anyone — see `GlintsPipelineStage` above.
+ */
+exports.GLINTS_PIPELINE_STAGES = [
+    {
+        key: "baru",
+        label: "BARU",
+        // The default vacancy view already shows un-progressed applications, so
+        // no tab click is issued. Text list kept for symmetry / future refactor.
+        tabTexts: ["Belum Sesuai", "NEW", "New"],
+        modalBadgePattern: /^\s*(Belum Sesuai|NEW)\s*$/i,
+        isDefault: true,
+    },
+    {
+        key: "terhubung",
+        label: "TERHUBUNG",
+        tabTexts: ["Terhubung", "Connected"],
+        modalBadgePattern: /^\s*(Terhubung|Connected)\s*$/i,
+    },
+];
 const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
 const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
 const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
@@ -1520,68 +1543,123 @@ class Glints {
                 // the page opens on the default applicants view.
                 const vacancyUrl = new URL(it.link, "https://employers.glints.id");
                 vacancyUrl.searchParams.delete("atsTab");
-                yield page.goto(vacancyUrl.toString());
-                // The candidate table hydrates well after domcontentloaded (the page
-                // shows "Memuat..." for many seconds); poll until either the empty-state
-                // marker or the first applicant row renders before deciding to skip.
-                const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
-                const applicantRows = page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR);
-                const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
-                // The empty-state wrapper can flash while the table hydrates (observed
-                // live: the same vacancy showed it on one run and 8 rows on the next),
-                // so a single sighting is not proof of emptiness — require it to hold
-                // for several consecutive polls with no data rows.
-                let emptyStreak = 0;
-                let confirmedEmpty = false;
-                let rowsSettled = false;
-                for (let i = 0; i < settleAttempts; i++) {
-                    yield page.waitForTimeout(1000);
-                    const emptyCount = yield emptyMarker.count();
-                    if ((yield applicantRows.count()) > 0 && emptyCount === 0) {
-                        rowsSettled = true;
+                // Iterate each pipeline stage. The BARU stage is the vacancy page's
+                // default view (no tab click); TERHUBUNG has to be selected via its
+                // stage-filter tab, and its rows carry unmasked contact info without
+                // any applicant being progressed. Stage tabs are filter-only — a click
+                // never moves an applicant between stages.
+                for (const stage of exports.GLINTS_PIPELINE_STAGES) {
+                    if (this.COLLECTED == this.LIMIT) {
                         break;
                     }
-                    if (emptyCount > 0) {
-                        if (++emptyStreak >= 8) {
-                            confirmedEmpty = true;
+                    // Re-navigate to the vacancy for every stage so pagination state
+                    // never leaks between stages and the default (BARU) view is what
+                    // we start from before switching filters.
+                    yield page.goto(vacancyUrl.toString());
+                    const stageSelected = yield this.selectPipelineStage(page, stage);
+                    if (!stageSelected) {
+                        console.warn(`[GLINTS] Stage "${stage.label}" tab not found for vacancy "${it.title}" (${page.url()}); skipping this stage`);
+                        continue;
+                    }
+                    // The candidate table hydrates well after domcontentloaded (the page
+                    // shows "Memuat..." for many seconds); poll until either the empty-state
+                    // marker or the first applicant row renders before deciding to skip.
+                    const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+                    const applicantRows = page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR);
+                    const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+                    // The empty-state wrapper can flash while the table hydrates (observed
+                    // live: the same vacancy showed it on one run and 8 rows on the next),
+                    // so a single sighting is not proof of emptiness — require it to hold
+                    // for several consecutive polls with no data rows.
+                    let emptyStreak = 0;
+                    let confirmedEmpty = false;
+                    let rowsSettled = false;
+                    for (let i = 0; i < settleAttempts; i++) {
+                        yield page.waitForTimeout(1000);
+                        const emptyCount = yield emptyMarker.count();
+                        if ((yield applicantRows.count()) > 0 && emptyCount === 0) {
+                            rowsSettled = true;
                             break;
                         }
+                        if (emptyCount > 0) {
+                            if (++emptyStreak >= 8) {
+                                confirmedEmpty = true;
+                                break;
+                            }
+                        }
+                        else {
+                            emptyStreak = 0;
+                        }
                     }
-                    else {
-                        emptyStreak = 0;
+                    // Skip stage if no candidates
+                    if (confirmedEmpty) {
+                        console.info(`[GLINTS] No candidates in stage "${stage.label}" for vacancy "${it.title}" (${page.url()})`);
+                        continue;
                     }
+                    if (!rowsSettled && (yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
+                        const pageText = (_d = (yield page.locator("body").textContent())) === null || _d === void 0 ? void 0 : _d.replace(/\s+/g, " ").trim().slice(0, 500);
+                        console.warn(`[GLINTS] Candidate table missing for stage "${stage.label}" vacancy "${it.title}" at ${page.url()}: ${pageText}`);
+                        continue;
+                    }
+                    let isNext = true;
+                    do {
+                        // wait 5 seconds before, avoid rendering list employees
+                        yield page.waitForTimeout(5000);
+                        // Check for lazy-loaded elements before proceeding
+                        yield this.checkLazyLoadedElement(page, exports.GLINTS_APPLICANT_ROW_SELECTOR);
+                        if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
+                            break;
+                        }
+                        yield this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString(), stage);
+                        // Check if there is a next page
+                        const nextPage = page.locator('[data-testid="next-page"]');
+                        isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
+                        if (!isNext) {
+                            // Click on the "Next" button to move to the next page
+                            yield nextPage.click();
+                        }
+                    } while (!isNext && this.COLLECTED < this.LIMIT);
                 }
-                // Skip job if no candidates in this stage
-                if (confirmedEmpty) {
-                    console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
-                    continue;
-                }
-                if (!rowsSettled && (yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
-                    const pageText = (_d = (yield page.locator("body").textContent())) === null || _d === void 0 ? void 0 : _d.replace(/\s+/g, " ").trim().slice(0, 500);
-                    console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
-                    continue;
-                }
-                let isNext = true;
-                do {
-                    // wait 5 seconds before, avoid rendering list employees
-                    yield page.waitForTimeout(5000);
-                    // Check for lazy-loaded elements before proceeding
-                    yield this.checkLazyLoadedElement(page, exports.GLINTS_APPLICANT_ROW_SELECTOR);
-                    if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
-                        break;
-                    }
-                    yield this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString());
-                    // Check if there is a next page
-                    const nextPage = page.locator('[data-testid="next-page"]');
-                    isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
-                    if (!isNext) {
-                        // Click on the "Next" button to move to the next page
-                        yield nextPage.click();
-                    }
-                } while (!isNext && this.COLLECTED < this.LIMIT);
             }
             yield browser.close();
             console.log("DONE");
+        });
+    }
+    /**
+     * Switches the vacancy's manage-candidates page to the given pipeline
+     * stage's tab. Read-only: clicking a stage-filter tab never moves an
+     * applicant between stages — it just changes which rows the candidate
+     * table renders. The default (BARU) stage is already shown by the page's
+     * initial load and needs no click, so it always resolves true.
+     *
+     * For a non-default stage the tab is matched by any of its `tabTexts`
+     * (id + en variants), and only by an exact accessible-name match — a
+     * substring match could hit a progression control whose label merely
+     * contains the stage word (e.g. "Pindahkan ke Terhubung"), which would
+     * move an applicant. The page hydrates well after domcontentloaded, so
+     * the tab bar is polled within TIMEOUT before the stage is declared
+     * absent; only then does the method resolve false and the caller skip
+     * the stage with a warn log rather than failing the vacancy.
+     */
+    selectPipelineStage(page, stage) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (stage.isDefault) {
+                return true;
+            }
+            const pollAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+            for (let attempt = 0; attempt < pollAttempts; attempt++) {
+                for (const tabText of stage.tabTexts) {
+                    const tabButton = page.getByRole("button", { name: tabText, exact: true }).first();
+                    if ((yield tabButton.count()) > 0) {
+                        yield tabButton.click();
+                        // Give the candidate table time to swap in the newly filtered rows.
+                        yield page.waitForTimeout(1500);
+                        return true;
+                    }
+                }
+                yield page.waitForTimeout(1000);
+            }
+            return false;
         });
     }
     /**
@@ -1596,7 +1674,7 @@ class Glints {
      * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
      *                            If an error occurs during extraction or processing, the promise is rejected.
      */
-    ExtractApplicantDetail(page, job, jobId, vacancyLink) {
+    ExtractApplicantDetail(page, job, jobId, vacancyLink, stage) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
             const locatorListApplicant = exports.GLINTS_APPLICANT_ROW_SELECTOR;
@@ -1633,20 +1711,21 @@ class Glints {
                     // (index 2, the same cell extractName reads) is what actually opens
                     // the modal now.
                     yield element.locator('.Polaris-IndexTable__TableCell, td').nth(2).click();
-                    // Scope to the modal: the stage tab bar behind it also reads "Belum
-                    // Sesuai"/"NEW" (the modal itself carries
-                    // data-testid="modal-wrapper"). The dashboard's UI language is a
-                    // per-account server-side setting independent of the browser's
-                    // pinned id-ID locale — observed live: an account rendering entirely
-                    // in English, where an un-progressed application's status badge
-                    // reads "NEW" rather than "Belum Sesuai" ("Not yet assessed", not a
-                    // literal "Not Suitable" rejection). Match both.
-                    const modalDetailButtonBelumSelesai = yield page
+                    // Scope to the modal: the stage tab bar behind it also carries the
+                    // stage's badge text (the modal itself is data-testid="modal-wrapper").
+                    // The dashboard's UI language is a per-account server-side setting
+                    // independent of the browser's pinned id-ID locale — observed live:
+                    // an account rendering entirely in English, where an un-progressed
+                    // application's status badge reads "NEW" rather than "Belum Sesuai"
+                    // ("Not yet assessed", not a literal "Not Suitable" rejection). The
+                    // badge pattern comes from the stage config so this matches whichever
+                    // pipeline stage the row belongs to (BARU, TERHUBUNG, ...).
+                    const modalStageBadge = yield page
                         .getByTestId('modal-wrapper')
-                        .getByText(/^\s*(Belum Sesuai|NEW)\s*$/i)
+                        .getByText(stage.modalBadgePattern)
                         .last();
-                    yield modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
-                    const modalDetail = yield modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
+                    yield modalStageBadge.waitFor({ state: 'visible' });
+                    const modalDetail = yield modalStageBadge.locator("..").locator("..").locator("..").locator("..").locator("..");
                     const skills = yield this.extractSkills(modalDetail);
                     const summary = yield this.extractSummary(modalDetail);
                     const workExperience = yield this.extractWorkExperience(modalDetail);

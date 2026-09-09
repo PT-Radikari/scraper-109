@@ -30,6 +30,10 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 dotenv_1.default.config();
+/** True for null/undefined and whitespace-only strings — a value a masked or gated scrape yields. */
+function isBlank(value) {
+    return value === null || value === undefined || (typeof value === "string" && value.trim() === "");
+}
 /**
  * The only error type the sink is allowed to surface. Raw Axios errors must
  * never escape this module: config.params carry candidate email/phone filters,
@@ -204,10 +208,13 @@ class SupabaseSink {
      * Looks for an existing candidate row by, in order, the selected portal
      * candidate id, the normalized email, then the normalized phone recorded in
      * the row's `data->identity` metadata. Cross-checking all three keeps one
-     * person on one row when re-scrapes surface different identifiers.
+     * person on one row when re-scrapes surface different identifiers. The
+     * row's stored email/data come back with the id so the refresh path can
+     * decide whether a contact backfill applies.
      */
-    findExistingCandidateId(portal, portalCandidateId, email, phone) {
+    findExistingCandidate(portal, portalCandidateId, email, phone) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             const filterSets = [];
             if (portalCandidateId) {
                 filterSets.push({ portal: `eq.${portal}`, portal_candidate_id: `eq.${portalCandidateId}` });
@@ -221,12 +228,97 @@ class SupabaseSink {
             for (const filters of filterSets) {
                 const response = yield axios_1.default.get(`${this.url}/rest/v1/portal_candidates`, {
                     headers: this.headers(),
-                    params: Object.assign({ select: "id", limit: 1 }, filters),
+                    params: Object.assign({ select: "id,email,data", limit: 1 }, filters),
                 });
-                if (response.data[0])
-                    return Number(response.data[0].id);
+                const row = response.data[0];
+                if (row) {
+                    return {
+                        id: Number(row.id),
+                        email: (_a = row.email) !== null && _a !== void 0 ? _a : null,
+                        data: row.data && typeof row.data === "object" ? row.data : null,
+                    };
+                }
             }
             return null;
+        });
+    }
+    /**
+     * Fill-empty-only contact backfill for an existing candidate row. A portal
+     * can serve masked contact info on first sight (glints strips the mask to
+     * "") and the real value only on a later re-scrape (e.g. the TERHUBUNG
+     * stage), so blank stored contact fields — the email column plus the
+     * contact-bearing keys of `data` — are populated when the new scrape
+     * carries a non-empty value. A stored non-empty value is never overwritten
+     * and a blank scrape never blanks stored data; `data` fields are only
+     * considered when the scrape supplies a data payload at all.
+     */
+    buildContactBackfill(row, c, email, phone) {
+        var _a, _b, _c, _d, _e;
+        const patch = {};
+        if (isBlank(row.email) && !isBlank(email)) {
+            patch.email = email;
+        }
+        if (!c.data || typeof c.data !== "object") {
+            return patch;
+        }
+        const incoming = c.data;
+        const stored = ((_a = row.data) !== null && _a !== void 0 ? _a : {});
+        const merged = Object.assign({}, stored);
+        let changed = false;
+        const fill = (target, key, value) => {
+            if (isBlank(target[key]) && !isBlank(value)) {
+                target[key] = value;
+                return true;
+            }
+            return false;
+        };
+        changed = fill(merged, "email", (_b = incoming.email) !== null && _b !== void 0 ? _b : email) || changed;
+        const incomingContact = incoming.contact && typeof incoming.contact === "object" ? incoming.contact : {};
+        const contact = merged.contact && typeof merged.contact === "object" ? Object.assign({}, merged.contact) : {};
+        if (fill(contact, "contact_number", (_c = incomingContact.contact_number) !== null && _c !== void 0 ? _c : phone)) {
+            if (isBlank(contact.type) && !isBlank(incomingContact.type)) {
+                contact.type = incomingContact.type;
+            }
+            merged.contact = contact;
+            changed = true;
+        }
+        const incomingIdentity = incoming.identity && typeof incoming.identity === "object" ? incoming.identity : {};
+        const identity = merged.identity && typeof merged.identity === "object" ? Object.assign({}, merged.identity) : {};
+        let identityChanged = fill(identity, "email", (_d = incomingIdentity.email) !== null && _d !== void 0 ? _d : email);
+        identityChanged = fill(identity, "phone", (_e = incomingIdentity.phone) !== null && _e !== void 0 ? _e : phone) || identityChanged;
+        if (identityChanged) {
+            merged.identity = identity;
+            changed = true;
+        }
+        if (changed) {
+            patch.data = merged;
+        }
+        return patch;
+    }
+    /**
+     * Refreshes an existing candidate row: last_seen_at plus any fill-empty
+     * contact backfill. A 409 on the email column (another row already holds
+     * that email under the (portal, email) UNIQUE constraint) retries without
+     * the email so the refresh itself never fails the applicant.
+     */
+    refreshCandidate(row, c, email, phone) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            const patch = Object.assign({ last_seen_at: new Date().toISOString() }, this.buildContactBackfill(row, c, email, phone));
+            const send = (body) => axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${row.id}`, body, {
+                headers: this.headers({ Prefer: "return=minimal" }),
+            });
+            try {
+                yield send(patch);
+            }
+            catch (error) {
+                const status = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.status;
+                if (status !== 409 || !("email" in patch))
+                    throw error;
+                const { email: _conflicting } = patch, withoutEmail = __rest(patch, ["email"]);
+                yield send(withoutEmail);
+            }
+            return row.id;
         });
     }
     /**
@@ -236,8 +328,9 @@ class SupabaseSink {
      * Inserts dedupe on (portal, portal_candidate_id), falling back to
      * (portal, email) when the portal candidate id is missing; a 409 raised by
      * the sibling UNIQUE constraint resolves back through the same lookup.
-     * Existing rows only get a last_seen_at refresh, preserving write-once
-     * content.
+     * Existing rows get a last_seen_at refresh plus a fill-empty-only contact
+     * backfill (see buildContactBackfill); all other stored content stays
+     * write-once.
      * @returns the numeric id of the (inserted or existing) row.
      */
     upsertCandidate(c) {
@@ -254,9 +347,9 @@ class SupabaseSink {
                     yield axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
                     return id;
                 });
-                const existingId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                if (existingId !== null) {
-                    return touch(existingId);
+                const existing = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                if (existing !== null) {
+                    return this.refreshCandidate(existing, c, email, phone);
                 }
                 const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
                 const { phone: _phone } = c, columns = __rest(c, ["phone"]);
@@ -275,19 +368,19 @@ class SupabaseSink {
                     const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
                     if (status !== 409)
                         throw error;
-                    const conflictId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                    if (conflictId === null)
+                    const conflictRow = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                    if (conflictRow === null)
                         throw error;
-                    return touch(conflictId);
+                    return this.refreshCandidate(conflictRow, c, email, phone);
                 }
                 if (inserted) {
                     return touch(Number(inserted.id));
                 }
-                const raceId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                if (raceId === null) {
+                const raceRow = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                if (raceRow === null) {
                     throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
                 }
-                return touch(raceId);
+                return this.refreshCandidate(raceRow, c, email, phone);
             }));
         });
     }
