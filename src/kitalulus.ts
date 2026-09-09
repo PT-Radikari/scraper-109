@@ -45,6 +45,7 @@ type Applicant = {
   portal: string;
   type: string;
   applied_for: string;
+  vacancy_description?: string;
   applied_date: string;
   name: string;
   nick_name: string;
@@ -139,6 +140,54 @@ export class KitaLulus {
   private COOKIES: KitaLulusCookie[] = [];
   private sink: SupabaseSink | null = null;
   private pendingTempFiles: string[] = [];
+  private vacancyDescriptions = new Map<string, string>();
+
+  private normalizeVacancyTitle(title: string): string {
+    return title.replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  private async readVacancyDescription(page: playwright.Page): Promise<string> {
+    const selectors = [
+      '[data-testid*="description" i]',
+      '[data-test-id*="description" i]',
+      '[name*="description" i]',
+      'textarea[placeholder*="deskripsi" i]',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      if (await locator.count() && await locator.isVisible().catch(() => false)) {
+        const value = await locator.inputValue().catch(async () => await locator.textContent());
+        if (value?.trim()) return value.replace(/\s+/g, " ").trim();
+      }
+    }
+    const body = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim() ?? "";
+    const match = body.match(/(?:deskripsi|description)\s*:?\s*(.{40,}?)(?=\s+(?:persyaratan|kualifikasi|benefit|gaji|lokasi)\b|$)/i);
+    return match?.[1]?.trim() ?? "";
+  }
+
+  private async collectVacancyDescriptions(page: playwright.Page): Promise<void> {
+    await page.goto("https://employer.kitalulus.com/vacancy", { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+    await page.waitForTimeout(1000);
+    const detailLinks = page.getByRole("link", { name: /lihat detail lowongan/i });
+    const detailButtons = page.getByRole("button", { name: /lihat detail lowongan/i });
+    const count = Math.max(await detailLinks.count(), await detailButtons.count());
+    for (let index = 0; index < count; index++) {
+      const control = index < await detailLinks.count() ? detailLinks.nth(index) : detailButtons.nth(index);
+      const title = (await control.locator("xpath=ancestor::*[self::article or self::li or @role='listitem'][1]").textContent().catch(() => ""))?.replace(/\s+/g, " ").trim() ?? "";
+      const href = await control.getAttribute("href").catch(() => null);
+      if (href) {
+        await page.goto(new URL(href, "https://employer.kitalulus.com").toString(), { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+      } else {
+        await control.click();
+        await page.waitForTimeout(500);
+      }
+      const detailTitle = (await page.locator("h1, h2, [role='heading']").first().textContent().catch(() => ""))?.trim() || title;
+      const description = await this.readVacancyDescription(page);
+      if (detailTitle && description) this.vacancyDescriptions.set(this.normalizeVacancyTitle(detailTitle), description);
+      await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+    }
+  }
 
   private readonly SIGN_IN_EMAIL_SELECTOR: string = '[data-test-id="tfSignInEmail"]';
   private readonly SIGN_IN_PASSWORD_SELECTOR: string = '[data-test-id="tfSignInPassword"]';
@@ -215,6 +264,7 @@ export class KitaLulus {
     await sendApplicantToSink(this.getSink(), {
       portal: param.portal,
       applied_for: param.applied_for,
+      vacancy_description: param.vacancy_description,
       applied_date: param.applied_date,
       url_profile: param.page_url,
       vacancy_url: listPageUrl,
@@ -750,6 +800,9 @@ export class KitaLulus {
       await this.tooltipsDashbaord(page);
       console.info("[TOOLTIP] Dashboard tooltips done.");
 
+      console.info("[VACANCY] Collecting authenticated vacancy descriptions...");
+      await this.collectVacancyDescriptions(page);
+
       console.info("[NAV] Navigating to Pelamar (applicants) page...");
       await page.locator('[data-test-id="mnDashboardSidebar[2]"]').click();
 
@@ -1244,6 +1297,7 @@ export class KitaLulus {
       portal: "kita_lulus",
       type: type,
       applied_for: appliedFor,
+      vacancy_description: this.vacancyDescriptions.get(this.normalizeVacancyTitle(appliedFor)),
       applied_date: await this.extractAppliedDate(page),
       name: await this.extractName(page),
       nick_name: await this.extractNickName(page),

@@ -31,6 +31,7 @@ export interface VacancyInput {
   portal_vacancy_id: string;
   title?: string | null;
   link?: string | null;
+  description?: string | null;
   link_recommendation?: string | null;
   total_applicant?: number | null;
   status?: string | null;
@@ -147,6 +148,22 @@ export class SupabaseSink {
   private readonly anonKey: string;
   private readonly bucket: string;
   private readonly serviceKey: string | null;
+  /** Latches once so a missing description column logs one line, not one per row. */
+  private warnedMissingDescriptionColumn = false;
+
+  /**
+   * True when a PostgREST write failed only because the target column does not
+   * exist yet (schema cache miss PGRST204, or Postgres undefined_column 42703).
+   * Used to keep the description write best-effort until its migration lands.
+   */
+  static isMissingColumnError(error: unknown): boolean {
+    if (!isAxiosLikeError(error)) return false;
+    const data = error.response?.data as { code?: unknown; message?: unknown } | undefined;
+    const code = typeof data?.code === "string" ? data.code : undefined;
+    if (code === "PGRST204" || code === "42703") return true;
+    const message = typeof data?.message === "string" ? data.message : "";
+    return /Could not find the '.*' column|column .* does not exist/i.test(message);
+  }
 
   constructor(config?: Partial<SupabaseSinkConfig>) {
     this.url = (config?.url ?? process.env.SCORING_SUPABASE_URL ?? "").replace(/\/+$/, "");
@@ -252,11 +269,39 @@ export class SupabaseSink {
             portal_vacancy_id: `eq.${v.portal_vacancy_id}`,
           });
 
+      // last_seen_at always refreshes; it is present on every deployment.
       await axios.patch(
         `${this.url}/rest/v1/portal_vacancies?id=eq.${id}`,
         { last_seen_at: new Date().toISOString() },
         { headers: this.headers({ Prefer: "return=minimal" }) },
       );
+
+      // Description is a newer column. Write it best-effort so a deployment
+      // where the add_vacancy_description migration has not been applied yet
+      // does not drop the whole applicant on a PostgREST "column not found"
+      // (PGRST204 / SQLSTATE 42703). It fills in on the next re-scrape once the
+      // migration lands, with no code change.
+      const description = v.description?.trim();
+      if (description) {
+        try {
+          await axios.patch(
+            `${this.url}/rest/v1/portal_vacancies?id=eq.${id}`,
+            { description },
+            { headers: this.headers({ Prefer: "return=minimal" }) },
+          );
+        } catch (error) {
+          if (SupabaseSink.isMissingColumnError(error)) {
+            if (!this.warnedMissingDescriptionColumn) {
+              this.warnedMissingDescriptionColumn = true;
+              console.warn(
+                "[SINK] portal_vacancies.description not found — skipping description writes until the add_vacancy_description migration is applied.",
+              );
+            }
+          } else {
+            throw error;
+          }
+        }
+      }
       return id;
     });
   }

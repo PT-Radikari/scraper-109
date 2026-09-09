@@ -90,6 +90,19 @@ describe("sendApplicantToSink", () => {
     );
   });
 
+  it("forwards vacancy description to the Supabase vacancy row", async () => {
+    const sink = buildMockSink();
+    await sendApplicantToSink(sink as unknown as SupabaseSink, baseApplicant({
+      vacancy_description: "Handle customer calls and resolve issues.",
+    }));
+
+    expect(sink.upsertVacancy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: "Handle customer calls and resolve issues.",
+      }),
+    );
+  });
+
   it("synthesizes the vacancy id from portal + applied_for when no native id exists", async () => {
     const sink = buildMockSink();
     await sendApplicantToSink(sink as unknown as SupabaseSink, baseApplicant());

@@ -78,6 +78,9 @@ type WorkExperience = {
 type Applicant = {
   portal: string;
   type: string;
+  vacancy_description?: string;
+  vacancy_id?: string;
+  vacancy_link?: string;
   applied_for: string;
   applied_date: string;
   url_profile: string;
@@ -121,7 +124,7 @@ type Education = {
 /**
  * Represents a vacancy page.
  */
-type VacancyPage = { title: string; link: string };
+type VacancyPage = { title: string; link: string; editLink?: string; description?: string };
 
 /**
  * Represents an applicant for a jobVacancy position in the database.
@@ -1298,7 +1301,7 @@ export class Glints {
    * @param param - The applicant data to be persisted.
    */
   async sendToSink(param: Applicant): Promise<void> {
-    const vacancyId = crypto
+    const vacancyId = param.vacancy_id?.trim() || crypto
       .createHash("sha1")
       .update(`${param.portal}${param.applied_for}`)
       .digest("hex");
@@ -1325,7 +1328,8 @@ export class Glints {
         portal: param.portal,
         portal_vacancy_id: vacancyId,
         title: param.applied_for,
-        link: param.url_profile,
+        link: param.vacancy_link ?? param.url_profile,
+        description: param.vacancy_description ?? null,
         status: "new",
         raw: { type: param.type },
       });
@@ -1474,16 +1478,45 @@ export class Glints {
    * @param page - The page to extract vacancy pages from.
    * @returns A promise that resolves to an array of VacancyPage objects.
    */
+  async extractVacancyDescription(page: playwright.Page): Promise<string> {
+    const selectors = [
+      '[data-testid*="description" i]',
+      '[name*="description" i]',
+      'textarea[placeholder*="deskripsi" i]',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      if (await locator.count() && await locator.isVisible().catch(() => false)) {
+        const value = await locator.inputValue().catch(async () => await locator.textContent());
+        if (value?.trim()) return value.trim();
+      }
+    }
+    return "";
+  }
+
+  private async extractVacancyDescriptionFromEditPage(page: playwright.Page, editLink?: string): Promise<string> {
+    if (!editLink) return "";
+    const returnUrl = page.url();
+    await page.goto(editLink, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+    await page.waitForTimeout(1000);
+    const description = await this.extractVacancyDescription(page);
+    await page.goto(returnUrl, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+    return description;
+  }
+
   async ExtractListVacancyPage(page: any): Promise<VacancyPage[]> {
     const vacancies = await page.evaluate(() => {
-      const byJobId = new Map<string, { title: string; link: string; isBaseLink: boolean }>();
+      const byJobId = new Map<string, { title: string; link: string; vacancyId?: string; editLink?: string; isBaseLink: boolean }>();
       const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/manage-candidates"]'));
 
       for (const link of links) {
         const href = new URL(link.getAttribute("href") ?? "", "https://employers.glints.id");
-        const jobId = href.searchParams.get("jid") ?? href.href;
+        const vacancyId = href.searchParams.get("jid") ?? undefined;
+        const jobId = vacancyId ?? href.href;
         const card = link.closest('[data-cy="job-card-listed"]');
         const title = card?.querySelector('[data-cy="job-title-text"]')?.textContent?.trim() ?? "";
+        const editHref = card?.querySelector<HTMLAnchorElement>('a[href*="/job/edit/"]')?.getAttribute("href") ?? undefined;
         const isBaseLink = !href.searchParams.has("status");
 
         if (!title) {
@@ -1492,11 +1525,21 @@ export class Glints {
 
         const existing = byJobId.get(jobId);
         if (!existing || isBaseLink) {
-          byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
+          byJobId.set(jobId, {
+            title,
+            link: href.toString(),
+            vacancyId,
+            editLink: editHref ? new URL(editHref, "https://employers.glints.id").toString() : undefined,
+            isBaseLink,
+          });
         }
       }
 
-      return Array.from(byJobId.values()).map(({ title, link }) => ({ title, link }));
+      return Array.from(byJobId.values()).map(({ title, link, editLink }) => ({
+        title,
+        link,
+        ...(editLink ? { editLink } : {}),
+      }));
     });
 
     console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
@@ -1853,7 +1896,9 @@ export class Glints {
           break;
         }
 
-        await this.ExtractApplicantDetail(page, it.title);
+        const vacancyDescription = await this.extractVacancyDescriptionFromEditPage(page, it.editLink);
+        const vacancyId = new URL(it.link, "https://employers.glints.id").searchParams.get("jid") ?? undefined;
+        await this.ExtractApplicantDetail(page, it.title, vacancyDescription, vacancyId, it.link);
 
         // Check if there is a next page
         const nextPage = page.locator('[data-testid="next-page"]');
@@ -1882,7 +1927,7 @@ export class Glints {
    * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
    *                            If an error occurs during extraction or processing, the promise is rejected.
    */
-  async ExtractApplicantDetail(page: any, job: string): Promise<void> {
+  async ExtractApplicantDetail(page: any, job: string, vacancyDescription = "", vacancyId?: string, vacancyLink?: string): Promise<void> {
     const locatorListApplicant = GLINTS_APPLICANT_ROW_SELECTOR;
     const lv = page.locator(locatorListApplicant);
     const rows = await Promise.all(
@@ -1952,6 +1997,9 @@ export class Glints {
         const applicant: Applicant = {
           portal: "glints",
           type: "applicant",
+          vacancy_description: vacancyDescription,
+          vacancy_id: vacancyId,
+          vacancy_link: vacancyLink,
           applied_for: job,
           applied_date: appliedDate,
           name: name,

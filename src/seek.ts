@@ -67,6 +67,7 @@ type Applicant = {
   portal: string;
   type: string;
   applied_for: string;
+  vacancy_description?: string;
   applied_date: string;
   name: string;
   email: string;
@@ -110,6 +111,51 @@ export class Seek {
   private SLOWMO: number = 1000;
   private COLLECTED: number = 0;
   private sink: SupabaseSink | null = null;
+  private vacancyDescriptions = new Map<string, string>();
+
+  private normalizeVacancyTitle(title: string): string {
+    return title.replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  private async readVacancyDescription(page: playwright.Page): Promise<string> {
+    const selectors = [
+      '[data-testid*="description" i]',
+      '[data-test-id*="description" i]',
+      '[name*="description" i]',
+      '[class*="description" i]',
+      'textarea',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of selectors) {
+      const locator = page.locator(selector).first();
+      if (!(await locator.count()) || !(await locator.isVisible().catch(() => false))) continue;
+      const value = await locator.inputValue().catch(async () => await locator.textContent());
+      if (value?.trim()) return value.replace(/\s+/g, " ").trim();
+    }
+    const body = (await page.locator("body").textContent().catch(() => ""))?.replace(/\s+/g, " ").trim() ?? "";
+    return body.match(/(?:deskripsi|description|job description)\s*:?\s*(.{40,}?)(?=\s+(?:persyaratan|kualifikasi|benefit|salary|lokasi|location)\b|$)/i)?.[1]?.trim() ?? "";
+  }
+
+  private async collectVacancyDescriptions(page: playwright.Page): Promise<void> {
+    await page.goto("https://id.employer.seek.com/id/dashboard", { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+    await page.waitForTimeout(1000);
+    const controls = page.getByText("lihat iklan lowongan", { exact: false });
+    const count = await controls.count();
+    for (let index = 0; index < count; index++) {
+      const control = controls.nth(index);
+      const href = await control.getAttribute("href").catch(() => null);
+      if (href) {
+        await page.goto(new URL(href, "https://id.employer.seek.com").toString(), { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+      } else {
+        await control.click();
+        await page.waitForTimeout(500);
+      }
+      const title = (await page.locator("h1, h2, [role='heading']").first().textContent().catch(() => ""))?.replace(/\s+/g, " ").trim() ?? "";
+      const description = await this.readVacancyDescription(page);
+      if (title && description) this.vacancyDescriptions.set(this.normalizeVacancyTitle(title), description);
+      await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+    }
+  }
 
   /**
    * Represents a Seek object.
@@ -223,6 +269,7 @@ export class Seek {
     await sendApplicantToSink(this.getSink(), {
       portal: param.portal,
       applied_for: param.applied_for,
+      vacancy_description: param.vacancy_description,
       applied_date: param.applied_date,
       url_profile: param.page_url,
       vacancy_url: vacancyUrl,
@@ -420,6 +467,13 @@ export class Seek {
         }
       }
 
+      console.info("[VACANCY] Collecting authenticated Seek vacancy descriptions...");
+      await this.collectVacancyDescriptions(page);
+      await page.goto("https://id.employer.seek.com/id/dashboard", {
+        waitUntil: "domcontentloaded",
+        timeout: this.TIMEOUT,
+      });
+
       const applicants = await this.extractVisibleApplicants(page);
       console.info(`[SEEK] Extracted ${applicants.length} visible applicant(s) from ${page.url()}.`);
       if (applicants.length === 0) {
@@ -428,6 +482,7 @@ export class Seek {
       }
 
       for (const applicant of applicants.slice(0, this.LIMIT || applicants.length)) {
+        applicant.vacancy_description = this.vacancyDescriptions.get(this.normalizeVacancyTitle(applicant.applied_for));
         const key = applicant.email || applicant.phone;
         if (!key) {
           continue;
@@ -508,7 +563,8 @@ export class Seek {
         return {
           portal: "seek",
           type: "applicant",
-          applied_for: "",
+          applied_for: lines.find((line) => !emailRegex.test(line) && !phoneRegex.test(line) && line.length > 2 && line.length <= 120) ?? "",
+          vacancy_description: "",
           applied_date: bodyText.match(dateRegex)?.[0] ?? "",
           name,
           email: bodyText.match(emailRegex)?.[0] ?? "",

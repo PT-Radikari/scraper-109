@@ -129,6 +129,48 @@ describe("SupabaseSink", () => {
         })
       );
     });
+
+    it("writes the description in its own patch when present", async () => {
+      const sink = buildSink();
+
+      await sink.upsertVacancy({
+        portal: "glints",
+        portal_vacancy_id: "v-1",
+        title: "Software Engineer",
+        description: "  Handle inbound customer calls.  ",
+        status: "new",
+      });
+
+      expect(mockedAxios.patch).toHaveBeenCalledWith(
+        `${URL}/rest/v1/portal_vacancies?id=eq.1`,
+        { description: "Handle inbound customer calls." },
+        expect.objectContaining({
+          headers: expect.objectContaining({ Prefer: "return=minimal" }),
+        })
+      );
+    });
+
+    it("does not drop the vacancy when the description column is missing", async () => {
+      const missingColumn = Object.assign(new Error("bad request"), {
+        isAxiosError: true,
+        response: { status: 400, data: { code: "PGRST204", message: "Could not find the 'description' column of 'portal_vacancies'" } },
+      });
+      // First patch (last_seen_at) succeeds; second (description) hits the missing column.
+      mockedAxios.patch
+        .mockResolvedValueOnce({ data: [{ id: 1 }] } as never)
+        .mockRejectedValueOnce(missingColumn as never);
+      const sink = buildSink();
+
+      await expect(
+        sink.upsertVacancy({
+          portal: "glints",
+          portal_vacancy_id: "v-1",
+          title: "Software Engineer",
+          description: "Handle inbound customer calls.",
+          status: "new",
+        })
+      ).resolves.toBe(1);
+    });
   });
 
   describe("upsertCandidate", () => {

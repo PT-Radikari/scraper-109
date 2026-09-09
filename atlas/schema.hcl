@@ -56,6 +56,10 @@ table "portal_vacancies" {
     null = true
   }
   column "link" {
+    type  = text
+    null  = true
+  }
+  column "description" {
     type = text
     null = true
   }

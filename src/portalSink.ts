@@ -39,6 +39,8 @@ export interface SinkApplicant {
   portal: string;
   /** Portal-native vacancy id. Falls back to sha1(portal + applied_for). */
   vacancy_id?: string | null;
+  /** Authenticated vacancy detail text from the portal. */
+  vacancy_description?: string | null;
   applied_for: string;
   applied_date?: string | null;
   vacancy_link?: string | null;
@@ -128,6 +130,7 @@ export async function sendApplicantToSink(
       portal_vacancy_id: vacancyId,
       title: a.applied_for,
       link: a.vacancy_link ?? a.vacancy_url ?? null,
+      description: a.vacancy_description ?? null,
       status: "new",
       raw: { type: "applicant" },
     });
