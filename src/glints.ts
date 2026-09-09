@@ -1942,22 +1942,30 @@ export class Glints {
    * initial load and needs no click, so it always resolves true.
    *
    * For a non-default stage the tab is matched by any of its `tabTexts`
-   * (id + en variants). A stage whose tab is not present on the page
-   * resolves false; the caller then skips the stage with a warn log rather
-   * than failing the vacancy.
+   * (id + en variants), and only by an exact accessible-name match — a
+   * substring match could hit a progression control whose label merely
+   * contains the stage word (e.g. "Pindahkan ke Terhubung"), which would
+   * move an applicant. The page hydrates well after domcontentloaded, so
+   * the tab bar is polled within TIMEOUT before the stage is declared
+   * absent; only then does the method resolve false and the caller skip
+   * the stage with a warn log rather than failing the vacancy.
    */
   async selectPipelineStage(page: any, stage: GlintsPipelineStage): Promise<boolean> {
     if (stage.isDefault) {
       return true;
     }
-    for (const tabText of stage.tabTexts) {
-      const tabButton = page.locator(`button:has-text("${tabText}")`).first();
-      if ((await tabButton.count()) > 0) {
-        await tabButton.click();
-        // Give the candidate table time to swap in the newly filtered rows.
-        await page.waitForTimeout(1500);
-        return true;
+    const pollAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+    for (let attempt = 0; attempt < pollAttempts; attempt++) {
+      for (const tabText of stage.tabTexts) {
+        const tabButton = page.getByRole("button", { name: tabText, exact: true }).first();
+        if ((await tabButton.count()) > 0) {
+          await tabButton.click();
+          // Give the candidate table time to swap in the newly filtered rows.
+          await page.waitForTimeout(1500);
+          return true;
+        }
       }
+      await page.waitForTimeout(1000);
     }
     return false;
   }

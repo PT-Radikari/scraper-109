@@ -20,33 +20,59 @@ function makeConfig(): GlintsConfigJson {
 }
 
 /**
- * Simulates one stage-filter tab button on the vacancy page. Each entry maps
- * the visible button label to how many times a matching `has-text(label)`
- * locator should report `count() === 1`; the same click drops the count to 0.
- * The click is recorded so the test can assert which tab (and how) was hit.
+ * Simulates the vacancy page's buttons for `getByRole("button", ...)` with
+ * real Playwright name-matching semantics: a plain string name is a
+ * case-insensitive substring match, `exact: true` a case-sensitive
+ * whole-string match. Mirroring the substring default is what lets the
+ * anti-progression test below catch a regression back to loose matching.
+ * `first()` picks the earliest label in constructor (DOM) order; clicks are
+ * recorded and a clicked label stops matching, like the tab swapping views.
+ * `revealAfterCountCalls` hides every button for the first N `count()` calls
+ * to model a page that hydrates long after navigation.
  */
 class FakeStageTabsPage {
-  private counts: Map<string, number>;
+  private labels: string[];
+  private clicked = new Set<string>();
+  private countCalls = 0;
+  private readonly revealAfterCountCalls: number;
   clicks: string[] = [];
   waits = 0;
 
-  constructor(present: string[]) {
-    this.counts = new Map(present.map((label) => [label, 1]));
+  constructor(present: string[], revealAfterCountCalls = 0) {
+    this.labels = present;
+    this.revealAfterCountCalls = revealAfterCountCalls;
   }
 
-  locator(selector: string) {
-    const match = selector.match(/^button:has-text\("(.+)"\)$/);
-    if (!match) {
-      throw new Error(`unexpected selector ${selector}`);
+  getByRole(role: string, options: { name?: string; exact?: boolean } = {}) {
+    if (role !== "button") {
+      throw new Error(`unexpected role ${role}`);
     }
-    const label = match[1];
+    const name = String(options.name ?? "");
     const page = this;
+    const matches = () => {
+      if (page.countCalls < page.revealAfterCountCalls) {
+        return [];
+      }
+      return page.labels.filter((label) => {
+        if (page.clicked.has(label)) return false;
+        return options.exact
+          ? label === name
+          : label.toLowerCase().includes(name.toLowerCase());
+      });
+    };
     return {
       first: () => ({
-        count: async () => page.counts.get(label) ?? 0,
+        count: async () => {
+          page.countCalls += 1;
+          return matches().length > 0 ? 1 : 0;
+        },
         click: async () => {
-          page.clicks.push(label);
-          page.counts.set(label, 0);
+          const target = matches()[0];
+          if (!target) {
+            throw new Error(`click on empty locator for name "${name}"`);
+          }
+          page.clicks.push(target);
+          page.clicked.add(target);
         },
       }),
     };
@@ -123,16 +149,29 @@ describe("Glints.selectPipelineStage", () => {
     expect(page.clicks).toEqual([]);
   });
 
+  it("polls for the tab while the page hydrates instead of skipping the stage", async () => {
+    const scraper = new Glints(makeConfig());
+    // Every tab-text query in the first poll round sees nothing (the tab bar
+    // renders only after "Memuat..." clears); the tab must still be found.
+    const page = new FakeStageTabsPage(["Terhubung"], terhubungStage.tabTexts.length);
+    await expect(scraper.selectPipelineStage(page, terhubungStage)).resolves.toBe(true);
+    expect(page.clicks).toEqual(["Terhubung"]);
+    expect(page.waits).toBeGreaterThanOrEqual(1000);
+  });
+
   it("never touches a control that would move an applicant between stages", async () => {
     const scraper = new Glints(makeConfig());
-    // Present on the page: the stage-filter tab AND a stage-progression
-    // control ("Pindahkan"/"Move to"). Only the filter tab may be clicked.
+    // Present on the page: a stage-progression control ("Pindahkan"/"Move
+    // to") rendered BEFORE the stage-filter tab in DOM order, so a substring
+    // matcher would pick the progression control first. Only the filter tab
+    // may be clicked.
     const page = new FakeStageTabsPage([
-      "Terhubung",
       "Pindahkan ke Terhubung",
       "Move to Connected",
+      "Terhubung",
     ]);
     await scraper.selectPipelineStage(page, terhubungStage);
+    expect(page.clicks).toEqual(["Terhubung"]);
     for (const click of page.clicks) {
       expect(click.toLowerCase()).not.toMatch(/pindahkan|move to/);
     }
