@@ -95,8 +95,10 @@ async function uploadOptionalArtifact(
 /**
  * Writes one applicant straight into the scoring Supabase, mirroring
  * Glints.sendToSink step for step. Idempotent across re-scrapes: vacancies and
- * candidates are write-once (refresh touches last_seen_at only, statuses are
- * never reset) and the application link ignores duplicates.
+ * candidates are write-once (refresh touches last_seen_at plus a fill-empty
+ * contact backfill — see SupabaseSink.upsertCandidate; stored non-empty values
+ * are never overwritten and statuses are never reset) and the application link
+ * ignores duplicates.
  *
  * Errors are sanitized (no PII, no keys) before they are logged and rethrown,
  * so a failing cycle surfaces one loud, safe line per applicant.
