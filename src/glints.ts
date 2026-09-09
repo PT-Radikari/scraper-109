@@ -99,6 +99,8 @@ type Applicant = {
   portal_vacancy_id?: string;
   /** Absolute manage-candidates URL for the vacancy this applicant applied to. */
   vacancy_link?: string;
+  /** Real job description read from the authenticated edit page (Detail Pelengkap). */
+  vacancy_description?: string | null;
 };
 
 /**
@@ -124,7 +126,7 @@ type Education = {
 /**
  * Represents a vacancy page.
  */
-type VacancyPage = { title: string; link: string; jobId: string };
+type VacancyPage = { title: string; link: string; jobId: string; editLink?: string };
 
 /**
  * Represents an applicant for a jobVacancy position in the database.
@@ -1329,7 +1331,12 @@ export class Glints {
         url_profile: param.url_profile,
         vacancy_link: param.vacancy_link ?? param.url_profile,
         vacancy_url: param.vacancy_link ?? param.url_profile,
-        vacancy_raw: { type: param.type },
+        vacancy_raw: {
+          type: param.type,
+          ...(param.vacancy_description?.trim()
+            ? { description: param.vacancy_description.trim() }
+            : {}),
+        },
         portal_candidate_id: param.portal_candidate_id,
         name: param.name,
         email: param.email,
@@ -1455,13 +1462,77 @@ export class Glints {
   }
 
   /**
+   * Reads a vacancy's real job description from the currently open Glints job
+   * edit page (the "Detail Pelengkap" / tab=ENHANCE view is where the full
+   * description field lives). Tries the description form controls first, then
+   * falls back to a labelled body scrape. Any miss returns "" — a layout
+   * change costs one vacancy's description, never the run.
+   */
+  async extractVacancyDescription(page: any): Promise<string> {
+    const selectors = [
+      '[data-testid*="description" i]',
+      '[name*="description" i]',
+      'textarea[placeholder*="deskripsi" i]',
+      'textarea[placeholder*="description" i]',
+      '[contenteditable="true"]',
+    ];
+    for (const selector of selectors) {
+      try {
+        const locator = page.locator(selector).first();
+        if ((await locator.count()) === 0 || !(await locator.isVisible().catch(() => false))) {
+          continue;
+        }
+        const value = await locator.inputValue().catch(async () => await locator.textContent());
+        if (value?.trim()) {
+          return value.replace(/\s+/g, " ").trim();
+        }
+      } catch {
+        // try the next selector
+      }
+    }
+    const body = (await page.locator("body").textContent().catch(() => ""))?.replace(/\s+/g, " ").trim() ?? "";
+    return body.match(/(?:deskripsi pekerjaan|deskripsi|job description|description)\s*:?\s*(.{40,}?)(?=\s+(?:persyaratan|kualifikasi|requirement|benefit|tunjangan|gaji|salary|lokasi|location)\b|$)/i)?.[1]?.trim() ?? "";
+  }
+
+  /**
+   * Opens a vacancy's authenticated edit page (reached from the dashboard via
+   * Ubah/Edit -> Detail Pelengkap), reads the description, then returns to the
+   * page it started on so the applicant loop resumes untouched. Best-effort:
+   * a missing edit link or navigation error degrades to "".
+   */
+  async extractVacancyDescriptionFromEditPage(page: any, editLink?: string): Promise<string> {
+    if (!editLink) {
+      return "";
+    }
+    const returnUrl = page.url();
+    try {
+      const enhanceUrl = new URL(editLink);
+      if (!enhanceUrl.searchParams.has("tab")) {
+        enhanceUrl.searchParams.set("tab", "ENHANCE");
+      }
+      await page.goto(enhanceUrl.toString(), { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+      await page.waitForTimeout(1500);
+      return await this.extractVacancyDescription(page);
+    } catch (error) {
+      console.warn(`[GLINTS] Failed to read vacancy description from ${editLink}: ${String(error)}`);
+      return "";
+    } finally {
+      try {
+        await page.goto(returnUrl, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+      } catch {
+        // the caller re-navigates per vacancy anyway
+      }
+    }
+  }
+
+  /**
    * Extracts a list of vacancy pages from a given page.
    * @param page - The page to extract vacancy pages from.
    * @returns A promise that resolves to an array of VacancyPage objects.
    */
   async ExtractListVacancyPage(page: any): Promise<VacancyPage[]> {
     const vacancies = await page.evaluate(() => {
-      const byJobId = new Map<string, { title: string; link: string; isBaseLink: boolean }>();
+      const byJobId = new Map<string, { title: string; link: string; editLink?: string; isBaseLink: boolean }>();
       const links = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/manage-candidates"]'));
 
       for (const link of links) {
@@ -1469,6 +1540,8 @@ export class Glints {
         const jobId = href.searchParams.get("jid") ?? href.href;
         const card = link.closest('[data-cy="job-card-listed"]');
         const title = card?.querySelector('[data-cy="job-title-text"]')?.textContent?.trim() ?? "";
+        const editHref = card?.querySelector<HTMLAnchorElement>('a[href*="/job/edit/"]')?.getAttribute("href") ?? undefined;
+        const editLink = editHref ? new URL(editHref, "https://employers.glints.id").toString() : undefined;
         const isBaseLink = !href.searchParams.has("status");
 
         if (!title) {
@@ -1477,11 +1550,18 @@ export class Glints {
 
         const existing = byJobId.get(jobId);
         if (!existing || isBaseLink) {
-          byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
+          byJobId.set(jobId, { title, link: href.toString(), editLink: editLink ?? existing?.editLink, isBaseLink });
+        } else if (editLink && !existing.editLink) {
+          existing.editLink = editLink;
         }
       }
 
-      return Array.from(byJobId.entries()).map(([jobId, { title, link }]) => ({ title, link, jobId }));
+      return Array.from(byJobId.entries()).map(([jobId, { title, link, editLink }]) => ({
+        title,
+        link,
+        jobId,
+        ...(editLink ? { editLink } : {}),
+      }));
     });
 
     console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
@@ -1784,6 +1864,13 @@ export class Glints {
       // the page opens on the default applicants view.
       const vacancyUrl = new URL(it.link, "https://employers.glints.id");
       vacancyUrl.searchParams.delete("atsTab");
+
+      // Read the real job description from the authenticated edit page
+      // (Detail Pelengkap) once per vacancy, before walking its applicants, so
+      // every applicant row carries it into raw.description. Best-effort: an
+      // empty result just leaves the description blank for this vacancy.
+      const vacancyDescription = await this.extractVacancyDescriptionFromEditPage(page, it.editLink);
+
       await page.goto(vacancyUrl.toString());
 
       // The candidate table hydrates well after domcontentloaded (the page
@@ -1838,7 +1925,7 @@ export class Glints {
           break;
         }
 
-        await this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString());
+        await this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString(), vacancyDescription);
 
         // Check if there is a next page
         const nextPage = page.locator('[data-testid="next-page"]');
@@ -1867,7 +1954,7 @@ export class Glints {
    * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
    *                            If an error occurs during extraction or processing, the promise is rejected.
    */
-  async ExtractApplicantDetail(page: any, job: string, jobId: string, vacancyLink: string): Promise<void> {
+  async ExtractApplicantDetail(page: any, job: string, jobId: string, vacancyLink: string, vacancyDescription = ""): Promise<void> {
     const locatorListApplicant = GLINTS_APPLICANT_ROW_SELECTOR;
     const lv = page.locator(locatorListApplicant);
     const rows = await Promise.all(
@@ -1966,6 +2053,7 @@ export class Glints {
           portal_candidate_id: detail?.applicantId ?? "",
           portal_vacancy_id: jobId,
           vacancy_link: vacancyLink,
+          vacancy_description: vacancyDescription || null,
         }
 
         await this.sendToSink(applicant)

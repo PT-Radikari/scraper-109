@@ -92,6 +92,124 @@ describe("portal extraction helpers", () => {
     ]);
   });
 
+  it("captures the Glints job edit link so descriptions can be read from Detail Pelengkap", async () => {
+    const config: GlintsConfigJson = {
+      headless: true,
+      cookies: [],
+      local_storage: [],
+      limit: 0,
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: dbPathForSource(tempDir, "glints.db"),
+    };
+    const scraper = new Glints(config);
+    const card = {
+      querySelector: (selector: string) => {
+        if (selector === '[data-cy="job-title-text"]') return { textContent: "Contact Center Agent" };
+        if (selector === 'a[href*="/job/edit/"]') {
+          return { getAttribute: (n: string) => (n === "href" ? "/job/edit/ebf41bfc?tab=ENHANCE" : null) };
+        }
+        return null;
+      },
+    };
+    const links = [
+      { href: "/manage-candidates?jid=job-b", closest: () => card },
+    ].map((link) => ({
+      href: `https://employers.glints.id${link.href}`,
+      textContent: "Kelola Kandidat",
+      getAttribute: (name: string) => (name === "href" ? link.href : null),
+      closest: link.closest,
+    }));
+
+    const page = {
+      evaluate: async (callback: () => unknown) => {
+        const previousDocument = (global as any).document;
+        (global as any).document = {
+          querySelectorAll: (selector: string) =>
+            selector === 'a[href*="/manage-candidates"]' ? links : [],
+        };
+        try {
+          return callback();
+        } finally {
+          (global as any).document = previousDocument;
+        }
+      },
+    };
+
+    await expect(scraper.ExtractListVacancyPage(page)).resolves.toEqual([
+      {
+        title: "Contact Center Agent",
+        link: "https://employers.glints.id/manage-candidates?jid=job-b",
+        jobId: "job-b",
+        editLink: "https://employers.glints.id/job/edit/ebf41bfc?tab=ENHANCE",
+      },
+    ]);
+  });
+
+  it("reads the vacancy description from the edit page and returns to the applicant page", async () => {
+    const config: GlintsConfigJson = {
+      headless: true,
+      cookies: [],
+      local_storage: [],
+      limit: 0,
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: dbPathForSource(tempDir, "glints.db"),
+    };
+    const scraper = new Glints(config);
+
+    let currentUrl = "https://employers.glints.id/manage-candidates?jid=job-b";
+    const visited: string[] = [];
+    const page = {
+      url: () => currentUrl,
+      goto: async (url: string) => {
+        currentUrl = url;
+        visited.push(url);
+      },
+      waitForTimeout: async () => undefined,
+      locator: (selector: string) => ({
+        first: () => ({
+          count: async () => (selector.includes("description") ? 1 : 0),
+          isVisible: async () => true,
+          inputValue: async () => "Handle inbound customer calls and resolve issues.",
+          textContent: async () => "Handle inbound customer calls and resolve issues.",
+        }),
+        count: async () => (selector.includes("description") ? 1 : 0),
+        isVisible: async () => true,
+        inputValue: async () => "Handle inbound customer calls and resolve issues.",
+        textContent: async () => "Handle inbound customer calls and resolve issues.",
+      }),
+    };
+
+    const description = await scraper.extractVacancyDescriptionFromEditPage(
+      page as any,
+      "https://employers.glints.id/job/edit/ebf41bfc",
+    );
+
+    expect(description).toBe("Handle inbound customer calls and resolve issues.");
+    // Navigated to the ENHANCE edit tab, then back to the applicant page.
+    expect(visited[0]).toContain("tab=ENHANCE");
+    expect(currentUrl).toBe("https://employers.glints.id/manage-candidates?jid=job-b");
+  });
+
+  it("returns an empty description when the vacancy has no edit link", async () => {
+    const config: GlintsConfigJson = {
+      headless: true,
+      cookies: [],
+      local_storage: [],
+      limit: 0,
+      api_destination: "http://127.0.0.1/unused",
+      timeout: 1000,
+      slowmo: 0,
+      db_path: dbPathForSource(tempDir, "glints.db"),
+    };
+    const scraper = new Glints(config);
+    const page = { url: () => "x", goto: async () => undefined } as any;
+    await expect(scraper.extractVacancyDescriptionFromEditPage(page, undefined)).resolves.toBe("");
+  });
+
   it("keeps a semantic fallback when the Glints Polaris row class drifts", () => {
     expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain(".Polaris-IndexTable__TableRow");
     expect(GLINTS_APPLICANT_ROW_SELECTOR).toContain('[data-testid="candidate-row"]');
