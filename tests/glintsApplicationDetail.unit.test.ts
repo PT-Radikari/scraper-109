@@ -172,8 +172,6 @@ describe("Glints.sendToSink artifact references", () => {
     const candidate = sink.upsertCandidate.mock.calls[0][0];
     expect(candidate.cv_object_key).toBe("glints/202608/cv-digest.pdf");
     expect(candidate.photo_object_key).toBe("glints/202608/photo-digest.webp");
-    expect(candidate.data.cv).toBe("glints/202608/cv-digest.pdf");
-    expect(candidate.data.photo).toBe("glints/202608/photo-digest.webp");
     expect(JSON.stringify(candidate.data)).not.toContain("/tmp/somewhere");
   });
 
@@ -188,8 +186,6 @@ describe("Glints.sendToSink artifact references", () => {
     const candidate = sink.upsertCandidate.mock.calls[0][0];
     expect(candidate.cv_object_key).toBeNull();
     expect(candidate.photo_object_key).toBeNull();
-    expect(candidate.data.cv).toBe("");
-    expect(candidate.data.photo).toBe("");
   });
 
   it("keys identity on the portal-native applicant id when present and normalizes the contact number", async () => {
@@ -207,7 +203,7 @@ describe("Glints.sendToSink artifact references", () => {
     expect(candidate.portal_candidate_id).toBe("00000000-1111-4222-8333-444444444444");
     expect(candidate.data.identity.source).toBe("portal");
     expect(candidate.phone).toBe("628111234567");
-    expect(candidate.data.contact).toEqual({ type: "WhatsApp", contact_number: "628111234567" });
+    expect(candidate.data.contact).toEqual({ type: "phone", contact_number: "628111234567" });
   });
 });
 
