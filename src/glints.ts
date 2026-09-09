@@ -136,6 +136,64 @@ type ApplicantDB = Pick<Applicant, "email"> & {
 export const GLINTS_APPLICANT_ROW_SELECTOR =
   '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
 
+/**
+ * A pipeline stage the scraper iterates on each vacancy's manage-candidates
+ * page. Stage tabs on that page are read-only filters: switching to one only
+ * changes the visible candidate list and never moves an applicant between
+ * stages, so iterating both "BARU" (the default view — un-progressed
+ * applications whose contact is masked by Glints) and "TERHUBUNG" (the
+ * connected stage — WhatsApp + email are unmasked once an applicant reaches
+ * this stage, regardless of who moved them there) captures unmasked contacts
+ * without progressing anyone's pipeline. Adding a third stage means appending
+ * one entry here; nothing else needs to know about it.
+ */
+export type GlintsPipelineStage = {
+  /** Log/debug key — id-only, lowercase, no whitespace. */
+  key: "baru" | "terhubung";
+  /** Human label used in log lines. */
+  label: string;
+  /**
+   * Visible texts on the stage-filter tab bar the dashboard renders above the
+   * candidate table — id and en variants. The tab is matched by any of them.
+   */
+  tabTexts: readonly string[];
+  /**
+   * Text inside the applicant modal identifying its current pipeline status.
+   * This anchor is what `ExtractApplicantDetail` walks up from to reach the
+   * modal-detail container — it must match the stage's own badge text.
+   */
+  modalBadgePattern: RegExp;
+  /**
+   * When true, the stage is the vacancy page's default view and no tab click
+   * is required. Non-default stages need their tab clicked before rows load.
+   */
+  isDefault?: boolean;
+};
+
+/**
+ * Ordered list of stages the scraper iterates per vacancy. The default stage
+ * comes first so an early LIMIT hit still returns the un-progressed applicants
+ * first (existing behaviour). Terhubung was added to capture unmasked contact
+ * info without progressing anyone — see `GlintsPipelineStage` above.
+ */
+export const GLINTS_PIPELINE_STAGES: readonly GlintsPipelineStage[] = [
+  {
+    key: "baru",
+    label: "BARU",
+    // The default vacancy view already shows un-progressed applications, so
+    // no tab click is issued. Text list kept for symmetry / future refactor.
+    tabTexts: ["Belum Sesuai", "NEW", "New"],
+    modalBadgePattern: /^\s*(Belum Sesuai|NEW)\s*$/i,
+    isDefault: true,
+  },
+  {
+    key: "terhubung",
+    label: "TERHUBUNG",
+    tabTexts: ["Terhubung", "Connected"],
+    modalBadgePattern: /^\s*(Terhubung|Connected)\s*$/i,
+  },
+];
+
 const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
 const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
 const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
@@ -1784,75 +1842,124 @@ export class Glints {
       // the page opens on the default applicants view.
       const vacancyUrl = new URL(it.link, "https://employers.glints.id");
       vacancyUrl.searchParams.delete("atsTab");
-      await page.goto(vacancyUrl.toString());
 
-      // The candidate table hydrates well after domcontentloaded (the page
-      // shows "Memuat..." for many seconds); poll until either the empty-state
-      // marker or the first applicant row renders before deciding to skip.
-      const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
-      const applicantRows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
-      const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
-      // The empty-state wrapper can flash while the table hydrates (observed
-      // live: the same vacancy showed it on one run and 8 rows on the next),
-      // so a single sighting is not proof of emptiness — require it to hold
-      // for several consecutive polls with no data rows.
-      let emptyStreak = 0;
-      let confirmedEmpty = false;
-      let rowsSettled = false;
-      for (let i = 0; i < settleAttempts; i++) {
-        await page.waitForTimeout(1000);
-        const emptyCount = await emptyMarker.count();
-        if ((await applicantRows.count()) > 0 && emptyCount === 0) {
-          rowsSettled = true;
+      // Iterate each pipeline stage. The BARU stage is the vacancy page's
+      // default view (no tab click); TERHUBUNG has to be selected via its
+      // stage-filter tab, and its rows carry unmasked contact info without
+      // any applicant being progressed. Stage tabs are filter-only — a click
+      // never moves an applicant between stages.
+      for (const stage of GLINTS_PIPELINE_STAGES) {
+        if (this.COLLECTED == this.LIMIT) {
           break;
         }
-        if (emptyCount > 0) {
-          if (++emptyStreak >= 8) {
-            confirmedEmpty = true;
+
+        // Re-navigate to the vacancy for every stage so pagination state
+        // never leaks between stages and the default (BARU) view is what
+        // we start from before switching filters.
+        await page.goto(vacancyUrl.toString());
+
+        const stageSelected = await this.selectPipelineStage(page, stage);
+        if (!stageSelected) {
+          console.warn(`[GLINTS] Stage "${stage.label}" tab not found for vacancy "${it.title}" (${page.url()}); skipping this stage`);
+          continue;
+        }
+
+        // The candidate table hydrates well after domcontentloaded (the page
+        // shows "Memuat..." for many seconds); poll until either the empty-state
+        // marker or the first applicant row renders before deciding to skip.
+        const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+        const applicantRows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
+        const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+        // The empty-state wrapper can flash while the table hydrates (observed
+        // live: the same vacancy showed it on one run and 8 rows on the next),
+        // so a single sighting is not proof of emptiness — require it to hold
+        // for several consecutive polls with no data rows.
+        let emptyStreak = 0;
+        let confirmedEmpty = false;
+        let rowsSettled = false;
+        for (let i = 0; i < settleAttempts; i++) {
+          await page.waitForTimeout(1000);
+          const emptyCount = await emptyMarker.count();
+          if ((await applicantRows.count()) > 0 && emptyCount === 0) {
+            rowsSettled = true;
             break;
           }
-        } else {
-          emptyStreak = 0;
-        }
-      }
-
-      // Skip job if no candidates in this stage
-      if (confirmedEmpty) {
-        console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
-        continue;
-      }
-      if (!rowsSettled && await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
-        const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
-        console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
-        continue;
-      }
-
-      let isNext = true;
-      do {
-        // wait 5 seconds before, avoid rendering list employees
-        await page.waitForTimeout(5000);
-        // Check for lazy-loaded elements before proceeding
-        await this.checkLazyLoadedElement(page, GLINTS_APPLICANT_ROW_SELECTOR);
-
-        if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
-          break;
+          if (emptyCount > 0) {
+            if (++emptyStreak >= 8) {
+              confirmedEmpty = true;
+              break;
+            }
+          } else {
+            emptyStreak = 0;
+          }
         }
 
-        await this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString());
-
-        // Check if there is a next page
-        const nextPage = page.locator('[data-testid="next-page"]');
-        isNext = await nextPage.count() === 0 || await nextPage.isDisabled();
-        if (!isNext) {
-          // Click on the "Next" button to move to the next page
-          await nextPage.click();
+        // Skip stage if no candidates
+        if (confirmedEmpty) {
+          console.info(`[GLINTS] No candidates in stage "${stage.label}" for vacancy "${it.title}" (${page.url()})`);
+          continue;
         }
-      } while (!isNext && this.COLLECTED < this.LIMIT);
+        if (!rowsSettled && await page.locator(GLINTS_APPLICANT_ROW_SELECTOR).count() === 0) {
+          const pageText = (await page.locator("body").textContent())?.replace(/\s+/g, " ").trim().slice(0, 500);
+          console.warn(`[GLINTS] Candidate table missing for stage "${stage.label}" vacancy "${it.title}" at ${page.url()}: ${pageText}`);
+          continue;
+        }
 
+        let isNext = true;
+        do {
+          // wait 5 seconds before, avoid rendering list employees
+          await page.waitForTimeout(5000);
+          // Check for lazy-loaded elements before proceeding
+          await this.checkLazyLoadedElement(page, GLINTS_APPLICANT_ROW_SELECTOR);
+
+          if (await page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count() > 0) {
+            break;
+          }
+
+          await this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString(), stage);
+
+          // Check if there is a next page
+          const nextPage = page.locator('[data-testid="next-page"]');
+          isNext = await nextPage.count() === 0 || await nextPage.isDisabled();
+          if (!isNext) {
+            // Click on the "Next" button to move to the next page
+            await nextPage.click();
+          }
+        } while (!isNext && this.COLLECTED < this.LIMIT);
+
+      }
     }
 
     await browser.close();
     console.log("DONE");
+  }
+
+  /**
+   * Switches the vacancy's manage-candidates page to the given pipeline
+   * stage's tab. Read-only: clicking a stage-filter tab never moves an
+   * applicant between stages — it just changes which rows the candidate
+   * table renders. The default (BARU) stage is already shown by the page's
+   * initial load and needs no click, so it always resolves true.
+   *
+   * For a non-default stage the tab is matched by any of its `tabTexts`
+   * (id + en variants). A stage whose tab is not present on the page
+   * resolves false; the caller then skips the stage with a warn log rather
+   * than failing the vacancy.
+   */
+  async selectPipelineStage(page: any, stage: GlintsPipelineStage): Promise<boolean> {
+    if (stage.isDefault) {
+      return true;
+    }
+    for (const tabText of stage.tabTexts) {
+      const tabButton = page.locator(`button:has-text("${tabText}")`).first();
+      if ((await tabButton.count()) > 0) {
+        await tabButton.click();
+        // Give the candidate table time to swap in the newly filtered rows.
+        await page.waitForTimeout(1500);
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -1867,7 +1974,7 @@ export class Glints {
    * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
    *                            If an error occurs during extraction or processing, the promise is rejected.
    */
-  async ExtractApplicantDetail(page: any, job: string, jobId: string, vacancyLink: string): Promise<void> {
+  async ExtractApplicantDetail(page: any, job: string, jobId: string, vacancyLink: string, stage: GlintsPipelineStage): Promise<void> {
     const locatorListApplicant = GLINTS_APPLICANT_ROW_SELECTOR;
     const lv = page.locator(locatorListApplicant);
     const rows = await Promise.all(
@@ -1908,20 +2015,21 @@ export class Glints {
         // the modal now.
         await element.locator('.Polaris-IndexTable__TableCell, td').nth(2).click();
 
-        // Scope to the modal: the stage tab bar behind it also reads "Belum
-        // Sesuai"/"NEW" (the modal itself carries
-        // data-testid="modal-wrapper"). The dashboard's UI language is a
-        // per-account server-side setting independent of the browser's
-        // pinned id-ID locale — observed live: an account rendering entirely
-        // in English, where an un-progressed application's status badge
-        // reads "NEW" rather than "Belum Sesuai" ("Not yet assessed", not a
-        // literal "Not Suitable" rejection). Match both.
-        const modalDetailButtonBelumSelesai = await page
+        // Scope to the modal: the stage tab bar behind it also carries the
+        // stage's badge text (the modal itself is data-testid="modal-wrapper").
+        // The dashboard's UI language is a per-account server-side setting
+        // independent of the browser's pinned id-ID locale — observed live:
+        // an account rendering entirely in English, where an un-progressed
+        // application's status badge reads "NEW" rather than "Belum Sesuai"
+        // ("Not yet assessed", not a literal "Not Suitable" rejection). The
+        // badge pattern comes from the stage config so this matches whichever
+        // pipeline stage the row belongs to (BARU, TERHUBUNG, ...).
+        const modalStageBadge = await page
           .getByTestId('modal-wrapper')
-          .getByText(/^\s*(Belum Sesuai|NEW)\s*$/i)
+          .getByText(stage.modalBadgePattern)
           .last();
-        await modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
-        const modalDetail = await modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
+        await modalStageBadge.waitFor({ state: 'visible' });
+        const modalDetail = await modalStageBadge.locator("..").locator("..").locator("..").locator("..").locator("..");
 
         const skills = await this.extractSkills(modalDetail);
         const summary = await this.extractSummary(modalDetail);

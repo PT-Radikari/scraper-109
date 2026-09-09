@@ -6,6 +6,7 @@ import {
   Glints,
   GlintsConfigJson,
   GLINTS_APPLICANT_ROW_SELECTOR,
+  GLINTS_PIPELINE_STAGES,
 } from "../src/glints";
 import type { SeekConfigJson } from "../src/seek";
 
@@ -128,7 +129,7 @@ describe("portal extraction helpers", () => {
       throw new Error("stop row after recording processing order");
     };
 
-    await scraper.ExtractApplicantDetail(page, "Software Engineer", "job-id-unused", "https://employers.glints.id/manage-candidates?jid=job-id-unused");
+    await scraper.ExtractApplicantDetail(page, "Software Engineer", "job-id-unused", "https://employers.glints.id/manage-candidates?jid=job-id-unused", GLINTS_PIPELINE_STAGES[0]);
 
     expect(processedOrder).toEqual([1, 2, 0]);
   });
