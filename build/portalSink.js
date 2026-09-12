@@ -42,7 +42,7 @@ function uploadOptionalArtifact(sink, portal, kind, localPath, bytes) {
  */
 function sendApplicantToSink(sink, a) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s;
         const vacancyId = ((_a = a.vacancy_id) !== null && _a !== void 0 ? _a : "").trim() !== ""
             ? a.vacancy_id.trim()
             : crypto_1.default.createHash("sha1").update(`${a.portal}${a.applied_for}`).digest("hex");
@@ -66,19 +66,23 @@ function sendApplicantToSink(sink, a) {
                 portal_vacancy_id: vacancyId,
                 title: a.applied_for,
                 link: (_c = (_b = a.vacancy_link) !== null && _b !== void 0 ? _b : a.vacancy_url) !== null && _c !== void 0 ? _c : null,
-                description: (_d = a.vacancy_description) !== null && _d !== void 0 ? _d : null,
+                // A row stored before the portal knew its real detail link holds
+                // vacancy_url (the shared list URL) as its link; naming it here lets
+                // the sink replace exactly that value and nothing else.
+                superseded_link: (_d = a.vacancy_url) !== null && _d !== void 0 ? _d : null,
+                description: (_e = a.vacancy_description) !== null && _e !== void 0 ? _e : null,
                 status: "new",
-                raw: Object.assign({ type: "applicant" }, ((_e = a.vacancy_raw) !== null && _e !== void 0 ? _e : {})),
+                raw: Object.assign({ type: "applicant" }, ((_f = a.vacancy_raw) !== null && _f !== void 0 ? _f : {})),
             });
             const candidateRowId = yield sink.upsertCandidate({
                 portal: a.portal,
                 portal_candidate_id: identity.portalCandidateId,
                 email: identity.email,
                 phone: identity.phone,
-                name: (_f = a.name) !== null && _f !== void 0 ? _f : null,
+                name: (_g = a.name) !== null && _g !== void 0 ? _g : null,
                 cv_object_key: cvKey,
                 photo_object_key: photoKey,
-                data: Object.assign(Object.assign({}, ((_g = a.raw) !== null && _g !== void 0 ? _g : {})), { portal: a.portal, applied_for: a.applied_for, applied_date: appliedDate, url_profile: (_h = a.url_profile) !== null && _h !== void 0 ? _h : null, name: (_j = a.name) !== null && _j !== void 0 ? _j : null, email: identity.email, date_of_birth: (_k = a.date_of_birth) !== null && _k !== void 0 ? _k : null, location: (_l = a.location) !== null && _l !== void 0 ? _l : null, contact: { type: "phone", contact_number: (_o = (_m = identity.phone) !== null && _m !== void 0 ? _m : a.phone) !== null && _o !== void 0 ? _o : "" }, work_experience: (_p = a.work_experience) !== null && _p !== void 0 ? _p : [], education: (_q = a.education) !== null && _q !== void 0 ? _q : [], skill: (_r = a.skill) !== null && _r !== void 0 ? _r : [], identity: {
+                data: Object.assign(Object.assign({}, ((_h = a.raw) !== null && _h !== void 0 ? _h : {})), { portal: a.portal, applied_for: a.applied_for, applied_date: appliedDate, url_profile: (_j = a.url_profile) !== null && _j !== void 0 ? _j : null, name: (_k = a.name) !== null && _k !== void 0 ? _k : null, email: identity.email, date_of_birth: (_l = a.date_of_birth) !== null && _l !== void 0 ? _l : null, location: (_m = a.location) !== null && _m !== void 0 ? _m : null, contact: { type: "phone", contact_number: (_p = (_o = identity.phone) !== null && _o !== void 0 ? _o : a.phone) !== null && _p !== void 0 ? _p : "" }, work_experience: (_q = a.work_experience) !== null && _q !== void 0 ? _q : [], education: (_r = a.education) !== null && _r !== void 0 ? _r : [], skill: (_s = a.skill) !== null && _s !== void 0 ? _s : [], identity: {
                         source: identity.source,
                         low_confidence: identity.lowConfidence,
                         email: identity.email,

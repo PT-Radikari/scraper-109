@@ -139,6 +139,10 @@ export async function sendApplicantToSink(
       portal_vacancy_id: vacancyId,
       title: a.applied_for,
       link: a.vacancy_link ?? a.vacancy_url ?? null,
+      // A row stored before the portal knew its real detail link holds
+      // vacancy_url (the shared list URL) as its link; naming it here lets
+      // the sink replace exactly that value and nothing else.
+      superseded_link: a.vacancy_url ?? null,
       description: a.vacancy_description ?? null,
       status: "new",
       raw: { type: "applicant", ...(a.vacancy_raw ?? {}) },

@@ -31,6 +31,13 @@ export interface VacancyInput {
   portal_vacancy_id: string;
   title?: string | null;
   link?: string | null;
+  /**
+   * The list/fallback URL this vacancy's `link` was previously written from
+   * (the portal's shared applicants-list URL). Only a stored link equal to
+   * this one is treated as stale and replaced by `link`; any other stored
+   * value is left alone. See the backfill note on upsertVacancy.
+   */
+  superseded_link?: string | null;
   description?: string | null;
   link_recommendation?: string | null;
   total_applicant?: number | null;
@@ -160,6 +167,9 @@ export class SupabaseSink {
   private readonly anonKey: string;
   private readonly bucket: string;
   private readonly serviceKey: string | null;
+  /** Latches once so a refused link/raw backfill logs one line, not one per row. */
+  private warnedMissingVacancyBackfillGrant = false;
+
   /** Latches once so a missing description column logs one line, not one per row. */
   private warnedMissingDescriptionColumn = false;
 
@@ -288,9 +298,11 @@ export class SupabaseSink {
    */
   async upsertVacancy(v: VacancyInput): Promise<number> {
     return this.guard("upsertVacancy", async () => {
+      // superseded_link is a comparison input, not a column.
+      const { superseded_link: supersededLink, ...row } = v;
       const response = await axios.post(
         `${this.url}/rest/v1/portal_vacancies`,
-        [v],
+        [row],
         {
           headers: this.headers({
             Prefer: "resolution=ignore-duplicates, return=representation",
@@ -298,7 +310,8 @@ export class SupabaseSink {
           params: { on_conflict: "portal,portal_vacancy_id" },
         }
       );
-      const id = response.data[0]
+      const inserted = Boolean(response.data[0]);
+      const id = inserted
         ? Number(response.data[0].id)
         : await this.findId("portal_vacancies", {
             portal: `eq.${v.portal}`,
@@ -338,8 +351,95 @@ export class SupabaseSink {
           }
         }
       }
+
+      if (!inserted) {
+        await this.backfillVacancyContent(id, v, supersededLink ?? null);
+      }
       return id;
     });
+  }
+
+  /**
+   * Fills in what an already-stored vacancy row is missing, and nothing more.
+   *
+   * A vacancy row is written once (`resolution=ignore-duplicates`), so a
+   * vacancy first seen by an older build keeps that build's `link` and `raw`
+   * forever — for KitaLulus, the shared applicants-list URL and a raw blob
+   * with no detail sections. This converges those rows without ever
+   * overwriting content a scrape already captured:
+   *
+   * - `link` is written when the stored one is empty, or when it is exactly
+   *   the `superseded_link` the caller names (the list URL this sink itself
+   *   previously wrote as the fallback) and a different link is now known.
+   *   Any other stored value is left alone — it was not written by this
+   *   fallback path, so it is not ours to replace.
+   * - `raw` gains only keys it does not already hold a non-null value for;
+   *   existing keys always win.
+   *
+   * Best-effort, like the description write above: a deployment where the
+   * backfill_vacancy_link_and_raw migration has not granted anon UPDATE on
+   * these columns logs one line and keeps the applicant, rather than failing
+   * the row over a refresh.
+   */
+  private async backfillVacancyContent(
+    id: number,
+    v: VacancyInput,
+    supersededLink: string | null,
+  ): Promise<void> {
+    const incomingRaw = v.raw ?? null;
+    const incomingLink = v.link?.trim() || null;
+    if (!incomingLink && !incomingRaw) return;
+
+    let existing: { link?: string | null; raw?: Record<string, unknown> | null };
+    try {
+      const response = await axios.get(`${this.url}/rest/v1/portal_vacancies`, {
+        headers: this.headers(),
+        params: { select: "link,raw", id: `eq.${id}`, limit: 1 },
+      });
+      existing = response.data[0] ?? {};
+    } catch {
+      return;
+    }
+
+    const patch: Record<string, unknown> = {};
+
+    const storedLink = typeof existing.link === "string" ? existing.link.trim() : "";
+    if (incomingLink && incomingLink !== storedLink) {
+      const stale = supersededLink !== null && storedLink === supersededLink.trim();
+      if (!storedLink || stale) patch.link = incomingLink;
+    }
+
+    if (incomingRaw) {
+      const storedRaw =
+        existing.raw && typeof existing.raw === "object" ? (existing.raw as Record<string, unknown>) : {};
+      const merged = { ...storedRaw };
+      let added = false;
+      for (const [key, value] of Object.entries(incomingRaw)) {
+        if (value === null || value === undefined) continue;
+        const held = storedRaw[key];
+        if (held === undefined || held === null) {
+          merged[key] = value;
+          added = true;
+        }
+      }
+      if (added) patch.raw = merged;
+    }
+
+    if (Object.keys(patch).length === 0) return;
+
+    try {
+      await axios.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, patch, {
+        headers: this.headers({ Prefer: "return=minimal" }),
+      });
+    } catch (error) {
+      if (!this.warnedMissingVacancyBackfillGrant) {
+        this.warnedMissingVacancyBackfillGrant = true;
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        console.warn(
+          `[SINK] portal_vacancies link/raw backfill refused${status ? ` (${status})` : ""} — apply the backfill_vacancy_link_and_raw migration to let existing rows converge.`,
+        );
+      }
+    }
   }
 
   /**

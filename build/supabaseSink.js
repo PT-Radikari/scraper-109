@@ -108,6 +108,8 @@ class SupabaseSink {
     }
     constructor(config) {
         var _a, _b, _c, _d, _e, _f, _g, _h;
+        /** Latches once so a refused link/raw backfill logs one line, not one per row. */
+        this.warnedMissingVacancyBackfillGrant = false;
         /** Latches once so a missing description column logs one line, not one per row. */
         this.warnedMissingDescriptionColumn = false;
         this.url = ((_b = (_a = config === null || config === void 0 ? void 0 : config.url) !== null && _a !== void 0 ? _a : process.env.SCORING_SUPABASE_URL) !== null && _b !== void 0 ? _b : "").replace(/\/+$/, "");
@@ -206,13 +208,16 @@ class SupabaseSink {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("upsertVacancy", () => __awaiter(this, void 0, void 0, function* () {
                 var _a;
-                const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_vacancies`, [v], {
+                // superseded_link is a comparison input, not a column.
+                const { superseded_link: supersededLink } = v, row = __rest(v, ["superseded_link"]);
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_vacancies`, [row], {
                     headers: this.headers({
                         Prefer: "resolution=ignore-duplicates, return=representation",
                     }),
                     params: { on_conflict: "portal,portal_vacancy_id" },
                 });
-                const id = response.data[0]
+                const inserted = Boolean(response.data[0]);
+                const id = inserted
                     ? Number(response.data[0].id)
                     : yield this.findId("portal_vacancies", {
                         portal: `eq.${v.portal}`,
@@ -242,8 +247,90 @@ class SupabaseSink {
                         }
                     }
                 }
+                if (!inserted) {
+                    yield this.backfillVacancyContent(id, v, supersededLink !== null && supersededLink !== void 0 ? supersededLink : null);
+                }
                 return id;
             }));
+        });
+    }
+    /**
+     * Fills in what an already-stored vacancy row is missing, and nothing more.
+     *
+     * A vacancy row is written once (`resolution=ignore-duplicates`), so a
+     * vacancy first seen by an older build keeps that build's `link` and `raw`
+     * forever — for KitaLulus, the shared applicants-list URL and a raw blob
+     * with no detail sections. This converges those rows without ever
+     * overwriting content a scrape already captured:
+     *
+     * - `link` is written when the stored one is empty, or when it is exactly
+     *   the `superseded_link` the caller names (the list URL this sink itself
+     *   previously wrote as the fallback) and a different link is now known.
+     *   Any other stored value is left alone — it was not written by this
+     *   fallback path, so it is not ours to replace.
+     * - `raw` gains only keys it does not already hold a non-null value for;
+     *   existing keys always win.
+     *
+     * Best-effort, like the description write above: a deployment where the
+     * backfill_vacancy_link_and_raw migration has not granted anon UPDATE on
+     * these columns logs one line and keeps the applicant, rather than failing
+     * the row over a refresh.
+     */
+    backfillVacancyContent(id, v, supersededLink) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c, _d;
+            const incomingRaw = (_a = v.raw) !== null && _a !== void 0 ? _a : null;
+            const incomingLink = ((_b = v.link) === null || _b === void 0 ? void 0 : _b.trim()) || null;
+            if (!incomingLink && !incomingRaw)
+                return;
+            let existing;
+            try {
+                const response = yield axios_1.default.get(`${this.url}/rest/v1/portal_vacancies`, {
+                    headers: this.headers(),
+                    params: { select: "link,raw", id: `eq.${id}`, limit: 1 },
+                });
+                existing = (_c = response.data[0]) !== null && _c !== void 0 ? _c : {};
+            }
+            catch (_e) {
+                return;
+            }
+            const patch = {};
+            const storedLink = typeof existing.link === "string" ? existing.link.trim() : "";
+            if (incomingLink && incomingLink !== storedLink) {
+                const stale = supersededLink !== null && storedLink === supersededLink.trim();
+                if (!storedLink || stale)
+                    patch.link = incomingLink;
+            }
+            if (incomingRaw) {
+                const storedRaw = existing.raw && typeof existing.raw === "object" ? existing.raw : {};
+                const merged = Object.assign({}, storedRaw);
+                let added = false;
+                for (const [key, value] of Object.entries(incomingRaw)) {
+                    if (value === null || value === undefined)
+                        continue;
+                    const held = storedRaw[key];
+                    if (held === undefined || held === null) {
+                        merged[key] = value;
+                        added = true;
+                    }
+                }
+                if (added)
+                    patch.raw = merged;
+            }
+            if (Object.keys(patch).length === 0)
+                return;
+            try {
+                yield axios_1.default.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, patch, {
+                    headers: this.headers({ Prefer: "return=minimal" }),
+                });
+            }
+            catch (error) {
+                if (!this.warnedMissingVacancyBackfillGrant) {
+                    this.warnedMissingVacancyBackfillGrant = true;
+                    const status = axios_1.default.isAxiosError(error) ? (_d = error.response) === null || _d === void 0 ? void 0 : _d.status : undefined;
+                    console.warn(`[SINK] portal_vacancies link/raw backfill refused${status ? ` (${status})` : ""} — apply the backfill_vacancy_link_and_raw migration to let existing rows converge.`);
+                }
+            }
         });
     }
     /**

@@ -95,6 +95,170 @@ describe("SupabaseSink", () => {
       );
     });
 
+    // ── existing-row backfill (link / raw) ────────────────────────────────
+    //
+    // Vacancy rows are write-once, so a vacancy first seen by an older build
+    // keeps that build's link (the shared applicants-list URL) and a raw blob
+    // with no detail sections. These cover the narrow convergence path added
+    // for that: fill what is empty, replace only the list URL this sink wrote
+    // itself, and never overwrite anything already captured.
+    describe("backfill on an existing row", () => {
+      /** post ignored (row exists) -> findId -> read link/raw for the backfill. */
+      function existingRow(row: { link?: string | null; raw?: Record<string, unknown> | null }) {
+        mockedAxios.post.mockResolvedValueOnce({ data: [] } as never);
+        mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 9 }] } as never);
+        mockedAxios.get.mockResolvedValueOnce({ data: [row] } as never);
+      }
+
+      function backfillPatch() {
+        return mockedAxios.patch.mock.calls.find(
+          (call) => call[0] === `${URL}/rest/v1/portal_vacancies?id=eq.9` &&
+            typeof call[1] === "object" &&
+            call[1] !== null &&
+            !("last_seen_at" in (call[1] as object)),
+        )?.[1] as Record<string, unknown> | undefined;
+      }
+
+      it("replaces a stored link that is exactly the superseded list URL", async () => {
+        existingRow({ link: "https://portal.example/applicants?vacancy_id=v-1", raw: null });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          superseded_link: "https://portal.example/applicants?vacancy_id=v-1",
+        });
+
+        expect(backfillPatch()).toEqual({ link: "https://portal.example/vacancy/v-1" });
+      });
+
+      it("fills an empty link", async () => {
+        existingRow({ link: "", raw: null });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          superseded_link: "https://portal.example/applicants?vacancy_id=v-1",
+        });
+
+        expect(backfillPatch()).toEqual({ link: "https://portal.example/vacancy/v-1" });
+      });
+
+      it("leaves a stored link that is neither empty nor the superseded one", async () => {
+        existingRow({ link: "https://portal.example/curated-link", raw: null });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          superseded_link: "https://portal.example/applicants?vacancy_id=v-1",
+        });
+
+        expect(backfillPatch()).toBeUndefined();
+      });
+
+      it("adds only raw keys the stored blob does not already hold", async () => {
+        existingRow({
+          link: "https://portal.example/vacancy/v-1",
+          raw: { type: "applicant", description: "already captured", detail_sections: null },
+        });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          raw: {
+            type: "applicant",
+            description: "fresher text",
+            detail_sections: { "Informasi Lowongan": { "Nama pekerjaan": "Driver" } },
+          },
+        });
+
+        expect(backfillPatch()).toEqual({
+          raw: {
+            type: "applicant",
+            description: "already captured",
+            detail_sections: { "Informasi Lowongan": { "Nama pekerjaan": "Driver" } },
+          },
+        });
+      });
+
+      it("patches nothing when the stored row already holds everything", async () => {
+        existingRow({
+          link: "https://portal.example/vacancy/v-1",
+          raw: { type: "applicant", detail_sections: { a: 1 } },
+        });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          raw: { type: "applicant", detail_sections: { b: 2 } },
+        });
+
+        expect(backfillPatch()).toBeUndefined();
+      });
+
+      it("never sends superseded_link as a column", async () => {
+        existingRow({ link: "", raw: null });
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          superseded_link: "https://portal.example/applicants?vacancy_id=v-1",
+        });
+
+        const posted = (mockedAxios.post.mock.calls[0][1] as Array<Record<string, unknown>>)[0];
+        expect(posted).not.toHaveProperty("superseded_link");
+      });
+
+      it("keeps the applicant when the backfill patch is refused (grant not applied yet)", async () => {
+        existingRow({ link: "", raw: null });
+        mockedAxios.patch
+          .mockResolvedValueOnce({ data: [] } as never) // last_seen_at
+          .mockRejectedValueOnce(Object.assign(new Error("permission denied"), {
+            isAxiosError: true,
+            response: { status: 403 },
+          }));
+        const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+        const sink = buildSink();
+
+        await expect(
+          sink.upsertVacancy({
+            portal: "kita_lulus",
+            portal_vacancy_id: "v-1",
+            link: "https://portal.example/vacancy/v-1",
+          }),
+        ).resolves.toBe(9);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("backfill_vacancy_link_and_raw"));
+        warn.mockRestore();
+      });
+
+      it("does not touch an existing row's link or raw on a first insert", async () => {
+        const sink = buildSink();
+
+        await sink.upsertVacancy({
+          portal: "kita_lulus",
+          portal_vacancy_id: "v-1",
+          link: "https://portal.example/vacancy/v-1",
+          superseded_link: "https://portal.example/applicants?vacancy_id=v-1",
+          raw: { detail_sections: { a: 1 } },
+        });
+
+        expect(
+          mockedAxios.patch.mock.calls.filter((call) => !("last_seen_at" in (call[1] as object))),
+        ).toHaveLength(0);
+      });
+    });
+
     it("never patches status on a re-scrape, only last_seen_at", async () => {
       mockedAxios.post.mockResolvedValueOnce({ data: [] } as never);
       mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 9 }] } as never);
