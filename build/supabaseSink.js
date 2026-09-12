@@ -30,6 +30,10 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 dotenv_1.default.config();
+/** True for null/undefined and whitespace-only strings — a value a masked or gated scrape yields. */
+function isBlank(value) {
+    return value === null || value === undefined || (typeof value === "string" && value.trim() === "");
+}
 /**
  * The only error type the sink is allowed to surface. Raw Axios errors must
  * never escape this module: config.params carry candidate email/phone filters,
@@ -86,11 +90,32 @@ const MIME_TYPES = {
  * Storage API (/storage/v1) using only the anon key.
  */
 class SupabaseSink {
+    /**
+     * True when a PostgREST write failed only because the target column does not
+     * exist yet (schema cache miss PGRST204, or Postgres undefined_column 42703).
+     * Used to keep the description write best-effort until its migration lands.
+     */
+    static isMissingColumnError(error) {
+        var _a;
+        if (!isAxiosLikeError(error))
+            return false;
+        const data = (_a = error.response) === null || _a === void 0 ? void 0 : _a.data;
+        const code = typeof (data === null || data === void 0 ? void 0 : data.code) === "string" ? data.code : undefined;
+        if (code === "PGRST204" || code === "42703")
+            return true;
+        const message = typeof (data === null || data === void 0 ? void 0 : data.message) === "string" ? data.message : "";
+        return /Could not find the '.*' column|column .* does not exist/i.test(message);
+    }
     constructor(config) {
-        var _a, _b, _c, _d, _e, _f;
+        var _a, _b, _c, _d, _e, _f, _g, _h;
+        /** Latches once so a missing description column logs one line, not one per row. */
+        this.warnedMissingDescriptionColumn = false;
         this.url = ((_b = (_a = config === null || config === void 0 ? void 0 : config.url) !== null && _a !== void 0 ? _a : process.env.SCORING_SUPABASE_URL) !== null && _b !== void 0 ? _b : "").replace(/\/+$/, "");
         this.anonKey = (_d = (_c = config === null || config === void 0 ? void 0 : config.anonKey) !== null && _c !== void 0 ? _c : process.env.SCORING_SUPABASE_ANON_KEY) !== null && _d !== void 0 ? _d : "";
         this.bucket = (_f = (_e = config === null || config === void 0 ? void 0 : config.bucket) !== null && _e !== void 0 ? _e : process.env.SCORING_SUPABASE_BUCKET) !== null && _f !== void 0 ? _f : "scrape-artifacts";
+        this.serviceKey = (_h = (_g = config === null || config === void 0 ? void 0 : config.serviceKey) !== null && _g !== void 0 ? _g : process.env.SCORING_SUPABASE_SERVICE_KEY) !== null && _h !== void 0 ? _h : null;
+        if (this.serviceKey === "")
+            this.serviceKey = null;
         if (!this.url) {
             throw new Error("SupabaseSink: SCORING_SUPABASE_URL is required");
         }
@@ -101,6 +126,25 @@ class SupabaseSink {
     headers(extra = {}) {
         return Object.assign({ apikey: this.anonKey, Authorization: `Bearer ${this.anonKey}`, "Content-Type": "application/json", "Accept-Profile": "scrape", "Content-Profile": "scrape" }, extra);
     }
+    /**
+     * Whether the service-only surfaces (verification hand-off, session-object
+     * persistence) are usable. Callers must check this instead of letting a
+     * missing key surface as a request failure mid-flow.
+     */
+    hasServiceAccess() {
+        return this.serviceKey !== null;
+    }
+    /**
+     * Headers for the service-only surfaces. The service key bypasses RLS, so
+     * nothing here may ever be reachable from scraped-content code paths;
+     * keep its use confined to the verification table and the session object.
+     */
+    serviceHeaders(extra = {}) {
+        if (!this.serviceKey) {
+            throw new SupabaseSinkError("SupabaseSink: SCORING_SUPABASE_SERVICE_KEY is required for this operation");
+        }
+        return Object.assign({ apikey: this.serviceKey, Authorization: `Bearer ${this.serviceKey}`, "Content-Type": "application/json", "Accept-Profile": "scrape", "Content-Profile": "scrape" }, extra);
+    }
     guard(operation, run) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
@@ -108,6 +152,34 @@ class SupabaseSink {
             }
             catch (error) {
                 throw sanitizeSinkError(error, operation);
+            }
+        });
+    }
+    /**
+     * Retries an idempotent request a few times on a transient gateway error
+     * (502/503/504) before giving up. Storage uploads are content-addressed
+     * (uploadArtifactBytes) or timestamp-keyed (uploadDebugArtifact), so a
+     * retried POST is safe: it either recreates the same object or is rejected
+     * as a duplicate by the bucket's own dedupe check.
+     */
+    withTransientRetry(run_1) {
+        return __awaiter(this, arguments, void 0, function* (run, attempts = 3) {
+            var _a;
+            for (let attempt = 1;; attempt++) {
+                try {
+                    return yield run();
+                }
+                catch (error) {
+                    // Duck-typed rather than axios.isAxiosError(): callers' own duplicate-
+                    // detection also inspects this same error afterwards, and axios's real
+                    // check is a mocked one-shot in tests, so a second call here would
+                    // consume it before that later check runs.
+                    const status = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.status;
+                    const transient = status !== undefined && [502, 503, 504].includes(status);
+                    if (!transient || attempt >= attempts)
+                        throw error;
+                    yield new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+                }
             }
         });
     }
@@ -133,6 +205,7 @@ class SupabaseSink {
     upsertVacancy(v) {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("upsertVacancy", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
                 const response = yield axios_1.default.post(`${this.url}/rest/v1/portal_vacancies`, [v], {
                     headers: this.headers({
                         Prefer: "resolution=ignore-duplicates, return=representation",
@@ -145,7 +218,30 @@ class SupabaseSink {
                         portal: `eq.${v.portal}`,
                         portal_vacancy_id: `eq.${v.portal_vacancy_id}`,
                     });
+                // last_seen_at always refreshes; it is present on every deployment.
                 yield axios_1.default.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
+                // Description is a newer column. Write it best-effort so a deployment
+                // where the add_vacancy_description migration has not been applied yet
+                // does not drop the whole applicant on a PostgREST "column not found"
+                // (PGRST204 / SQLSTATE 42703). It fills in on the next re-scrape once the
+                // migration lands, with no code change.
+                const description = (_a = v.description) === null || _a === void 0 ? void 0 : _a.trim();
+                if (description) {
+                    try {
+                        yield axios_1.default.patch(`${this.url}/rest/v1/portal_vacancies?id=eq.${id}`, { description }, { headers: this.headers({ Prefer: "return=minimal" }) });
+                    }
+                    catch (error) {
+                        if (SupabaseSink.isMissingColumnError(error)) {
+                            if (!this.warnedMissingDescriptionColumn) {
+                                this.warnedMissingDescriptionColumn = true;
+                                console.warn("[SINK] portal_vacancies.description not found — skipping description writes until the add_vacancy_description migration is applied.");
+                            }
+                        }
+                        else {
+                            throw error;
+                        }
+                    }
+                }
                 return id;
             }));
         });
@@ -154,10 +250,13 @@ class SupabaseSink {
      * Looks for an existing candidate row by, in order, the selected portal
      * candidate id, the normalized email, then the normalized phone recorded in
      * the row's `data->identity` metadata. Cross-checking all three keeps one
-     * person on one row when re-scrapes surface different identifiers.
+     * person on one row when re-scrapes surface different identifiers. The
+     * row's stored email/data come back with the id so the refresh path can
+     * decide whether a contact backfill applies.
      */
-    findExistingCandidateId(portal, portalCandidateId, email, phone) {
+    findExistingCandidate(portal, portalCandidateId, email, phone) {
         return __awaiter(this, void 0, void 0, function* () {
+            var _a;
             const filterSets = [];
             if (portalCandidateId) {
                 filterSets.push({ portal: `eq.${portal}`, portal_candidate_id: `eq.${portalCandidateId}` });
@@ -171,12 +270,97 @@ class SupabaseSink {
             for (const filters of filterSets) {
                 const response = yield axios_1.default.get(`${this.url}/rest/v1/portal_candidates`, {
                     headers: this.headers(),
-                    params: Object.assign({ select: "id", limit: 1 }, filters),
+                    params: Object.assign({ select: "id,email,data", limit: 1 }, filters),
                 });
-                if (response.data[0])
-                    return Number(response.data[0].id);
+                const row = response.data[0];
+                if (row) {
+                    return {
+                        id: Number(row.id),
+                        email: (_a = row.email) !== null && _a !== void 0 ? _a : null,
+                        data: row.data && typeof row.data === "object" ? row.data : null,
+                    };
+                }
             }
             return null;
+        });
+    }
+    /**
+     * Fill-empty-only contact backfill for an existing candidate row. A portal
+     * can serve masked contact info on first sight (glints strips the mask to
+     * "") and the real value only on a later re-scrape (e.g. the TERHUBUNG
+     * stage), so blank stored contact fields — the email column plus the
+     * contact-bearing keys of `data` — are populated when the new scrape
+     * carries a non-empty value. A stored non-empty value is never overwritten
+     * and a blank scrape never blanks stored data; `data` fields are only
+     * considered when the scrape supplies a data payload at all.
+     */
+    buildContactBackfill(row, c, email, phone) {
+        var _a, _b, _c, _d, _e;
+        const patch = {};
+        if (isBlank(row.email) && !isBlank(email)) {
+            patch.email = email;
+        }
+        if (!c.data || typeof c.data !== "object") {
+            return patch;
+        }
+        const incoming = c.data;
+        const stored = ((_a = row.data) !== null && _a !== void 0 ? _a : {});
+        const merged = Object.assign({}, stored);
+        let changed = false;
+        const fill = (target, key, value) => {
+            if (isBlank(target[key]) && !isBlank(value)) {
+                target[key] = value;
+                return true;
+            }
+            return false;
+        };
+        changed = fill(merged, "email", (_b = incoming.email) !== null && _b !== void 0 ? _b : email) || changed;
+        const incomingContact = incoming.contact && typeof incoming.contact === "object" ? incoming.contact : {};
+        const contact = merged.contact && typeof merged.contact === "object" ? Object.assign({}, merged.contact) : {};
+        if (fill(contact, "contact_number", (_c = incomingContact.contact_number) !== null && _c !== void 0 ? _c : phone)) {
+            if (isBlank(contact.type) && !isBlank(incomingContact.type)) {
+                contact.type = incomingContact.type;
+            }
+            merged.contact = contact;
+            changed = true;
+        }
+        const incomingIdentity = incoming.identity && typeof incoming.identity === "object" ? incoming.identity : {};
+        const identity = merged.identity && typeof merged.identity === "object" ? Object.assign({}, merged.identity) : {};
+        let identityChanged = fill(identity, "email", (_d = incomingIdentity.email) !== null && _d !== void 0 ? _d : email);
+        identityChanged = fill(identity, "phone", (_e = incomingIdentity.phone) !== null && _e !== void 0 ? _e : phone) || identityChanged;
+        if (identityChanged) {
+            merged.identity = identity;
+            changed = true;
+        }
+        if (changed) {
+            patch.data = merged;
+        }
+        return patch;
+    }
+    /**
+     * Refreshes an existing candidate row: last_seen_at plus any fill-empty
+     * contact backfill. A 409 on the email column (another row already holds
+     * that email under the (portal, email) UNIQUE constraint) retries without
+     * the email so the refresh itself never fails the applicant.
+     */
+    refreshCandidate(row, c, email, phone) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            const patch = Object.assign({ last_seen_at: new Date().toISOString() }, this.buildContactBackfill(row, c, email, phone));
+            const send = (body) => axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${row.id}`, body, {
+                headers: this.headers({ Prefer: "return=minimal" }),
+            });
+            try {
+                yield send(patch);
+            }
+            catch (error) {
+                const status = (_a = error === null || error === void 0 ? void 0 : error.response) === null || _a === void 0 ? void 0 : _a.status;
+                if (status !== 409 || !("email" in patch))
+                    throw error;
+                const { email: _conflicting } = patch, withoutEmail = __rest(patch, ["email"]);
+                yield send(withoutEmail);
+            }
+            return row.id;
         });
     }
     /**
@@ -186,8 +370,9 @@ class SupabaseSink {
      * Inserts dedupe on (portal, portal_candidate_id), falling back to
      * (portal, email) when the portal candidate id is missing; a 409 raised by
      * the sibling UNIQUE constraint resolves back through the same lookup.
-     * Existing rows only get a last_seen_at refresh, preserving write-once
-     * content.
+     * Existing rows get a last_seen_at refresh plus a fill-empty-only contact
+     * backfill (see buildContactBackfill); all other stored content stays
+     * write-once.
      * @returns the numeric id of the (inserted or existing) row.
      */
     upsertCandidate(c) {
@@ -204,9 +389,9 @@ class SupabaseSink {
                     yield axios_1.default.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${id}`, { last_seen_at: new Date().toISOString() }, { headers: this.headers({ Prefer: "return=minimal" }) });
                     return id;
                 });
-                const existingId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                if (existingId !== null) {
-                    return touch(existingId);
+                const existing = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                if (existing !== null) {
+                    return this.refreshCandidate(existing, c, email, phone);
                 }
                 const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
                 const { phone: _phone } = c, columns = __rest(c, ["phone"]);
@@ -225,19 +410,19 @@ class SupabaseSink {
                     const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
                     if (status !== 409)
                         throw error;
-                    const conflictId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                    if (conflictId === null)
+                    const conflictRow = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                    if (conflictRow === null)
                         throw error;
-                    return touch(conflictId);
+                    return this.refreshCandidate(conflictRow, c, email, phone);
                 }
                 if (inserted) {
                     return touch(Number(inserted.id));
                 }
-                const raceId = yield this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-                if (raceId === null) {
+                const raceRow = yield this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+                if (raceRow === null) {
                     throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
                 }
-                return touch(raceId);
+                return this.refreshCandidate(raceRow, c, email, phone);
             }));
         });
     }
@@ -292,18 +477,20 @@ class SupabaseSink {
     uploadArtifactBytes(portal, kind, bytes, extension) {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("uploadArtifact", () => __awaiter(this, void 0, void 0, function* () {
-                var _a;
                 const digest = crypto_1.default.createHash("sha256").update(bytes).digest("hex");
                 const ext = extension.replace(/^\./, "").toLowerCase();
                 const month = new Date().toISOString().slice(0, 7).replace("-", "");
                 const key = `${portal}/${month}/${digest}.${ext}`;
                 try {
-                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-                        headers: {
-                            apikey: this.anonKey,
-                            Authorization: `Bearer ${this.anonKey}`,
-                            "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
-                        },
+                    yield this.withTransientRetry(() => {
+                        var _a;
+                        return axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                            headers: {
+                                apikey: this.anonKey,
+                                Authorization: `Bearer ${this.anonKey}`,
+                                "Content-Type": (_a = MIME_TYPES[ext]) !== null && _a !== void 0 ? _a : "application/octet-stream",
+                            },
+                        });
                     });
                 }
                 catch (error) {
@@ -329,13 +516,13 @@ class SupabaseSink {
         return __awaiter(this, void 0, void 0, function* () {
             return this.guard("uploadDebugArtifact", () => __awaiter(this, void 0, void 0, function* () {
                 try {
-                    yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                    yield this.withTransientRetry(() => axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
                         headers: {
                             apikey: this.anonKey,
                             Authorization: `Bearer ${this.anonKey}`,
                             "Content-Type": contentType,
                         },
-                    });
+                    }));
                 }
                 catch (error) {
                     const response = axios_1.default.isAxiosError(error) ? error.response : undefined;
@@ -389,6 +576,130 @@ class SupabaseSink {
                 patch.finished_at = (_a = meta.finished_at) !== null && _a !== void 0 ? _a : new Date().toISOString();
                 yield axios_1.default.patch(`${this.url}/rest/v1/scrape_runs?id=eq.${runId}`, patch, {
                     headers: this.headers({ Prefer: "return=representation" }),
+                });
+            }));
+        });
+    }
+    /**
+     * Opens one device-verification hand-off: inserts a `requested` row into
+     * scrape.glints_verification for a human to fill with the emailed code.
+     * Service-key only — the table has no anon grants.
+     * @returns the numeric id of the new row, for the operator log line.
+     */
+    createVerificationRequest() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("createVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.post(`${this.url}/rest/v1/glints_verification`, [{ status: "requested" }], { headers: this.serviceHeaders({ Prefer: "return=representation" }) });
+                return Number(response.data[0].id);
+            }));
+        });
+    }
+    /**
+     * The most recently opened verification request, regardless of status.
+     * Drives the code-request rate cap: a recent row means a code email went
+     * out not long ago, so the scraper must not click "send code" again yet —
+     * and the DB timestamp survives container restarts where module state
+     * would not.
+     */
+    latestVerificationRequest() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("latestVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.get(`${this.url}/rest/v1/glints_verification`, {
+                    headers: this.serviceHeaders(),
+                    params: { select: "id,requested_at,status", order: "requested_at.desc", limit: 1 },
+                });
+                const row = response.data[0];
+                if (!row)
+                    return null;
+                return {
+                    id: Number(row.id),
+                    requested_at: String(row.requested_at),
+                    status: String(row.status),
+                };
+            }));
+        });
+    }
+    /**
+     * Reads back one verification row while polling for the human-entered code.
+     * The code value is a one-time secret: callers submit it to the portal and
+     * must never write it into a log line or an error message.
+     */
+    readVerificationRequest(id) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("readVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const response = yield axios_1.default.get(`${this.url}/rest/v1/glints_verification`, {
+                    headers: this.serviceHeaders(),
+                    params: { select: "code,status", id: `eq.${id}`, limit: 1 },
+                });
+                const row = response.data[0];
+                if (!row)
+                    return null;
+                return {
+                    code: typeof row.code === "string" && row.code.trim() !== "" ? row.code.trim() : null,
+                    status: String(row.status),
+                };
+            }));
+        });
+    }
+    /**
+     * Settles one verification row: `consumed` once its code logged the scraper
+     * in, `rejected` when the portal refused the code, `expired` when the
+     * bounded wait ran out. submitted_at records when the code was used.
+     */
+    settleVerificationRequest(id, status, submittedAt) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("settleVerificationRequest", () => __awaiter(this, void 0, void 0, function* () {
+                const patch = { status };
+                if (submittedAt !== undefined)
+                    patch.submitted_at = submittedAt;
+                yield axios_1.default.patch(`${this.url}/rest/v1/glints_verification?id=eq.${id}`, patch, {
+                    headers: this.serviceHeaders({ Prefer: "return=minimal" }),
+                });
+            }));
+        });
+    }
+    /**
+     * Downloads one private object from the artifact bucket (the persisted
+     * session snapshot). Service-key only: the bucket deliberately has no anon
+     * SELECT policy. A missing object resolves to null instead of throwing so
+     * first boot falls through to the credential login path.
+     */
+    downloadPrivateObject(key) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("downloadPrivateObject", () => __awaiter(this, void 0, void 0, function* () {
+                var _a;
+                try {
+                    const response = yield axios_1.default.get(`${this.url}/storage/v1/object/${this.bucket}/${key}`, {
+                        headers: this.serviceHeaders(),
+                        responseType: "arraybuffer",
+                    });
+                    return Buffer.from(response.data);
+                }
+                catch (error) {
+                    const status = axios_1.default.isAxiosError(error) ? (_a = error.response) === null || _a === void 0 ? void 0 : _a.status : undefined;
+                    if (status === 404 || status === 400)
+                        return null;
+                    throw error;
+                }
+            }));
+        });
+    }
+    /**
+     * Uploads (and overwrites) one private object in the artifact bucket.
+     * x-upsert makes re-persisting the session snapshot idempotent; anon cannot
+     * do this because overwrite needs UPDATE, which only the service key has.
+     */
+    uploadPrivateObject(key, bytes, contentType) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.guard("uploadPrivateObject", () => __awaiter(this, void 0, void 0, function* () {
+                const auth = this.serviceHeaders();
+                yield axios_1.default.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+                    headers: {
+                        apikey: auth.apikey,
+                        Authorization: auth.Authorization,
+                        "Content-Type": contentType,
+                        "x-upsert": "true",
+                    },
                 });
             }));
         });

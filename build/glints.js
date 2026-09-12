@@ -35,19 +35,41 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Glints = exports.classifyGlintsLoginResult = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
+exports.Glints = exports.normalizeGlintsApplicantName = exports.stripGlintsContactMask = exports.parseGlintsApplicationDetail = exports.classifyGlintsLoginResult = exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = exports.GLINTS_VERIFICATION_METHOD_SELECTOR = exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_PIPELINE_STAGES = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
-const crypto_1 = __importDefault(require("crypto"));
 const form_data_1 = __importDefault(require("form-data"));
 const path_1 = __importDefault(require("path"));
 const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
 const supabaseSink_1 = require("./supabaseSink");
-const candidateIdentity_1 = require("./candidateIdentity");
+const portalSink_1 = require("./portalSink");
 const portalLogin_1 = require("./portalLogin");
 exports.GLINTS_APPLICANT_ROW_SELECTOR = '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
+/**
+ * Ordered list of stages the scraper iterates per vacancy. The default stage
+ * comes first so an early LIMIT hit still returns the un-progressed applicants
+ * first (existing behaviour). Terhubung was added to capture unmasked contact
+ * info without progressing anyone — see `GlintsPipelineStage` above.
+ */
+exports.GLINTS_PIPELINE_STAGES = [
+    {
+        key: "baru",
+        label: "BARU",
+        // The default vacancy view already shows un-progressed applications, so
+        // no tab click is issued. Text list kept for symmetry / future refactor.
+        tabTexts: ["Belum Sesuai", "NEW", "New"],
+        modalBadgePattern: /^\s*(Belum Sesuai|NEW)\s*$/i,
+        isDefault: true,
+    },
+    {
+        key: "terhubung",
+        label: "TERHUBUNG",
+        tabTexts: ["Terhubung", "Connected"],
+        modalBadgePattern: /^\s*(Terhubung|Connected)\s*$/i,
+    },
+];
 const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
 const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
 const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
@@ -111,7 +133,14 @@ function glintsUrlLooksLikeVerification(url) {
         .some((segment) => segment !== "" && GLINTS_OTP_URL_SEGMENT_PATTERN.test(segment));
 }
 const GLINTS_INVALID_CREDENTIALS_PATTERN = /email atau (password|kata sandi) salah|(password|kata sandi)( yang)?( anda masukkan)? salah|invalid (email or )?(password|credentials)|incorrect (email or )?password|akun tidak (ditemukan|terdaftar)|(user|account) not (found|registered)/i;
-const GLINTS_DASHBOARD_MARKER_SELECTOR = '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Ubah")';
+// The account's dashboard UI language is a per-account server-side setting,
+// independent of the browser's pinned id-ID locale — observed live: an
+// authenticated dashboard with zero job posts (nothing to trip the
+// job-card-listed branch) rendering entirely in English ("Post A Job",
+// "Change") instead of Indonesian ("Pasang Loker", "Ubah"). Matching only the
+// Indonesian strings then misclassified a genuinely authenticated session as
+// still logged out. Cover both languages so the marker is locale-agnostic.
+const GLINTS_DASHBOARD_MARKER_SELECTOR = '[data-cy="job-card-listed"], p:text("Pasang Loker"), p:text("Post A Job"), p:text("Ubah"), p:text("Change")';
 const GLINTS_CHALLENGE_ELEMENT_SELECTOR = [
     'iframe[src*="captcha"]',
     'iframe[src*="geetest"]',
@@ -130,6 +159,40 @@ const GLINTS_OTP_ELEMENT_SELECTOR = [
     'input[data-testid*="otp" i]',
 ].join(", ");
 /**
+ * The "Verifikasi diri Anda" device-verification interstitial (captured live
+ * 2026-08-20, scrape-artifacts/glints/login-debug/2026-08-20T13-56-29-719Z/):
+ * the URL stays on /login, no code input is rendered yet, and the page offers
+ * a WhatsApp OTP and an email verification code behind these two data-cy
+ * buttons. Only the email one is ever clicked — the WhatsApp option would
+ * text a human's phone.
+ */
+exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = '[data-cy="send-email-verification-btn"]';
+exports.GLINTS_VERIFICATION_METHOD_SELECTOR = '[data-cy="send-email-verification-btn"], [data-cy="send-whatsApp-verification-btn"]';
+/**
+ * Where the emailed code gets typed once the send-email button was clicked.
+ * The exact post-click DOM is not captured, so this covers the common shapes:
+ * the generic OTP input hooks plus numeric/single-character code boxes.
+ */
+const GLINTS_VERIFICATION_CODE_INPUT_SELECTOR = [
+    GLINTS_OTP_ELEMENT_SELECTOR,
+    'input[inputmode="numeric"]',
+    'input[type="tel"]',
+    'input[maxlength="1"]',
+].join(", ");
+/**
+ * Submits the typed code on the verification page. Captured live 2026-08-21
+ * (scrape-artifacts/glints/login-debug/2026-08-21T03-56-04-452Z/): the page
+ * carries NO `button[type="submit"]` — the blue "Verifikasi" button is a
+ * plain button behind this data-cy hook, so the credential-login submit
+ * selector silently matches nothing here and the code is never sent. The
+ * sibling `otp-resend-button-btn` / `otp-back-btn` buttons must never be
+ * clicked, which is why the text fallback is anchored on "Verifikasi" alone.
+ */
+exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = '[data-cy="otp-verify-btn"]';
+exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = 'button:has-text("Verifikasi")';
+/** Private bucket object holding the persisted session snapshot. */
+const GLINTS_SESSION_OBJECT_KEY = "glints/session/current.json";
+/**
  * Classifies the state of the Glints login page. Pure so the detection logic
  * is unit-testable without a browser: leaving /login means the portal accepted
  * the login unless it landed on a verification route or an OTP form; on /login
@@ -142,6 +205,8 @@ const GLINTS_OTP_ELEMENT_SELECTOR = [
 function classifyGlintsLoginResult(observation) {
     const otpFormRendered = observation.hasOtpElement && GLINTS_OTP_PATTERN.test(observation.visibleText);
     if (!observation.url.includes("/login")) {
+        if (observation.hasVerificationMethodElement)
+            return "device_verification";
         if (glintsUrlLooksLikeVerification(observation.url) || otpFormRendered) {
             return "otp_required";
         }
@@ -150,6 +215,11 @@ function classifyGlintsLoginResult(observation) {
     if (GLINTS_INVALID_CREDENTIALS_PATTERN.test(observation.visibleText)) {
         return "invalid_credentials";
     }
+    // The data-cy method buttons are a stronger signal than any wording: the
+    // interstitial renders no code input yet, so without this it would sit in
+    // "pending" until the timeout (the exact failure production hit).
+    if (observation.hasVerificationMethodElement)
+        return "device_verification";
     if (otpFormRendered)
         return "otp_required";
     if (observation.hasChallengeElement &&
@@ -159,6 +229,64 @@ function classifyGlintsLoginResult(observation) {
     return "pending";
 }
 exports.classifyGlintsLoginResult = classifyGlintsLoginResult;
+/**
+ * Parses the application-detail API payload into the fields the scraper needs.
+ * Pure so the mapping is unit-testable against captured payload shapes; returns
+ * null when the payload carries no data object at all (endpoint drift), which
+ * callers treat as "fall back to DOM extraction".
+ */
+function parseGlintsApplicationDetail(payload) {
+    var _a;
+    const data = payload === null || payload === void 0 ? void 0 : payload.data;
+    if (typeof data !== "object" || data === null)
+        return null;
+    const d = data;
+    const applicant = (typeof d.Applicant === "object" && d.Applicant !== null ? d.Applicant : {});
+    const str = (value) => (typeof value === "string" ? value.trim() : "");
+    // Un-progressed ("BARU") applications carry Glints' masked placeholders
+    // ("+62****", "****@****") instead of real contact values; a placeholder is
+    // absent data, and storing it would dedupe unrelated candidates onto one row.
+    const contact = (value) => stripGlintsContactMask(str(value));
+    // The phone fallbacks (top-level phone and Applicant.phone) can carry a bare
+    // country code ("+62"); too short to be a number, so it never wins over the
+    // real WhatsApp fields.
+    const phone = (value) => {
+        const candidate = contact(value);
+        return candidate.replace(/\D/g, "").length >= 7 ? candidate : "";
+    };
+    return {
+        applicantId: str(d.ApplicantId) || str(applicant.id),
+        applicantName: [str(applicant.firstName), str(applicant.lastName)].filter(Boolean).join(" "),
+        email: contact(applicant.email),
+        whatsappNumber: contact((_a = d.whatsAppDetails) === null || _a === void 0 ? void 0 : _a.whatsAppNumber) ||
+            contact(applicant.whatsappNumber) ||
+            phone(d.phone) ||
+            phone(applicant.phone),
+        resumeKey: str(d.resume),
+        birthDate: str(applicant.birthDate).slice(0, 10),
+        gender: str(applicant.gender),
+    };
+}
+exports.parseGlintsApplicationDetail = parseGlintsApplicationDetail;
+/**
+ * Collapses Glints' masked contact placeholders to "". Contact info is gated
+ * until an application is moved past the "BARU" stage; both the modal and the
+ * application-detail API then render mask literals like "+62****" and
+ * "****@****" — never real data, so any starred value is treated as absent.
+ */
+function stripGlintsContactMask(value) {
+    return value.includes("*") ? "" : value;
+}
+exports.stripGlintsContactMask = stripGlintsContactMask;
+/**
+ * Normalizes an applicant name for capture-to-row correlation: trims, collapses
+ * internal whitespace and lowercases, so cosmetic rendering differences between
+ * the API payload and the row text do not count as a mismatch.
+ */
+function normalizeGlintsApplicantName(value) {
+    return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+exports.normalizeGlintsApplicantName = normalizeGlintsApplicantName;
 class Glints {
     /**
      * Represents a Glints object.
@@ -179,6 +307,15 @@ class Glints {
         this.DB_PATH = "";
         this.CACHE_DIR = '';
         this.TARGETCOMPANY = '';
+        /**
+         * Device-verification pacing. Instance fields (not config) so unit tests can
+         * shrink them; the poll interval is against the hand-off table, not Glints,
+         * so it can stay slow. The request interval is the anti-spam cadence for
+         * "send me a code" emails and must stay long.
+         */
+        this.VERIFICATION_CODE_WAIT_MS = 10 * 60000;
+        this.VERIFICATION_POLL_INTERVAL_MS = 15000;
+        this.VERIFICATION_REQUEST_MIN_INTERVAL_MS = 30 * 60000;
         this.HEADLESS = config.headless;
         this.LIMIT = config.limit;
         this.COOKIES = config.cookies;
@@ -395,28 +532,11 @@ class Glints {
             }
             switch (outcome) {
                 case "success": {
-                    yield page.goto("https://employers.glints.id/dashboard", {
-                        waitUntil: "domcontentloaded",
-                        timeout: this.TIMEOUT,
-                    });
-                    const landing = yield this.waitForDashboardOrLogin(page);
-                    if (landing !== "dashboard" || !(yield this.hasDashboardMarker(page))) {
-                        // The portal held the session on an interstitial. If that
-                        // interstitial is the OTP/device-verification page, name it.
-                        if ((yield this.observeLoginPage(page)) === "otp_required") {
-                            yield this.throwOtpRequired(page, credentials);
-                        }
-                        glintsLoginGuard.recordFailure("error");
-                        yield this.captureLoginDebug(page, "login submit left /login but the dashboard never rendered", credentials);
-                        throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
-                    }
-                    glintsLoginGuard.recordSuccess();
-                    exports.glintsSessionStore.set({
-                        cookies: yield context.cookies(),
-                        localStorage: yield this.readLocalStorageSnapshot(page),
-                        capturedAt: Date.now(),
-                    });
-                    console.info("[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles");
+                    yield this.confirmDashboardAfterLogin(page, context, credentials, true);
+                    return;
+                }
+                case "device_verification": {
+                    yield this.completeDeviceVerification(page, context, credentials);
                     return;
                 }
                 case "challenge": {
@@ -452,6 +572,264 @@ class Glints {
             yield this.captureLoginDebug(page, "OTP/device-verification page detected after login submit", credentials);
             throw new Error("[GLINTS] GLINTS_LOGIN_OTP_REQUIRED: the portal is asking for an email OTP / device verification code — a human must complete the verification (check the GLINTS_EMAIL inbox) or export a fresh session into glints.json; in-process login attempts are parked so the inbox is not flooded");
         });
+    }
+    /**
+     * Verifies that a login the portal accepted actually reaches the dashboard,
+     * then records the success and persists the refreshed session. Leaving
+     * /login alone is not success: the portal can park the session on an
+     * interstitial (device verification, password reset, onboarding).
+     * @param allowVerification Whether a device-verification interstitial found
+     *   here may start the code flow. False when called *from* that flow, so a
+     *   portal that re-raises verification right after a code was accepted
+     *   parks the attempt budget instead of looping.
+     */
+    confirmDashboardAfterLogin(page, context, credentials, allowVerification) {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield page.goto("https://employers.glints.id/dashboard", {
+                waitUntil: "domcontentloaded",
+                timeout: this.TIMEOUT,
+            });
+            const landing = yield this.waitForDashboardOrLogin(page);
+            if (landing !== "dashboard" || !(yield this.hasDashboardMarker(page))) {
+                // The portal held the session on an interstitial. If that interstitial
+                // is the device-verification or OTP page, name (or drive) it.
+                const observed = yield this.observeLoginPage(page);
+                if (observed === "device_verification" && allowVerification) {
+                    yield this.completeDeviceVerification(page, context, credentials);
+                    return;
+                }
+                if (observed === "otp_required" || observed === "device_verification") {
+                    yield this.throwOtpRequired(page, credentials);
+                }
+                glintsLoginGuard.recordFailure("error");
+                yield this.captureLoginDebug(page, "login submit left /login but the dashboard never rendered", credentials);
+                throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
+            }
+            glintsLoginGuard.recordSuccess();
+            yield this.persistSession(page, context);
+            console.info("[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles");
+        });
+    }
+    /**
+     * Drives the "Verifikasi diri Anda" device-verification interstitial: asks
+     * the portal to EMAIL a code (never the WhatsApp option), opens a hand-off
+     * row in scrape.glints_verification for a human to fill with that code,
+     * polls the row for a bounded window, submits the code on the page, and
+     * confirms the dashboard.
+     *
+     * Waiting is not a login failure: neither the rate-cap skip nor the code
+     * timeout consumes the credential attempt budget, so the ordinary cycle
+     * cadence keeps re-entering this flow until a human supplies the code. The
+     * "send code" click itself is capped through the row timestamps (one email
+     * per VERIFICATION_REQUEST_MIN_INTERVAL_MS, surviving restarts) so cycling
+     * never floods the inbox.
+     */
+    completeDeviceVerification(page, context, credentials) {
+        return __awaiter(this, void 0, void 0, function* () {
+            let sink = null;
+            try {
+                sink = this.getSink();
+            }
+            catch (_a) {
+                sink = null;
+            }
+            if (!sink || !sink.hasServiceAccess()) {
+                // No hand-off channel: park the budget exactly like the legacy OTP
+                // outcome so cycles do not keep re-submitting credentials pointlessly.
+                glintsLoginGuard.recordFailure("otp_required");
+                throw new Error("[GLINTS] GLINTS_VERIFICATION_UNAVAILABLE: the device-verification page is up but SCORING_SUPABASE_SERVICE_KEY is not configured, so there is no channel to hand a code to this process — configure the key or export a fresh session into glints.json; login attempts are parked");
+            }
+            // Rate-cap the "send code" click on the durable row timestamps — module
+            // state would reset with the container, and a restart loop must not turn
+            // into a code-email storm.
+            const recent = yield sink.latestVerificationRequest();
+            if (recent) {
+                const age = Math.max(0, Date.now() - Date.parse(recent.requested_at));
+                if (Number.isFinite(age) && age < this.VERIFICATION_REQUEST_MIN_INTERVAL_MS) {
+                    throw new Error(`[GLINTS] GLINTS_VERIFICATION_WAITING: a verification code was already requested at ${recent.requested_at} (scrape.glints_verification row ${recent.id}, status ${recent.status}); not requesting another inside the ${Math.round(this.VERIFICATION_REQUEST_MIN_INTERVAL_MS / 60000)}-minute cadence — the loop keeps cycling`);
+                }
+            }
+            const requestId = yield sink.createVerificationRequest();
+            try {
+                yield page.click(exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR);
+            }
+            catch (error) {
+                yield this.settleVerification(sink, requestId, "expired");
+                glintsLoginGuard.recordFailure("error");
+                yield this.captureLoginDebug(page, "device-verification email button did not accept the click", credentials);
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`[GLINTS] GLINTS_LOGIN_FAILED: the device-verification page rendered but the email-code button could not be clicked (UI drift?): ${(0, portalLogin_1.maskSecrets)(message, [credentials.password])} — see the LOGIN_DEBUG_ARTIFACTS line above`);
+            }
+            console.error(`[GLINTS] GLINTS_VERIFICATION_CODE_NEEDED (check email ${credentials.email}; insert code into scrape.glints_verification row ${requestId})`);
+            const attempts = Math.max(1, Math.ceil(this.VERIFICATION_CODE_WAIT_MS / this.VERIFICATION_POLL_INTERVAL_MS));
+            let code = null;
+            for (let i = 0; i < attempts; i++) {
+                yield page.waitForTimeout(this.VERIFICATION_POLL_INTERVAL_MS);
+                try {
+                    const row = yield sink.readVerificationRequest(requestId);
+                    if (row === null || row === void 0 ? void 0 : row.code) {
+                        code = row.code;
+                        break;
+                    }
+                }
+                catch (_b) {
+                    // Transient hand-off table hiccup — keep polling until the window ends.
+                }
+            }
+            if (code === null) {
+                yield this.settleVerification(sink, requestId, "expired");
+                throw new Error(`[GLINTS] GLINTS_VERIFICATION_CODE_TIMEOUT: no code appeared in scrape.glints_verification row ${requestId} within ${Math.round(this.VERIFICATION_CODE_WAIT_MS / 60000)} minutes — the loop keeps cycling and can request a fresh code after the ${Math.round(this.VERIFICATION_REQUEST_MIN_INTERVAL_MS / 60000)}-minute cadence`);
+            }
+            try {
+                yield this.enterVerificationCode(page, code, credentials);
+            }
+            catch (error) {
+                yield this.settleVerification(sink, requestId, "expired");
+                throw error;
+            }
+            // The portal accepts the code by navigating the page off /login within
+            // the window below.
+            const settleAttempts = Math.max(1, Math.ceil(this.TIMEOUT / 1000));
+            for (let i = 0; i < settleAttempts; i++) {
+                yield page.waitForTimeout(1000);
+                if (!page.url().includes("/login"))
+                    break;
+            }
+            if (page.url().includes("/login")) {
+                yield this.settleVerification(sink, requestId, "rejected", new Date().toISOString());
+                glintsLoginGuard.recordFailure("error");
+                yield this.captureLoginDebug(page, "device-verification code was submitted but the portal stayed on /login", credentials);
+                throw new Error(`[GLINTS] GLINTS_VERIFICATION_CODE_REJECTED: the code from scrape.glints_verification row ${requestId} did not log the session in (mistyped or expired) — see the LOGIN_DEBUG_ARTIFACTS line above; a fresh code can be requested after the cadence window`);
+            }
+            yield this.settleVerification(sink, requestId, "consumed", new Date().toISOString());
+            console.info(`[GLINTS] Device verification completed via scrape.glints_verification row ${requestId}`);
+            yield this.confirmDashboardAfterLogin(page, context, credentials, false);
+        });
+    }
+    /** Settles a hand-off row, never letting a settle failure mask the real outcome. */
+    settleVerification(sink, id, status, submittedAt) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield sink.settleVerificationRequest(id, status, submittedAt);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn(`[GLINTS] could not settle scrape.glints_verification row ${id} to ${status}: ${message}`);
+            }
+        });
+    }
+    /**
+     * Types the human-supplied code into whatever input shape the portal
+     * rendered after the email-code click: one input gets the whole code, a
+     * row of single-character boxes gets one digit each. Submits by clicking
+     * the page's own "Verifikasi" button (GLINTS_VERIFICATION_SUBMIT_SELECTOR,
+     * text-locator fallback), and only presses Enter when neither renders.
+     * The code value itself is a one-time secret and never reaches a log line.
+     */
+    enterVerificationCode(page, code, credentials) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const inputs = page.locator(GLINTS_VERIFICATION_CODE_INPUT_SELECTOR);
+            let count = 0;
+            const renderAttempts = Math.max(1, Math.ceil(this.TIMEOUT / 1000));
+            for (let i = 0; i < renderAttempts; i++) {
+                try {
+                    count = yield inputs.count();
+                }
+                catch (_a) {
+                    count = 0;
+                }
+                if (count > 0)
+                    break;
+                yield page.waitForTimeout(1000);
+            }
+            if (count === 0) {
+                glintsLoginGuard.recordFailure("error");
+                yield this.captureLoginDebug(page, "no code input rendered after requesting the email verification code", credentials);
+                throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: the email verification code was requested but no code input ever rendered — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
+            }
+            if (count === 1) {
+                yield inputs.first().fill(code);
+            }
+            else {
+                // One box per character; extra boxes beyond the code length stay empty.
+                const boxes = Math.min(count, code.length);
+                for (let i = 0; i < boxes; i++) {
+                    yield inputs.nth(i).fill(code[i]);
+                }
+            }
+            // The verification page has its own submit button (never a
+            // button[type="submit"]); the data-cy hook is the contract, the
+            // "Verifikasi" text locator covers a data-cy rename. Typing the code
+            // without clicking this leaves the page on /login and the row is then
+            // mis-settled as rejected even for a correct code.
+            for (const selector of [
+                exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR,
+                exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR,
+            ]) {
+                const submit = page.locator(selector);
+                let submitCount = 0;
+                for (let i = 0; i < 5; i++) {
+                    try {
+                        submitCount = yield submit.count();
+                    }
+                    catch (_b) {
+                        submitCount = 0;
+                    }
+                    if (submitCount > 0)
+                        break;
+                    yield page.waitForTimeout(1000);
+                }
+                if (submitCount === 0)
+                    continue;
+                yield submit.first().click();
+                return;
+            }
+            // No verification submit button at all: many OTP forms auto-submit on the
+            // last character, and Enter covers the rest.
+            try {
+                yield inputs.first().press("Enter");
+            }
+            catch (_c) {
+                // Auto-submit already navigated — nothing left to press.
+            }
+        });
+    }
+    /**
+     * Snapshots the authenticated session and stores it in process memory and —
+     * when the service key is configured — as a private bucket object, so a
+     * container restart resumes the trusted session instead of triggering a new
+     * device verification. Session material never reaches logs.
+     */
+    persistSession(page, context) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const snapshot = {
+                cookies: yield context.cookies(),
+                localStorage: yield this.readLocalStorageSnapshot(page),
+                capturedAt: Date.now(),
+            };
+            exports.glintsSessionStore.set(snapshot);
+            const bucketStore = this.getBucketSessionStore();
+            if (bucketStore) {
+                yield bucketStore.persist(snapshot);
+            }
+        });
+    }
+    /**
+     * The durable session store, or null when the sink or its service key is
+     * not configured (session persistence is then memory-only, the pre-existing
+     * behavior).
+     */
+    getBucketSessionStore() {
+        let sink;
+        try {
+            sink = this.getSink();
+        }
+        catch (_a) {
+            return null;
+        }
+        if (!sink.hasServiceAccess())
+            return null;
+        return new portalLogin_1.BucketSessionStore(sink, GLINTS_SESSION_OBJECT_KEY, (message) => console.warn(`[GLINTS] ${message}`));
     }
     /**
      * Fills and submits the employer login form, then polls until the portal
@@ -532,6 +910,12 @@ class Glints {
             return this.detectRenderedElement(page, GLINTS_OTP_ELEMENT_SELECTOR);
         });
     }
+    /** Detects the rendered "Verifikasi diri Anda" method-choice buttons. */
+    detectVerificationMethodElement(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.detectRenderedElement(page, exports.GLINTS_VERIFICATION_METHOD_SELECTOR);
+        });
+    }
     /** One classifier observation of the page's current state. */
     observeLoginPage(page) {
         return __awaiter(this, void 0, void 0, function* () {
@@ -540,6 +924,7 @@ class Glints {
                 visibleText: yield this.readLoginVisibleText(page),
                 hasChallengeElement: yield this.detectLoginChallengeElement(page),
                 hasOtpElement: yield this.detectLoginOtpElement(page),
+                hasVerificationMethodElement: yield this.detectVerificationMethodElement(page),
             });
         });
     }
@@ -587,7 +972,14 @@ class Glints {
                     continue;
                 }
             }
-            return page.url().includes("/login") ? "login" : "dashboard";
+            // Timeout: an unauthenticated session can land on a marketing/landing
+            // page whose URL never contains "/login" (observed live: the employer
+            // homepage, with "LOGIN"/"JOB SEEKER" nav text, at a URL that doesn't
+            // match), so the URL substring alone is not a safe "dashboard" signal —
+            // require the dashboard marker to actually be present, else fall back to
+            // "login" so ensureAuthenticated runs instead of selectTargetCompany
+            // failing on marketing-page content.
+            return (yield this.hasDashboardMarker(page)) ? "dashboard" : "login";
         });
     }
     /**
@@ -699,74 +1091,124 @@ class Glints {
      */
     sendToSink(param) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            const vacancyId = crypto_1.default
-                .createHash("sha1")
-                .update(`${param.portal}${param.applied_for}`)
-                .digest("hex");
-            const identity = (0, candidateIdentity_1.resolveCandidateIdentity)({
-                urlProfile: param.url_profile,
-                vacancyUrl: param.url_profile,
-                email: param.email,
-                phone: (_a = param.contact) === null || _a === void 0 ? void 0 : _a.contact_number,
-                name: param.name,
-                dateOfBirth: param.date_of_birth,
-                education: param.education,
-                workExperience: param.work_experience,
-            });
+            var _a, _b, _c;
             try {
                 const sink = this.getSink();
-                const appliedDate = param.applied_date && param.applied_date !== "0" ? param.applied_date : null;
-                const cvKey = param.cv !== "" ? yield sink.uploadArtifact(param.portal, "cv", param.cv) : null;
-                const photoKey = param.photo !== "" ? yield sink.uploadArtifact(param.portal, "photo", param.photo) : null;
-                const vacancyRowId = yield sink.upsertVacancy({
+                yield (0, portalSink_1.sendApplicantToSink)(sink, {
                     portal: param.portal,
-                    portal_vacancy_id: vacancyId,
-                    title: param.applied_for,
-                    link: param.url_profile,
-                    status: "new",
-                    raw: { type: param.type },
-                });
-                const candidateRowId = yield sink.upsertCandidate({
-                    portal: param.portal,
-                    portal_candidate_id: identity.portalCandidateId,
-                    email: identity.email,
-                    phone: identity.phone,
-                    name: param.name,
-                    cv_object_key: cvKey,
-                    photo_object_key: photoKey,
-                    data: Object.assign(Object.assign({}, param), { identity: {
-                            source: identity.source,
-                            low_confidence: identity.lowConfidence,
-                            email: identity.email,
-                            phone: identity.phone,
-                        } }),
-                });
-                yield sink.linkApplication(vacancyRowId, candidateRowId, {
+                    // Real Glints job id ("jid" query param on the manage-candidates
+                    // link) when the vacancy loop supplied one; sendApplicantToSink
+                    // falls back to sha1(portal + applied_for) when this is empty, which
+                    // is what every pre-fix row already used.
+                    vacancy_id: param.portal_vacancy_id,
                     applied_for: param.applied_for,
-                    applied_date: appliedDate,
+                    applied_date: param.applied_date,
+                    url_profile: param.url_profile,
+                    vacancy_link: (_a = param.vacancy_link) !== null && _a !== void 0 ? _a : param.url_profile,
+                    vacancy_url: (_b = param.vacancy_link) !== null && _b !== void 0 ? _b : param.url_profile,
+                    // Read off the vacancy's edit page once per vacancy; empty when that
+                    // page was not reachable, which upserts as a null description.
+                    vacancy_description: param.vacancy_description || null,
+                    vacancy_raw: { type: param.type },
+                    portal_candidate_id: param.portal_candidate_id,
+                    name: param.name,
+                    email: param.email,
+                    phone: (_c = param.contact) === null || _c === void 0 ? void 0 : _c.contact_number,
+                    date_of_birth: param.date_of_birth,
+                    location: param.location,
+                    work_experience: param.work_experience,
+                    education: param.education,
+                    skill: param.skill,
+                    cv_path: param.cv,
+                    photo_path: param.photo,
+                    raw: {
+                        type: param.type,
+                        summary: param.summary,
+                        salary_expectation: param.salary_expectation,
+                        gender: param.gender,
+                    },
                 });
                 console.info("Success writing applicant to Supabase sink", {
                     portal: param.portal,
-                    candidate_id: identity.portalCandidateId,
-                    identity_source: identity.source,
+                    vacancy_id: param.portal_vacancy_id,
                 });
                 this.COLLECTED++;
             }
             catch (error) {
+                // sendApplicantToSink already sanitizes and stamps .portal/.vacancyId/
+                // .candidateId (with its own real-id-or-sha1-fallback vacancyId, and
+                // the identity-resolved candidateId) — sanitizeSinkError passes an
+                // already-sanitized error through unchanged, so those fields survive.
                 const sinkError = (0, supabaseSink_1.sanitizeSinkError)(error, "sendToSink");
-                sinkError.portal = param.portal;
-                sinkError.vacancyId = vacancyId;
-                sinkError.candidateId = identity.portalCandidateId;
                 console.error("Error writing to Supabase sink", {
-                    portal: param.portal,
-                    vacancy_id: vacancyId,
-                    candidate_id: identity.portalCandidateId,
-                    identity_source: identity.source,
+                    portal: sinkError.portal,
+                    vacancy_id: sinkError.vacancyId,
+                    candidate_id: sinkError.candidateId,
                     status: sinkError.status,
                     error: sinkError.message,
                 });
                 throw sinkError;
+            }
+        });
+    }
+    /**
+     * Arms a capture for the GET /api/jobs/{jobId}/applications/{applicationId}
+     * response the dashboard itself fires when an applicant modal opens. Must be
+     * called *before* the row click that opens the modal. A previous row's
+     * late-arriving response would otherwise satisfy the wait, so the payload is
+     * only trusted when its Applicant name matches the row's extracted name.
+     * Resolves null on timeout, an unparseable payload, or a name mismatch —
+     * callers then fall back to the DOM. Purely observational: no extra request,
+     * no visible side effect.
+     */
+    armApplicationDetailCapture(page, expectedName) {
+        const timeout = Math.min(this.TIMEOUT, 20000);
+        return page
+            .waitForResponse((resp) => /\/api\/jobs\/[^/]+\/applications\/[^/?]+/.test(resp.url()) && resp.status() === 200, { timeout })
+            .then((resp) => __awaiter(this, void 0, void 0, function* () {
+            const detail = parseGlintsApplicationDetail(yield resp.json());
+            if (detail === null)
+                return null;
+            if (normalizeGlintsApplicantName(detail.applicantName) !== normalizeGlintsApplicantName(expectedName)) {
+                console.warn(`[GLINTS] application-detail capture is for "${detail.applicantName}", not row "${expectedName}"; discarding it`);
+                return null;
+            }
+            return detail;
+        }))
+            .catch(() => null);
+    }
+    /**
+     * Downloads the applicant's resume through the dashboard's own
+     * GET /api/s3/download endpoint (the same call the modal's CV tab makes) and
+     * stores it locally for the sink upload. Failures degrade to "" so a missing
+     * resume never fails the row; the signed URL is never logged.
+     *
+     * @param page - The page whose session performs the API request.
+     * @param resumeKey - The resume file key from the application detail.
+     * @param filename - Display filename for the content-disposition, no path.
+     * @returns The local file path of the stored resume, or "".
+     */
+    fetchResumeViaApi(page, resumeKey, filename) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const response = yield page.request.get("https://employers.glints.id/api/s3/download", {
+                    params: { key: resumeKey, label: "resume", filename: `${filename}.pdf` },
+                    timeout: Math.min(this.TIMEOUT, 30000),
+                });
+                if (!response.ok()) {
+                    console.warn(`[GLINTS] resume download endpoint returned status ${response.status()}`);
+                    return "";
+                }
+                const body = yield response.json();
+                const signedUrl = typeof (body === null || body === void 0 ? void 0 : body.url) === "string" ? body.url : "";
+                if (signedUrl === "")
+                    return "";
+                return yield this.fetchAndStore(signedUrl);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn(`[GLINTS] resume download failed: ${message.split("\n")[0]}`);
+                return "";
             }
         });
     }
@@ -797,27 +1239,68 @@ class Glints {
      * @param page - The page to extract vacancy pages from.
      * @returns A promise that resolves to an array of VacancyPage objects.
      */
+    extractVacancyDescription(page) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const selectors = [
+                '[data-testid*="description" i]',
+                '[name*="description" i]',
+                'textarea[placeholder*="deskripsi" i]',
+                '[contenteditable="true"]',
+            ];
+            for (const selector of selectors) {
+                const locator = page.locator(selector).first();
+                if ((yield locator.count()) && (yield locator.isVisible().catch(() => false))) {
+                    const value = yield locator.inputValue().catch(() => __awaiter(this, void 0, void 0, function* () { return yield locator.textContent(); }));
+                    if (value === null || value === void 0 ? void 0 : value.trim())
+                        return value.trim();
+                }
+            }
+            return "";
+        });
+    }
+    extractVacancyDescriptionFromEditPage(page, editLink) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!editLink)
+                return "";
+            const returnUrl = page.url();
+            yield page.goto(editLink, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+            yield page.waitForTimeout(1000);
+            const description = yield this.extractVacancyDescription(page);
+            yield page.goto(returnUrl, { waitUntil: "domcontentloaded", timeout: this.TIMEOUT });
+            return description;
+        });
+    }
     ExtractListVacancyPage(page) {
         return __awaiter(this, void 0, void 0, function* () {
             const vacancies = yield page.evaluate(() => {
-                var _a, _b, _c, _d, _e;
+                var _a, _b, _c, _d, _e, _f, _g;
                 const byJobId = new Map();
                 const links = Array.from(document.querySelectorAll('a[href*="/manage-candidates"]'));
                 for (const link of links) {
                     const href = new URL((_a = link.getAttribute("href")) !== null && _a !== void 0 ? _a : "", "https://employers.glints.id");
-                    const jobId = (_b = href.searchParams.get("jid")) !== null && _b !== void 0 ? _b : href.href;
+                    const vacancyId = (_b = href.searchParams.get("jid")) !== null && _b !== void 0 ? _b : undefined;
+                    const jobId = vacancyId !== null && vacancyId !== void 0 ? vacancyId : href.href;
                     const card = link.closest('[data-cy="job-card-listed"]');
                     const title = (_e = (_d = (_c = card === null || card === void 0 ? void 0 : card.querySelector('[data-cy="job-title-text"]')) === null || _c === void 0 ? void 0 : _c.textContent) === null || _d === void 0 ? void 0 : _d.trim()) !== null && _e !== void 0 ? _e : "";
+                    const editHref = (_g = (_f = card === null || card === void 0 ? void 0 : card.querySelector('a[href*="/job/edit/"]')) === null || _f === void 0 ? void 0 : _f.getAttribute("href")) !== null && _g !== void 0 ? _g : undefined;
                     const isBaseLink = !href.searchParams.has("status");
                     if (!title) {
                         continue;
                     }
                     const existing = byJobId.get(jobId);
                     if (!existing || isBaseLink) {
-                        byJobId.set(jobId, { title, link: href.toString(), isBaseLink });
+                        byJobId.set(jobId, {
+                            title,
+                            link: href.toString(),
+                            vacancyId,
+                            editLink: editHref ? new URL(editHref, "https://employers.glints.id").toString() : undefined,
+                            isBaseLink,
+                        });
                     }
                 }
-                return Array.from(byJobId.values()).map(({ title, link }) => ({ title, link }));
+                return Array.from(byJobId.entries()).map(([jobId, { title, link, editLink }]) => (Object.assign({ title,
+                    link,
+                    jobId }, (editLink ? { editLink } : {}))));
             });
             console.info(`[GLINTS] Found ${vacancies.length} vacancy link(s).`);
             return vacancies;
@@ -937,8 +1420,20 @@ class Glints {
                 locale: "id-ID",
             }));
             // A session refreshed by a credential login earlier in this process beats
-            // the committed glints.json export, which is only an optional warm-start.
-            const storedSession = exports.glintsSessionStore.get();
+            // the bucket-persisted session from a previous container, which beats the
+            // committed glints.json export (only an optional warm-start). The bucket
+            // hop is what keeps a device-verified session trusted across restarts.
+            let storedSession = exports.glintsSessionStore.get();
+            if (!storedSession) {
+                const bucketStore = this.getBucketSessionStore();
+                if (bucketStore) {
+                    storedSession = yield bucketStore.restore();
+                    if (storedSession) {
+                        exports.glintsSessionStore.set(storedSession);
+                        console.info("[GLINTS] Restored persisted session from the artifact bucket");
+                    }
+                }
+            }
             const sessionCookies = (_a = storedSession === null || storedSession === void 0 ? void 0 : storedSession.cookies) !== null && _a !== void 0 ? _a : this.COOKIES;
             if (sessionCookies.length > 0) {
                 yield context.addCookies(sessionCookies);
@@ -1030,6 +1525,17 @@ class Glints {
                     throw new Error("[GLINTS] Session expired: dashboard still redirected to login after a successful credential login");
                 }
             }
+            // Every successfully authenticated session gets re-persisted (memory +
+            // bucket) so restarts replay the freshest cookies instead of falling back
+            // to credentials — which from the server's location means another device
+            // verification. Persistence failures must never fail a healthy scrape.
+            try {
+                yield this.persistSession(page, context);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn(`[GLINTS] session snapshot after authentication failed: ${message}`);
+            }
             // Switch to the correct company before scraping — wrong company returns empty results
             yield this.selectTargetCompany(page);
             // Suppress VIP expired modal via localStorage, then dismiss if already shown
@@ -1081,68 +1587,128 @@ class Glints {
                 // the page opens on the default applicants view.
                 const vacancyUrl = new URL(it.link, "https://employers.glints.id");
                 vacancyUrl.searchParams.delete("atsTab");
-                yield page.goto(vacancyUrl.toString());
-                // The candidate table hydrates well after domcontentloaded (the page
-                // shows "Memuat..." for many seconds); poll until either the empty-state
-                // marker or the first applicant row renders before deciding to skip.
-                const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
-                const applicantRows = page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR);
-                const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
-                // The empty-state wrapper can flash while the table hydrates (observed
-                // live: the same vacancy showed it on one run and 8 rows on the next),
-                // so a single sighting is not proof of emptiness — require it to hold
-                // for several consecutive polls with no data rows.
-                let emptyStreak = 0;
-                let confirmedEmpty = false;
-                let rowsSettled = false;
-                for (let i = 0; i < settleAttempts; i++) {
-                    yield page.waitForTimeout(1000);
-                    const emptyCount = yield emptyMarker.count();
-                    if ((yield applicantRows.count()) > 0 && emptyCount === 0) {
-                        rowsSettled = true;
+                // The description lives on the vacancy's edit page, not the
+                // manage-candidates view — read it once per vacancy here, before the
+                // stage loop (which re-navigates to vacancyUrl for every stage
+                // anyway), rather than once per stage.
+                const vacancyDescription = yield this.extractVacancyDescriptionFromEditPage(page, it.editLink);
+                // Iterate each pipeline stage. The BARU stage is the vacancy page's
+                // default view (no tab click); TERHUBUNG has to be selected via its
+                // stage-filter tab, and its rows carry unmasked contact info without
+                // any applicant being progressed. Stage tabs are filter-only — a click
+                // never moves an applicant between stages.
+                for (const stage of exports.GLINTS_PIPELINE_STAGES) {
+                    if (this.COLLECTED == this.LIMIT) {
                         break;
                     }
-                    if (emptyCount > 0) {
-                        if (++emptyStreak >= 8) {
-                            confirmedEmpty = true;
+                    // Re-navigate to the vacancy for every stage so pagination state
+                    // never leaks between stages and the default (BARU) view is what
+                    // we start from before switching filters.
+                    yield page.goto(vacancyUrl.toString());
+                    const stageSelected = yield this.selectPipelineStage(page, stage);
+                    if (!stageSelected) {
+                        console.warn(`[GLINTS] Stage "${stage.label}" tab not found for vacancy "${it.title}" (${page.url()}); skipping this stage`);
+                        continue;
+                    }
+                    // The candidate table hydrates well after domcontentloaded (the page
+                    // shows "Memuat..." for many seconds); poll until either the empty-state
+                    // marker or the first applicant row renders before deciding to skip.
+                    const emptyMarker = page.locator('.Polaris-IndexTable__EmptySearchResultWrapper');
+                    const applicantRows = page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR);
+                    const settleAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+                    // The empty-state wrapper can flash while the table hydrates (observed
+                    // live: the same vacancy showed it on one run and 8 rows on the next),
+                    // so a single sighting is not proof of emptiness — require it to hold
+                    // for several consecutive polls with no data rows.
+                    let emptyStreak = 0;
+                    let confirmedEmpty = false;
+                    let rowsSettled = false;
+                    for (let i = 0; i < settleAttempts; i++) {
+                        yield page.waitForTimeout(1000);
+                        const emptyCount = yield emptyMarker.count();
+                        if ((yield applicantRows.count()) > 0 && emptyCount === 0) {
+                            rowsSettled = true;
                             break;
                         }
+                        if (emptyCount > 0) {
+                            if (++emptyStreak >= 8) {
+                                confirmedEmpty = true;
+                                break;
+                            }
+                        }
+                        else {
+                            emptyStreak = 0;
+                        }
                     }
-                    else {
-                        emptyStreak = 0;
+                    // Skip stage if no candidates
+                    if (confirmedEmpty) {
+                        console.info(`[GLINTS] No candidates in stage "${stage.label}" for vacancy "${it.title}" (${page.url()})`);
+                        continue;
                     }
+                    if (!rowsSettled && (yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
+                        const pageText = (_d = (yield page.locator("body").textContent())) === null || _d === void 0 ? void 0 : _d.replace(/\s+/g, " ").trim().slice(0, 500);
+                        console.warn(`[GLINTS] Candidate table missing for stage "${stage.label}" vacancy "${it.title}" at ${page.url()}: ${pageText}`);
+                        continue;
+                    }
+                    let isNext = true;
+                    do {
+                        // wait 5 seconds before, avoid rendering list employees
+                        yield page.waitForTimeout(5000);
+                        // Check for lazy-loaded elements before proceeding
+                        yield this.checkLazyLoadedElement(page, exports.GLINTS_APPLICANT_ROW_SELECTOR);
+                        if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
+                            break;
+                        }
+                        yield this.ExtractApplicantDetail(page, it.title, it.jobId, vacancyUrl.toString(), stage, vacancyDescription);
+                        // Check if there is a next page
+                        const nextPage = page.locator('[data-testid="next-page"]');
+                        isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
+                        if (!isNext) {
+                            // Click on the "Next" button to move to the next page
+                            yield nextPage.click();
+                        }
+                    } while (!isNext && this.COLLECTED < this.LIMIT);
                 }
-                // Skip job if no candidates in this stage
-                if (confirmedEmpty) {
-                    console.warn(`[GLINTS] No candidates shown for vacancy "${it.title}" (${page.url()})`);
-                    continue;
-                }
-                if (!rowsSettled && (yield page.locator(exports.GLINTS_APPLICANT_ROW_SELECTOR).count()) === 0) {
-                    const pageText = (_d = (yield page.locator("body").textContent())) === null || _d === void 0 ? void 0 : _d.replace(/\s+/g, " ").trim().slice(0, 500);
-                    console.warn(`[GLINTS] Candidate table missing for vacancy "${it.title}" at ${page.url()}: ${pageText}`);
-                    continue;
-                }
-                let isNext = true;
-                do {
-                    // wait 5 seconds before, avoid rendering list employees
-                    yield page.waitForTimeout(5000);
-                    // Check for lazy-loaded elements before proceeding
-                    yield this.checkLazyLoadedElement(page, exports.GLINTS_APPLICANT_ROW_SELECTOR);
-                    if ((yield page.locator('.Polaris-IndexTable__EmptySearchResultWrapper').count()) > 0) {
-                        break;
-                    }
-                    yield this.ExtractApplicantDetail(page, it.title);
-                    // Check if there is a next page
-                    const nextPage = page.locator('[data-testid="next-page"]');
-                    isNext = (yield nextPage.count()) === 0 || (yield nextPage.isDisabled());
-                    if (!isNext) {
-                        // Click on the "Next" button to move to the next page
-                        yield nextPage.click();
-                    }
-                } while (!isNext && this.COLLECTED < this.LIMIT);
             }
             yield browser.close();
             console.log("DONE");
+        });
+    }
+    /**
+     * Switches the vacancy's manage-candidates page to the given pipeline
+     * stage's tab. Read-only: clicking a stage-filter tab never moves an
+     * applicant between stages — it just changes which rows the candidate
+     * table renders. The default (BARU) stage is already shown by the page's
+     * initial load and needs no click, so it always resolves true.
+     *
+     * For a non-default stage the tab is matched by any of its `tabTexts`
+     * (id + en variants), and only by an exact accessible-name match — a
+     * substring match could hit a progression control whose label merely
+     * contains the stage word (e.g. "Pindahkan ke Terhubung"), which would
+     * move an applicant. The page hydrates well after domcontentloaded, so
+     * the tab bar is polled within TIMEOUT before the stage is declared
+     * absent; only then does the method resolve false and the caller skip
+     * the stage with a warn log rather than failing the vacancy.
+     */
+    selectPipelineStage(page, stage) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (stage.isDefault) {
+                return true;
+            }
+            const pollAttempts = Math.max(2, Math.ceil(Math.min(this.TIMEOUT, 45000) / 1000));
+            for (let attempt = 0; attempt < pollAttempts; attempt++) {
+                for (const tabText of stage.tabTexts) {
+                    const tabButton = page.getByRole("button", { name: tabText, exact: true }).first();
+                    if ((yield tabButton.count()) > 0) {
+                        yield tabButton.click();
+                        // Give the candidate table time to swap in the newly filtered rows.
+                        yield page.waitForTimeout(1500);
+                        return true;
+                    }
+                }
+                yield page.waitForTimeout(1000);
+            }
+            return false;
         });
     }
     /**
@@ -1157,8 +1723,9 @@ class Glints {
      * @returns {Promise<void>} - A promise that resolves once the applicant details are extracted and processed.
      *                            If an error occurs during extraction or processing, the promise is rejected.
      */
-    ExtractApplicantDetail(page, job) {
-        return __awaiter(this, void 0, void 0, function* () {
+    ExtractApplicantDetail(page_1, job_1, jobId_1, vacancyLink_1, stage_1) {
+        return __awaiter(this, arguments, void 0, function* (page, job, jobId, vacancyLink, stage, vacancyDescription = "") {
+            var _a;
             const locatorListApplicant = exports.GLINTS_APPLICANT_ROW_SELECTOR;
             const lv = page.locator(locatorListApplicant);
             const rows = yield Promise.all(Array.from({ length: yield lv.count() }, (_, index) => __awaiter(this, void 0, void 0, function* () {
@@ -1183,42 +1750,72 @@ class Glints {
                     const location = yield this.extractLocation(element);
                     const salaryExpectation = yield this.extractSalaryExpectation(element);
                     const appliedDate = rows[i].appliedDate;
-                    // cell row of applicant
-                    yield element.locator('.Polaris-IndexTable__TableCell, td').nth(1).click();
-                    // Scope to the modal: the stage tab bar behind it also reads "Belum
-                    // Sesuai" (the modal itself carries data-testid="modal-wrapper").
-                    const modalDetailButtonBelumSelesai = yield page
+                    // Opening the modal makes the dashboard fetch the full application
+                    // detail (contact, resume key, applicant id); arm the capture before
+                    // the click so the response is never missed.
+                    const detailPromise = this.armApplicationDetailCapture(page, name);
+                    // Click the name cell to open the applicant detail modal. A column
+                    // shift (observed live: cell 1 now holds the salary-expectation tag,
+                    // not a clickable row target) moved this off cell 1; the name cell
+                    // (index 2, the same cell extractName reads) is what actually opens
+                    // the modal now.
+                    yield element.locator('.Polaris-IndexTable__TableCell, td').nth(2).click();
+                    // Scope to the modal: the stage tab bar behind it also carries the
+                    // stage's badge text (the modal itself is data-testid="modal-wrapper").
+                    // The dashboard's UI language is a per-account server-side setting
+                    // independent of the browser's pinned id-ID locale — observed live:
+                    // an account rendering entirely in English, where an un-progressed
+                    // application's status badge reads "NEW" rather than "Belum Sesuai"
+                    // ("Not yet assessed", not a literal "Not Suitable" rejection). The
+                    // badge pattern comes from the stage config so this matches whichever
+                    // pipeline stage the row belongs to (BARU, TERHUBUNG, ...).
+                    const modalStageBadge = yield page
                         .getByTestId('modal-wrapper')
-                        .getByText('Belum Sesuai', { exact: true })
+                        .getByText(stage.modalBadgePattern)
                         .last();
-                    yield modalDetailButtonBelumSelesai.waitFor({ state: 'visible' });
-                    const modalDetail = yield modalDetailButtonBelumSelesai.locator("..").locator("..").locator("..").locator("..").locator("..");
+                    yield modalStageBadge.waitFor({ state: 'visible' });
+                    const modalDetail = yield modalStageBadge.locator("..").locator("..").locator("..").locator("..").locator("..");
                     const skills = yield this.extractSkills(modalDetail);
                     const summary = yield this.extractSummary(modalDetail);
-                    const wa = yield this.extractWhatapps(page, modalDetail);
-                    const email = yield this.extractEmail(page, modalDetail);
                     const workExperience = yield this.extractWorkExperience(modalDetail);
                     const education = yield this.extractEducation(modalDetail);
-                    cv = yield this.extractCV(page);
+                    // The application-detail API is the primary source for contact, CV and
+                    // identity; the modal's "Kontak Pelamar" block is the DOM fallback.
+                    const detail = yield detailPromise;
+                    const wa = detail && detail.whatsappNumber !== ""
+                        ? { type: "WhatsApp", contact_number: detail.whatsappNumber }
+                        : yield this.extractWhatapps(page, modalDetail);
+                    const email = detail && detail.email !== "" ? detail.email : yield this.extractEmail(page, modalDetail);
+                    cv =
+                        detail && detail.resumeKey !== ""
+                            ? yield this.fetchResumeViaApi(page, detail.resumeKey, `${name} - ${job}`)
+                            : "";
+                    if (cv === "") {
+                        cv = yield this.extractCV(page);
+                    }
                     const applicant = {
                         portal: "glints",
                         type: "applicant",
+                        vacancy_description: vacancyDescription,
                         applied_for: job,
                         applied_date: appliedDate,
                         name: name,
                         email: email,
                         summary: summary,
                         contact: wa,
-                        date_of_birth: dateOfBirth,
+                        date_of_birth: detail && detail.birthDate !== "" ? detail.birthDate : dateOfBirth,
                         salary_expectation: salaryExpectation,
                         work_experience: workExperience,
                         education: education,
                         skill: skills,
                         location: location,
-                        gender: gender,
+                        gender: detail && detail.gender !== "" ? detail.gender : gender,
                         photo: photo,
                         cv: cv,
                         url_profile: yield page.url(),
+                        portal_candidate_id: (_a = detail === null || detail === void 0 ? void 0 : detail.applicantId) !== null && _a !== void 0 ? _a : "",
+                        portal_vacancy_id: jobId,
+                        vacancy_link: vacancyLink,
                     };
                     yield this.sendToSink(applicant);
                     yield page.keyboard.press('Escape');
@@ -1323,21 +1920,29 @@ class Glints {
         });
     }
     /**
-     * Extracts and processes the name from a table row.
+     * Extracts the applicant's name from the name cell.
      *
-     * @param row - The table row from which to extract the name.
-     * @returns A Promise that resolves to the extracted name as a string.
-     *          The name is trimmed of leading and trailing spaces.
+     * The cell packs the name together with age/gender/distance/location tags
+     * and, for some applicants, a "Willing to relocate" badge into one text
+     * block (observed live: "Deni Sahri 26 yo · Male 84km · Cilegon, Banten
+     * Willing to relocate") — a fixed `div[1]/span` XPath used to isolate the
+     * name span, but a UI change moved the name out of that span (or added a
+     * sibling badge span there instead), silently returning the badge text
+     * ("Willing to relocate" or "") in place of the name. Parsing the name out
+     * of the cell's full text is robust to that kind of tag/badge churn.
      */
     extractName(row) {
         return __awaiter(this, void 0, void 0, function* () {
-            const elementName = yield this.applicantCells(row).nth(2).locator('//div[1]/span');
-            const elementNameCount = yield elementName.count();
-            let name = "";
-            for (let index = 0; index < elementNameCount; index++) {
-                name += " " + (yield elementName.nth(index).textContent());
-            }
-            return name.trim();
+            const cellText = (yield this.applicantCells(row).nth(2).innerText())
+                .replace(/\s+/g, " ")
+                .trim();
+            // Name ends right before the "<age> yo" tag when an age is shown.
+            const ageMatch = cellText.match(/^(.*?)\s+\d+\s*yo\b/i);
+            if (ageMatch)
+                return ageMatch[1].trim();
+            // No age tag: fall back to the text before the first "·" tag separator.
+            const sepIndex = cellText.indexOf("·");
+            return (sepIndex > 0 ? cellText.slice(0, sepIndex) : cellText).trim();
         });
     }
     /**
@@ -1528,53 +2133,54 @@ class Glints {
         });
     }
     /**
-     * Extracts and processes WhatsApp details from a modal detail section.
+     * Reads the value next to one label of the modal's "Kontak Pelamar" block.
+     * The live dashboard renders each contact as a label paragraph ("WhatsApp:",
+     * "Email: ") followed by a sibling anchor carrying the plain-text value — no
+     * hover or reveal interaction involved. Missing block degrades to "".
+     */
+    extractContactValue(modalDetail, label) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b;
+            try {
+                const labelLocator = modalDetail.getByText(label).first();
+                if ((yield labelLocator.count()) === 0)
+                    return "";
+                const row = labelLocator.locator("..");
+                const anchor = row.locator("a").first();
+                if ((yield anchor.count()) > 0) {
+                    return stripGlintsContactMask(((_a = (yield anchor.textContent())) !== null && _a !== void 0 ? _a : "").trim());
+                }
+                // Anchor drift fallback: the row's text minus the label itself.
+                return stripGlintsContactMask(((_b = (yield row.innerText())) !== null && _b !== void 0 ? _b : "").replace(label, "").trim());
+            }
+            catch (_c) {
+                return "";
+            }
+        });
+    }
+    /**
+     * Extracts the WhatsApp number from the modal's "Kontak Pelamar" block.
      *
-     * @param page - The Playwright page object representing the web page.
-     * @param modalDetail - The modal detail section from which to extract the WhatsApp details.
-     * @returns A Promise that resolves to the extracted WhatsApp number.
-     *          If the WhatsApp number is not found, it returns an empty string.
+     * @param page - Unused; kept for call-site compatibility.
+     * @param modalDetail - The modal detail section to read the contact from.
+     * @returns The contact; contact_number is "" when the block is absent.
      */
     extractWhatapps(page, modalDetail) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            let wa = "";
-            if ((yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").count()) > 0) {
-                yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[1]/div[1]/*").hover();
-                try {
-                    // Short timeout + fallback: the tooltip's inner layout drifts between
-                    // dashboard revisions and a missing element must not stall the row.
-                    wa = (_a = (yield page.getByText("WhatsApp", { exact: true }).locator("..").locator('//p[2]').textContent({ timeout: 5000 }))) !== null && _a !== void 0 ? _a : "";
-                }
-                catch (_b) {
-                    wa = "";
-                }
-            }
+            const wa = yield this.extractContactValue(modalDetail, "WhatsApp:");
             return { type: "WhatsApp", contact_number: wa };
         });
     }
     /**
-     * Extracts and processes email details from a modal detail section.
+     * Extracts the email from the modal's "Kontak Pelamar" block.
      *
-     * @param page - The Playwright page object representing the web page.
-     * @param modalDetail - The modal detail section from which to extract the email details.
-     * @returns A Promise that resolves to the extracted email.
-     *          If the email is not found, it returns an empty string.
+     * @param page - Unused; kept for call-site compatibility.
+     * @param modalDetail - The modal detail section to read the contact from.
+     * @returns The email, or "" when the block is absent.
      */
     extractEmail(page, modalDetail) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
-            let email = "";
-            if ((yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").count()) > 0) {
-                yield modalDetail.locator("//div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/div[2]/div[1]/div[1]/*").hover();
-                try {
-                    email = (_a = (yield page.getByText("Email").locator("..").locator('div > p').textContent({ timeout: 5000 }))) !== null && _a !== void 0 ? _a : "";
-                }
-                catch (_b) {
-                    email = "";
-                }
-            }
-            return email;
+            return this.extractContactValue(modalDetail, "Email:");
         });
     }
     /**
@@ -1854,7 +2460,7 @@ class Glints {
      */
     fetchAndStore(imageUrl) {
         return __awaiter(this, void 0, void 0, function* () {
-            var _a;
+            var _a, _b;
             try {
                 // Check if imageUrl is empty
                 if (imageUrl == "") {
@@ -1885,7 +2491,11 @@ class Glints {
                 return filePath;
             }
             catch (error) {
-                console.error(error);
+                // Never log the raw error object: an AxiosError carries config.url, and
+                // for resumes that is a signed S3 URL with its signature query.
+                const status = (_b = error === null || error === void 0 ? void 0 : error.response) === null || _b === void 0 ? void 0 : _b.status;
+                const message = error instanceof Error ? error.message : String(error);
+                console.error(`[GLINTS] fetchAndStore failed${status !== undefined ? ` (status ${status})` : ""}: ${message.split("\n")[0]}`);
                 return "";
             }
         });

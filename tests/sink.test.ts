@@ -240,7 +240,7 @@ describe("SupabaseSink", () => {
     });
 
     it("reuses a row found by portal candidate id without re-posting content", async () => {
-      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 3 }] } as never);
+      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 3, email: "a@b.c", data: null }] } as never);
       const sink = buildSink();
 
       const id = await sink.upsertCandidate({
@@ -262,7 +262,7 @@ describe("SupabaseSink", () => {
     it("cross-checks the normalized email when the portal id lookup misses", async () => {
       mockedAxios.get
         .mockResolvedValueOnce({ data: [] } as never)
-        .mockResolvedValueOnce({ data: [{ id: 5 }] } as never);
+        .mockResolvedValueOnce({ data: [{ id: 5, email: "a@b.c", data: null }] } as never);
       const sink = buildSink();
 
       const id = await sink.upsertCandidate({
@@ -276,7 +276,7 @@ describe("SupabaseSink", () => {
       expect(mockedAxios.get).toHaveBeenCalledWith(
         `${URL}/rest/v1/portal_candidates`,
         expect.objectContaining({
-          params: { select: "id", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
+          params: { select: "id,email,data", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
         })
       );
     });
@@ -299,7 +299,7 @@ describe("SupabaseSink", () => {
         `${URL}/rest/v1/portal_candidates`,
         expect.objectContaining({
           params: {
-            select: "id",
+            select: "id,email,data",
             limit: 1,
             portal: "eq.glints",
             "data->identity->>phone": "eq.628123456789",
@@ -339,7 +339,7 @@ describe("SupabaseSink", () => {
         .mockResolvedValueOnce({ data: [] } as never)
         .mockResolvedValueOnce({ data: [] } as never)
         .mockResolvedValueOnce({ data: [] } as never)
-        .mockResolvedValueOnce({ data: [{ id: 7 }] } as never);
+        .mockResolvedValueOnce({ data: [{ id: 7, email: "a@b.c", data: null }] } as never);
       const sink = buildSink();
 
       const id = await sink.upsertCandidate({
@@ -352,7 +352,7 @@ describe("SupabaseSink", () => {
       expect(mockedAxios.get).toHaveBeenCalledWith(
         `${URL}/rest/v1/portal_candidates`,
         expect.objectContaining({
-          params: { select: "id", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
+          params: { select: "id,email,data", limit: 1, portal: "eq.glints", email: "eq.a@b.c" },
         })
       );
       expect(mockedAxios.patch).toHaveBeenCalledWith(
@@ -374,6 +374,144 @@ describe("SupabaseSink", () => {
         sink.upsertCandidate({ portal: "glints", portal_candidate_id: "url-key", email: "" })
       ).rejects.toMatchObject({ name: "SupabaseSinkError", status: 409 });
       expect(mockedAxios.patch).not.toHaveBeenCalled();
+    });
+
+    it("captures unmasked TERHUBUNG contacts for a candidate first seen masked in BARU", async () => {
+      const sink = buildSink();
+
+      // 1st scrape (BARU, contact masked to ""): fresh insert with empty contact.
+      mockedAxios.get.mockResolvedValueOnce({ data: [] } as never);
+      mockedAxios.post.mockResolvedValueOnce({ data: [{ id: 21 }] } as never);
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-21",
+        email: "",
+        phone: "",
+        data: {
+          summary: "keep me",
+          contact: { type: "phone", contact_number: "" },
+          identity: { source: "portal_candidate_id", email: null, phone: null },
+        },
+      });
+      expect(mockedAxios.patch).toHaveBeenLastCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.21`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
+
+      const maskedRow = {
+        id: 21,
+        email: null,
+        data: {
+          summary: "keep me",
+          contact: { type: "phone", contact_number: "" },
+          identity: { source: "portal_candidate_id", email: null, phone: null },
+        },
+      };
+
+      // 2nd scrape (TERHUBUNG, unmasked): the empty stored fields are backfilled.
+      mockedAxios.get.mockResolvedValueOnce({ data: [maskedRow] } as never);
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-21",
+        email: "ada@x.y",
+        phone: "628111",
+        data: {
+          email: "ada@x.y",
+          contact: { type: "phone", contact_number: "628111" },
+          identity: { source: "portal_candidate_id", email: "ada@x.y", phone: "628111" },
+        },
+      });
+      expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+      expect(mockedAxios.patch).toHaveBeenLastCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.21`,
+        {
+          last_seen_at: expect.any(String),
+          email: "ada@x.y",
+          data: {
+            summary: "keep me",
+            email: "ada@x.y",
+            contact: { type: "phone", contact_number: "628111" },
+            identity: { source: "portal_candidate_id", email: "ada@x.y", phone: "628111" },
+          },
+        },
+        expect.anything()
+      );
+
+      const unmaskedRow = {
+        id: 21,
+        email: "ada@x.y",
+        data: {
+          summary: "keep me",
+          email: "ada@x.y",
+          contact: { type: "phone", contact_number: "628111" },
+          identity: { source: "portal_candidate_id", email: "ada@x.y", phone: "628111" },
+        },
+      };
+
+      // 3rd scrape (masked again): stored contact stays intact, nothing blanked.
+      mockedAxios.get.mockResolvedValueOnce({ data: [unmaskedRow] } as never);
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-21",
+        email: "",
+        phone: "",
+        data: {
+          email: "",
+          contact: { type: "phone", contact_number: "" },
+          identity: { source: "portal_candidate_id", email: "", phone: "" },
+        },
+      });
+      expect(mockedAxios.patch).toHaveBeenLastCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.21`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
+
+      // 4th scrape (different non-empty contact): never overwrites the stored one.
+      mockedAxios.get.mockResolvedValueOnce({ data: [unmaskedRow] } as never);
+      await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-21",
+        email: "other@x.y",
+        phone: "628999",
+        data: {
+          email: "other@x.y",
+          contact: { type: "phone", contact_number: "628999" },
+          identity: { source: "portal_candidate_id", email: "other@x.y", phone: "628999" },
+        },
+      });
+      expect(mockedAxios.patch).toHaveBeenLastCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.21`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
+    });
+
+    it("drops only the conflicting email from a backfill patch on a unique-constraint 409", async () => {
+      mockedAxios.get.mockResolvedValueOnce({ data: [{ id: 31, email: null, data: null }] } as never);
+      mockedAxios.patch.mockRejectedValueOnce({ response: { status: 409 } });
+      const sink = buildSink();
+
+      const id = await sink.upsertCandidate({
+        portal: "glints",
+        portal_candidate_id: "c-31",
+        email: "dup@x.y",
+      });
+
+      expect(id).toBe(31);
+      expect(mockedAxios.patch).toHaveBeenCalledTimes(2);
+      expect(mockedAxios.patch).toHaveBeenNthCalledWith(
+        1,
+        `${URL}/rest/v1/portal_candidates?id=eq.31`,
+        { last_seen_at: expect.any(String), email: "dup@x.y" },
+        expect.anything()
+      );
+      expect(mockedAxios.patch).toHaveBeenLastCalledWith(
+        `${URL}/rest/v1/portal_candidates?id=eq.31`,
+        { last_seen_at: expect.any(String) },
+        expect.anything()
+      );
     });
   });
 

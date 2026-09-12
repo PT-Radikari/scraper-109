@@ -51,6 +51,7 @@
     "start": "xvfb-run node build/server.js",
     "start:central-sync": "node build/server.js central-sync",
     "start:central-sync-once": "node build/server.js central-sync-once",
+    "start:viewer": "node build/viewer.js",
     "test": "jest"
   },
   "author": "",

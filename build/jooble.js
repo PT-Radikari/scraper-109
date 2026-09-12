@@ -17,6 +17,7 @@ const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
 const path_1 = __importDefault(require("path"));
+const crypto_1 = __importDefault(require("crypto"));
 const form_data_1 = __importDefault(require("form-data"));
 const portalBridge_1 = require("./central/portalBridge");
 const browserRegistry_1 = require("./browserRegistry");
@@ -216,7 +217,7 @@ class Jooble {
             // Fail fast at cycle start when the sink env vars are missing; the local
             // SQLite path is bypassed entirely (mirrors glints).
             this.getSink();
-            const browser = (0, browserRegistry_1.trackBrowser)(yield playwright_1.default.firefox.launch({
+            const browser = (0, browserRegistry_1.trackBrowser)(yield playwright_1.default.chromium.launch({
                 headless: this.HEADLESS,
                 slowMo: this.SLOWMO,
             }));
@@ -246,6 +247,24 @@ class Jooble {
                 }
             }
             for (const it of listVacancyPage) {
+                // Write the job posting itself, independent of whether it has any
+                // applicants yet. Description isn't captured yet - the vacancy list
+                // only exposes title+link, and the linked page is the applicant list,
+                // not a job-description view; a real description selector needs
+                // verifying against a live vacancy before it's added here.
+                try {
+                    yield this.getSink().upsertVacancy({
+                        portal: "jooble",
+                        portal_vacancy_id: crypto_1.default.createHash("sha1").update(`jooble${it.link}`).digest("hex"),
+                        title: it.title,
+                        link: it.link,
+                        status: "open",
+                        raw: { type: "vacancy", description: null },
+                    });
+                }
+                catch (error) {
+                    console.error("[JOOBLE] Failed to upsert vacancy posting:", error instanceof Error ? error.message : error);
+                }
                 if (this.LIMIT != 0) {
                     if (this.COLLECTED >= this.LIMIT) {
                         break;

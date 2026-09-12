@@ -1,0 +1,104 @@
+# Production Compose topology for scraper-109.
+#
+# Every service runs the SAME image (one Dockerfile, `command:` picks the
+# portal) so a portal's crash or restart never touches the others' processes,
+# filesystem, or npm/browser cache. Jooble and Pintarnya are intentionally not
+# wired here (Jooble is classifier-blocked, Pintarnya is deactivated — see
+# AGENTS.md); re-add them the same way once that changes.
+#
+# Secrets come from `.env` (copy `.env.sample` -> `.env` and fill in real
+# values) via `env_file:` only — never bake a real credential into this file,
+# the Dockerfile, or an image layer. `.env` itself must never be committed.
+#
+# Usage:
+#   cp .env.sample .env   # fill in real values; keep this file out of git
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f scraper-kitalulus
+#
+# Ports: only scraper-viewer publishes one (4000, the dashboard/API). The
+# scraper/sync services are headless workers with nothing to expose.
+
+x-scraper: &scraper
+  build:
+    context: .
+    dockerfile: dockerfile
+  image: scraper-109:latest
+  env_file:
+    - path: .env
+      required: false
+  restart: unless-stopped
+  # Docker's default /dev/shm is 64MB; Chromium under Playwright renders into
+  # shared memory and crashes ("Target crashed") well before any page can
+  # load once headed content shows up, confirmed by a live start-up check
+  # against this exact image. 1gb matches Playwright's own Docker guidance.
+  shm_size: "1gb"
+  # Every portal's own SQLite checkpoint file lives under db/ (see
+  # AGENTS.md "Sharp edges"); one shared volume is safe because each portal
+  # writes only its own filename (kitalulus.db, glints.db, seek.db, ...) and
+  # scraper-viewer needs to read all of them. Nothing in this codebase opens
+  # a persistent Playwright browser profile, so there is no browser-profile
+  # state to volume — every browser launch is ephemeral per scrape attempt.
+  volumes:
+    - scraper-db:/app/db
+  # No HTTP endpoint on these workers; a practical liveness signal is just
+  # "is the built server process still alive" so Docker restarts a wedged
+  # container instead of leaving it silently hung.
+  healthcheck:
+    test: ["CMD-SHELL", "pgrep -f 'build/server.js' > /dev/null || exit 1"]
+    interval: 60s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+services:
+  scraper-kitalulus:
+    <<: *scraper
+    container_name: scraper-kitalulus
+    command: npm run start:kitalulus:continuous
+
+  scraper-glints:
+    <<: *scraper
+    container_name: scraper-glints
+    command: npm run start:glints:continuous
+
+  scraper-jobstreet:
+    <<: *scraper
+    container_name: scraper-jobstreet
+    # "jobstreet" is this deployment's name for the SEEK ID portal; the
+    # codebase itself still calls it `seek` (src/seek.ts, start:seek:*).
+    command: npm run start:seek:continuous
+
+  scraper-sync:
+    <<: *scraper
+    container_name: scraper-sync
+    # Plain node, no Playwright/xvfb involved (central-sync only talks to
+    # Supabase over HTTP), so it gets its own healthcheck without the xvfb
+    # assumption baked into the shared one above.
+    command: npm run start:central-sync
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'build/server.js' > /dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  scraper-viewer:
+    <<: *scraper
+    container_name: scraper-viewer
+    command: npm run dev:viewer
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "require('http').get('http://localhost:4000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  scraper-db:

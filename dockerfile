@@ -36,8 +36,12 @@ RUN ARCH="$(dpkg --print-architecture)" && \
 # source — build-essential provides the make/g++ toolchain the base image
 # lacks. Installed before `npm ci`, together with the runtime libraries
 # Playwright's browsers need, in one lean apt layer.
+#
+# sqlite3 here is the standalone CLI (src/viewer.ts shells out to it to query
+# the per-portal db/*.db files) — separate from the npm `sqlite3` package's
+# native binding that `npm ci` builds below.
 RUN apt-get update && \
-    apt-get -y install --no-install-recommends build-essential \
+    apt-get -y install --no-install-recommends build-essential sqlite3 \
     libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev \
     libgbm-dev libasound-dev libatspi2.0-0 libxshmfence-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -56,3 +60,10 @@ RUN npm ci
 
 # Build the application using npm
 RUN npm run build
+
+# Only scraper-viewer (src/viewer.ts) listens on a port; the other services
+# built from this same image are headless workers with nothing to expose.
+# EXPOSE is documentation only (Compose's own `ports:` mapping is what
+# actually publishes it) but Dokploy/other orchestrators read it to offer a
+# default container port.
+EXPOSE 4000

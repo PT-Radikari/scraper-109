@@ -16,6 +16,7 @@ const express_1 = __importDefault(require("express"));
 const axios_1 = __importDefault(require("axios"));
 const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
+const dashboardData_1 = require("./dashboardData");
 const app = (0, express_1.default)();
 const PORT = 4000;
 app.use(express_1.default.json());
@@ -56,8 +57,11 @@ app.post("/api/ai/*", (req, res) => __awaiter(void 0, void 0, void 0, function* 
 }));
 const DB_DIR = path_1.default.join(__dirname, "../db");
 const ROOT_DIR = path_1.default.join(__dirname, "../");
-const TS_NODE = path_1.default.join(__dirname, "../node_modules/.bin/ts-node");
-const SERVER = path_1.default.join(__dirname, "server.ts");
+const TS_NODE = path_1.default.join(ROOT_DIR, "node_modules/.bin/ts-node");
+// Resolved from ROOT_DIR (not __dirname) so this keeps working when viewer.js
+// runs compiled from build/ (no .ts files there) as well as via ts-node from
+// src/: either way ROOT_DIR is the repo root, where src/server.ts always is.
+const SERVER = path_1.default.join(ROOT_DIR, "src/server.ts");
 const SCRAPERS = ["glints", "jooble", "seek", "pintarnya", "kitalulus"];
 const scraperState = {};
 const scraperProcesses = {};
@@ -203,6 +207,116 @@ app.post("/api/schedule/disable", (_req, res) => {
     disableSchedule();
     res.json({ ok: true });
 });
+// ── Scraping-progress dashboard (reads scrape.* via PostgREST, anon key only) ──
+//
+// Never exposes SCORING_SUPABASE_ANON_KEY/SERVICE_KEY to the browser: every
+// route below runs the PostgREST/Storage request server-side and returns
+// only the derived JSON. loadDashboardConfig() returns null on a fresh
+// checkout (no .env) — routes then answer 503 with a clear reason instead of
+// throwing, so the dashboard shows an explicit "not configured" state rather
+// than fabricating empty-but-successful data.
+function dashboardError(res, error) {
+    if (error instanceof dashboardData_1.DashboardDataError) {
+        res.status(error.status && error.status < 500 ? error.status : 502).json({ error: error.message });
+        return;
+    }
+    res.status(500).json({ error: "dashboard: unexpected error" });
+}
+app.get("/api/dashboard/config", (_req, res) => {
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    res.json({ configured: config !== null, portals: dashboardData_1.ALL_PORTALS, signingAvailable: Boolean(config === null || config === void 0 ? void 0 : config.serviceKey) });
+});
+app.get("/api/dashboard/portals", (_req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    try {
+        res.json(yield (0, dashboardData_1.getPortalSummaries)(config));
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
+app.get("/api/dashboard/runs/:portal", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    const { portal } = req.params;
+    if (!dashboardData_1.ALL_PORTALS.includes(portal)) {
+        res.status(400).json({ error: "unknown portal" });
+        return;
+    }
+    try {
+        res.json(yield (0, dashboardData_1.getRuns)(config, portal, 100));
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
+app.get("/api/dashboard/vacancies", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    try {
+        const portal = typeof req.query.portal === "string" ? req.query.portal : undefined;
+        const search = typeof req.query.search === "string" ? req.query.search : undefined;
+        res.json(yield (0, dashboardData_1.getVacancies)(config, { portal, search }));
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
+app.get("/api/dashboard/candidates", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    try {
+        const portal = typeof req.query.portal === "string" ? req.query.portal : undefined;
+        const search = typeof req.query.search === "string" ? req.query.search : undefined;
+        res.json(yield (0, dashboardData_1.getCandidates)(config, { portal, search }));
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
+// Signed URLs are always minted here, server-side, after looking the row up
+// with the anon key — never in the browser and never from a raw path the
+// client names directly. See getSignedUrl in src/dashboardData.ts.
+app.post("/api/dashboard/sign-url", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _c;
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    const { portal, candidateId, kind } = (_c = req.body) !== null && _c !== void 0 ? _c : {};
+    if (typeof portal !== "string" ||
+        !dashboardData_1.ALL_PORTALS.includes(portal) ||
+        !Number.isInteger(candidateId) ||
+        (kind !== "cv" && kind !== "photo")) {
+        res.status(400).json({ error: "portal, candidateId (int) and kind ('cv'|'photo') are required" });
+        return;
+    }
+    try {
+        const result = yield (0, dashboardData_1.getSignedUrl)(config, { portal, candidateId, kind });
+        if (!result) {
+            res.status(404).json({ error: "no object on file for this candidate" });
+            return;
+        }
+        res.json(result);
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
 app.get("/", (_req, res) => {
     res.send(HTML);
 });
@@ -455,10 +569,87 @@ const HTML = `<!DOCTYPE html>
     .loading { color: #555; padding: 40px 0; text-align: center; }
 
     a { color: #0055cc; }
+
+    /* ── Dashboard ── */
+    .dashboard-section { margin-bottom: 28px; }
+    .dashboard-section h2 {
+      font-size: 12px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.05em; color: #555; margin-bottom: 10px;
+    }
+    .dashboard-empty { color: #888; font-style: italic; padding: 10px 0; }
+    .dashboard-error {
+      color: #991b1b; background: #fef2f2; border: 1px solid #fecaca;
+      padding: 8px 12px; font-size: 12.5px;
+    }
+
+    .portal-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .portal-card {
+      border: 1px solid #ddd; padding: 10px 12px; cursor: pointer;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    .portal-card:hover { background: #f7f7f7; }
+    .portal-card.disabled { opacity: 0.7; background: #fafafa; }
+    .portal-card-head { display: flex; align-items: center; justify-content: space-between; }
+    .portal-card-name { font-weight: 600; font-size: 13.5px; text-transform: capitalize; }
+
+    .status-badge {
+      font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap;
+    }
+    .status-badge.queued        { background: #e5e7eb; color: #374151; }
+    .status-badge.running       { background: #fffbeb; color: #b45309; }
+    .status-badge.completed     { background: #f0fdf4; color: #15803d; }
+    .status-badge.partial       { background: #fff7ed; color: #c2410c; }
+    .status-badge.auth_expired  { background: #fef2f2; color: #b91c1c; }
+    .status-badge.failed        { background: #fef2f2; color: #991b1b; }
+    .status-badge.disabled      { background: #f3f4f6; color: #6b7280; }
+
+    .portal-blocker { font-size: 11.5px; color: #b91c1c; }
+    .portal-metrics { font-size: 11.5px; color: #555; display: grid; grid-template-columns: 1fr 1fr; gap: 1px 8px; margin-top: 4px; }
+    .portal-metrics span b { color: #111; }
+
+    .badge-yes { color: #15803d; font-weight: 600; }
+    .badge-no  { color: #999; }
+
+    .dashboard-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+
+    .run-row { display: grid; grid-template-columns: 170px 90px 90px 70px 70px 1fr; gap: 8px; padding: 6px 4px; border-bottom: 1px solid #eee; font-size: 12.5px; align-items: start; }
+    .run-row.head { font-weight: 600; border-bottom: 2px solid #111; }
+    .run-error { color: #b91c1c; white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
   <h1>Scraper Viewer</h1>
+
+  <div class="dashboard-section">
+    <h2>Portal Overview</h2>
+    <div id="dashboard-portals"><p class="dashboard-empty">Loading…</p></div>
+  </div>
+
+  <div class="dashboard-section">
+    <h2>Job Postings</h2>
+    <div class="dashboard-toolbar">
+      <select id="postings-portal-filter"><option value="">All portals</option></select>
+      <input type="text" id="postings-search" placeholder="Search title..." />
+    </div>
+    <div id="dashboard-postings"><p class="dashboard-empty">Loading…</p></div>
+  </div>
+
+  <div class="dashboard-section">
+    <h2>Candidates</h2>
+    <div class="dashboard-toolbar">
+      <select id="candidates-portal-filter"><option value="">All portals</option></select>
+      <input type="text" id="candidates-search" placeholder="Search name/email..." />
+    </div>
+    <div id="dashboard-candidates"><p class="dashboard-empty">Loading…</p></div>
+  </div>
+
+  <div class="modal-overlay" id="run-modal-overlay">
+    <div class="modal">
+      <button class="modal-close" id="run-modal-close">&#x2715;</button>
+      <div id="run-modal-body"></div>
+    </div>
+  </div>
 
   <div class="scrape-panel">
     <h2>Scrapers</h2>
@@ -848,6 +1039,11 @@ const HTML = `<!DOCTYPE html>
       return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
+    function safeHref(url) {
+      if (!/^https?:\\/\\//i.test(String(url || ''))) return '';
+      return esc(url);
+    }
+
     function storageLinkFromPath(filePath) {
       if (!filePath) return '';
       const normalized = String(filePath).replace(/\\\\/g, '/');
@@ -855,6 +1051,233 @@ const HTML = `<!DOCTYPE html>
       const filename = parts[parts.length - 1];
       return filename ? '/storage/' + encodeURIComponent(filename) : '';
     }
+
+    // ── Portal dashboard (scrape.* via /api/dashboard/*) ─────────────
+    // Every loader below carries its own "in flight" flag so a slow request
+    // never overlaps with the next poll tick, and each is wrapped so one
+    // portal's failure (e.g. Supabase down, or not configured) renders an
+    // error panel without blocking the others.
+
+    let dashboardConfigured = null; // null = unknown yet, true/false once checked
+    let dashboardPortals = [];
+    const inFlight = { portals: false, postings: false, candidates: false };
+
+    async function loadJSON(url, opts) {
+      const res = await fetch(url, opts);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || ('request failed (' + res.status + ')'));
+      return body;
+    }
+
+    function statusLabel(s) {
+      return String(s || 'queued').replace(/_/g, ' ');
+    }
+
+    function fmtTime(iso) {
+      if (!iso) return '—';
+      return new Date(iso).toLocaleString();
+    }
+
+    function fmtDuration(ms) {
+      if (ms == null) return '—';
+      const s = Math.round(ms / 1000);
+      if (s < 60) return s + 's';
+      const m = Math.floor(s / 60);
+      return m + 'm ' + (s % 60) + 's';
+    }
+
+    async function pollPortals() {
+      if (inFlight.portals) return;
+      inFlight.portals = true;
+      const el = document.getElementById('dashboard-portals');
+      try {
+        const cfg = await loadJSON('/api/dashboard/config');
+        dashboardConfigured = cfg.configured;
+        if (!cfg.configured) {
+          el.innerHTML = '<div class="dashboard-error">Supabase is not configured for this viewer (SCORING_SUPABASE_URL/ANON_KEY missing) — the dashboard has nothing to read yet.</div>';
+          return;
+        }
+        const portals = await loadJSON('/api/dashboard/portals');
+        dashboardPortals = portals;
+        populatePortalFilters(portals);
+        el.innerHTML = '<div class="portal-cards">' + portals.map(renderPortalCard).join('') + '</div>';
+      } catch (err) {
+        el.innerHTML = '<div class="dashboard-error">Failed to load portal status: ' + esc(err.message) + '</div>';
+      } finally {
+        inFlight.portals = false;
+      }
+    }
+
+    function renderPortalCard(p) {
+      const m = p.metrics || {};
+      return \`
+        <div class="portal-card \${p.enabled ? '' : 'disabled'}" onclick="openRunDetail('\${p.portal}')">
+          <div class="portal-card-head">
+            <span class="portal-card-name">\${esc(p.portal)}</span>
+            <span class="status-badge \${esc(p.status)}">\${esc(statusLabel(p.status))}</span>
+          </div>
+          \${p.blocker ? \`<div class="portal-blocker">\${esc(p.blocker)}</div>\` : ''}
+          <div class="portal-metrics">
+            <span>Last run: <b>\${esc(fmtTime(p.lastRun))}</b></span>
+            <span>Duration: <b>\${esc(fmtDuration(p.durationMs))}</b></span>
+            <span>Vacancies: <b>\${m.vacanciesSeen ?? 0}</b></span>
+            <span>Descriptions: <b>\${m.descriptionsCaptured ?? 0}</b></span>
+            <span>Candidates: <b>\${m.candidatesSeen ?? 0}</b></span>
+            <span>Applications: <b>\${m.applicationsLinked ?? 0}</b></span>
+            <span>CVs down/up: <b>\${m.cvsDownloaded ?? 0}/\${m.cvsUploaded ?? 0}</b></span>
+            <span>Errors: <b>\${m.errors ?? 0}</b></span>
+          </div>
+        </div>
+      \`;
+    }
+
+    function populatePortalFilters(portals) {
+      for (const id of ['postings-portal-filter', 'candidates-portal-filter']) {
+        const sel = document.getElementById(id);
+        if (sel.dataset.filled) continue;
+        sel.dataset.filled = '1';
+        portals.forEach(p => {
+          const opt = document.createElement('option');
+          opt.value = p.portal;
+          opt.textContent = p.portal + (p.enabled ? '' : ' (disabled)');
+          sel.appendChild(opt);
+        });
+      }
+    }
+
+    async function openRunDetail(portal) {
+      const body = document.getElementById('run-modal-body');
+      body.innerHTML = '<p class="loading">Loading runs…</p>';
+      document.getElementById('run-modal-overlay').classList.add('open');
+      try {
+        const runs = await loadJSON('/api/dashboard/runs/' + encodeURIComponent(portal));
+        if (!runs.length) {
+          body.innerHTML = '<h2>' + esc(portal) + ' — run history</h2><p class="dashboard-empty">No runs recorded yet.</p>';
+          return;
+        }
+        const rows = runs.map(r => \`
+          <div class="run-row">
+            <span>\${esc(fmtTime(r.started_at))}</span>
+            <span>\${esc(r.status || '—')}</span>
+            <span>\${esc(fmtDuration(r.started_at && r.finished_at ? (new Date(r.finished_at) - new Date(r.started_at)) : null))}</span>
+            <span>\${r.vacancies_seen ?? '—'}</span>
+            <span>\${r.candidates_seen ?? '—'}</span>
+            <span class="run-error">\${esc(r.error || '')}</span>
+          </div>
+        \`).join('');
+        body.innerHTML = \`
+          <h2>\${esc(portal)} — run history</h2>
+          <div class="run-row head"><span>Started</span><span>Status</span><span>Duration</span><span>Vac.</span><span>Cand.</span><span>Error</span></div>
+          \${rows}
+        \`;
+      } catch (err) {
+        body.innerHTML = '<h2>' + esc(portal) + '</h2><div class="dashboard-error">Failed to load run history: ' + esc(err.message) + '</div>';
+      }
+    }
+
+    async function pollPostings() {
+      if (inFlight.postings || dashboardConfigured === false) return;
+      inFlight.postings = true;
+      const el = document.getElementById('dashboard-postings');
+      try {
+        const portal = document.getElementById('postings-portal-filter').value;
+        const search = document.getElementById('postings-search').value.trim();
+        const params = new URLSearchParams();
+        if (portal) params.set('portal', portal);
+        if (search) params.set('search', search);
+        const rows = await loadJSON('/api/dashboard/vacancies?' + params.toString());
+        if (!rows.length) {
+          el.innerHTML = '<p class="dashboard-empty">No job postings match.</p>';
+          return;
+        }
+        el.innerHTML = \`<table><thead><tr>
+            <th>Portal</th><th>Title</th><th>Description</th><th>Applicants</th><th>Source</th><th>Updated</th>
+          </tr></thead><tbody>\${rows.map(v => \`
+            <tr>
+              <td><span class="tag">\${esc(v.portal)}</span></td>
+              <td>\${esc(v.title || '—')}</td>
+              <td>\${v.hasDescription ? '<span class="badge-yes">captured</span>' : '<span class="badge-no">missing</span>'}</td>
+              <td>\${v.total_applicant ?? '—'}</td>
+              <td>\${safeHref(v.link) ? '<a href="' + safeHref(v.link) + '" target="_blank">link</a>' : '—'}</td>
+              <td>\${esc(fmtTime(v.last_seen_at))}</td>
+            </tr>\`).join('')}</tbody></table>\`;
+      } catch (err) {
+        el.innerHTML = '<div class="dashboard-error">Failed to load job postings: ' + esc(err.message) + '</div>';
+      } finally {
+        inFlight.postings = false;
+      }
+    }
+
+    async function requestSignedLink(portal, candidateId, kind, btn) {
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = '…';
+      try {
+        const result = await loadJSON('/api/dashboard/sign-url', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ portal, candidateId, kind }),
+        });
+        window.open(result.url, '_blank');
+      } catch (err) {
+        alert('Could not get link: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function pollCandidates() {
+      if (inFlight.candidates || dashboardConfigured === false) return;
+      inFlight.candidates = true;
+      const el = document.getElementById('dashboard-candidates');
+      try {
+        const portal = document.getElementById('candidates-portal-filter').value;
+        const search = document.getElementById('candidates-search').value.trim();
+        const params = new URLSearchParams();
+        if (portal) params.set('portal', portal);
+        if (search) params.set('search', search);
+        const rows = await loadJSON('/api/dashboard/candidates?' + params.toString());
+        if (!rows.length) {
+          el.innerHTML = '<p class="dashboard-empty">No candidates match.</p>';
+          return;
+        }
+        el.innerHTML = \`<table><thead><tr>
+            <th>Portal</th><th>Identity</th><th>Vacancy</th><th>Application</th><th>CV</th><th>Files</th><th>Updated</th>
+          </tr></thead><tbody>\${rows.map(c => \`
+            <tr>
+              <td><span class="tag">\${esc(c.portal)}</span></td>
+              <td>\${esc(c.identity)}</td>
+              <td>\${esc(c.vacancy || '—')}</td>
+              <td>\${c.applicationStatus === 'linked' ? '<span class="badge-yes">linked</span>' : '<span class="badge-no">unlinked</span>'}</td>
+              <td>\${c.cvStatus === 'captured' ? '<span class="badge-yes">captured</span>' : '<span class="badge-no">none</span>'}</td>
+              <td>\${c.cvStatus === 'captured' ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'cv\\',this)">CV link</button>' : ''} \${c.hasPhoto ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'photo\\',this)">Photo link</button>' : ''}</td>
+              <td>\${esc(fmtTime(c.updatedAt))}</td>
+            </tr>\`).join('')}</tbody></table>\`;
+      } catch (err) {
+        el.innerHTML = '<div class="dashboard-error">Failed to load candidates: ' + esc(err.message) + '</div>';
+      } finally {
+        inFlight.candidates = false;
+      }
+    }
+
+    document.getElementById('run-modal-close').addEventListener('click', () => {
+      document.getElementById('run-modal-overlay').classList.remove('open');
+    });
+    document.getElementById('run-modal-overlay').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) document.getElementById('run-modal-overlay').classList.remove('open');
+    });
+    document.getElementById('postings-portal-filter').addEventListener('change', pollPostings);
+    document.getElementById('postings-search').addEventListener('input', pollPostings);
+    document.getElementById('candidates-portal-filter').addEventListener('change', pollCandidates);
+    document.getElementById('candidates-search').addEventListener('input', pollCandidates);
+
+    pollPortals();
+    pollPostings();
+    pollCandidates();
+    setInterval(pollPortals, 10000);
+    setInterval(pollPostings, 20000);
+    setInterval(pollCandidates, 20000);
 
     document.getElementById('modal-close').addEventListener('click', () => {
       document.getElementById('modal-overlay').classList.remove('open');

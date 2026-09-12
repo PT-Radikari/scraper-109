@@ -6,6 +6,7 @@ import {
   Glints,
   GlintsConfigJson,
   GLINTS_APPLICANT_ROW_SELECTOR,
+  GLINTS_PIPELINE_STAGES,
 } from "../src/glints";
 import type { SeekConfigJson } from "../src/seek";
 
@@ -82,10 +83,12 @@ describe("portal extraction helpers", () => {
       {
         title: "Trainer Contact Center",
         link: "https://employers.glints.id/manage-candidates?jid=job-a",
+        jobId: "job-a",
       },
       {
         title: "Contact Center Agent",
         link: "https://employers.glints.id/manage-candidates?jid=job-b",
+        jobId: "job-b",
       },
     ]);
   });
@@ -126,7 +129,7 @@ describe("portal extraction helpers", () => {
       throw new Error("stop row after recording processing order");
     };
 
-    await scraper.ExtractApplicantDetail(page, "Software Engineer");
+    await scraper.ExtractApplicantDetail(page, "Software Engineer", "job-id-unused", "https://employers.glints.id/manage-candidates?jid=job-id-unused", GLINTS_PIPELINE_STAGES[0]);
 
     expect(processedOrder).toEqual([1, 2, 0]);
   });
@@ -160,7 +163,7 @@ describe("portal extraction helpers", () => {
     };
 
     const page = {
-      evaluate: async (callback: () => unknown) => {
+      evaluate: async (callback: (...args: any[]) => unknown, ...args: any[]) => {
         const previousDocument = (global as any).document;
         const previousLocation = (global as any).location;
         (global as any).document = {
@@ -171,7 +174,7 @@ describe("portal extraction helpers", () => {
           href: "https://id.employer.seek.com/candidates",
         };
         try {
-          return callback();
+          return callback(...args);
         } finally {
           (global as any).document = previousDocument;
           (global as any).location = previousLocation;

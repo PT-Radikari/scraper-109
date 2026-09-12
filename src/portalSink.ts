@@ -50,6 +50,13 @@ export interface SinkApplicant {
   url_profile?: string | null;
   /** The page URL shared by every candidate row on the vacancy page. */
   vacancy_url?: string | null;
+  /**
+   * Extra portal-native vacancy metadata (e.g. location, expiry) spread into
+   * `portal_vacancies.raw` alongside the generic `{type: "applicant"}` marker.
+   * `raw.description` is the agreed slot for a real job-description string
+   * once a portal can source one; omit the key entirely when it can't.
+   */
+  vacancy_raw?: Record<string, unknown> | null;
   name?: string | null;
   email?: string | null;
   phone?: string | null;
@@ -90,8 +97,10 @@ async function uploadOptionalArtifact(
 /**
  * Writes one applicant straight into the scoring Supabase, mirroring
  * Glints.sendToSink step for step. Idempotent across re-scrapes: vacancies and
- * candidates are write-once (refresh touches last_seen_at only, statuses are
- * never reset) and the application link ignores duplicates.
+ * candidates are write-once (refresh touches last_seen_at plus a fill-empty
+ * contact backfill — see SupabaseSink.upsertCandidate; stored non-empty values
+ * are never overwritten and statuses are never reset) and the application link
+ * ignores duplicates.
  *
  * Errors are sanitized (no PII, no keys) before they are logged and rethrown,
  * so a failing cycle surfaces one loud, safe line per applicant.
@@ -132,7 +141,7 @@ export async function sendApplicantToSink(
       link: a.vacancy_link ?? a.vacancy_url ?? null,
       description: a.vacancy_description ?? null,
       status: "new",
-      raw: { type: "applicant" },
+      raw: { type: "applicant", ...(a.vacancy_raw ?? {}) },
     });
 
     const candidateRowId = await sink.upsertCandidate({

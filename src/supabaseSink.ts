@@ -55,6 +55,18 @@ export interface CandidateInput {
   data?: Record<string, unknown> | null;
 }
 
+/** Stored identity slice of an existing portal_candidates row. */
+interface ExistingCandidateRow {
+  id: number;
+  email: string | null;
+  data: Record<string, unknown> | null;
+}
+
+/** True for null/undefined and whitespace-only strings — a value a masked or gated scrape yields. */
+function isBlank(value: unknown): boolean {
+  return value === null || value === undefined || (typeof value === "string" && value.trim() === "");
+}
+
 /** Extra context for one application link. */
 export interface ApplicationMeta {
   applied_for?: string | null;
@@ -229,6 +241,30 @@ export class SupabaseSink {
     }
   }
 
+  /**
+   * Retries an idempotent request a few times on a transient gateway error
+   * (502/503/504) before giving up. Storage uploads are content-addressed
+   * (uploadArtifactBytes) or timestamp-keyed (uploadDebugArtifact), so a
+   * retried POST is safe: it either recreates the same object or is rejected
+   * as a duplicate by the bucket's own dedupe check.
+   */
+  private async withTransientRetry<T>(run: () => Promise<T>, attempts = 3): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await run();
+      } catch (error) {
+        // Duck-typed rather than axios.isAxiosError(): callers' own duplicate-
+        // detection also inspects this same error afterwards, and axios's real
+        // check is a mocked one-shot in tests, so a second call here would
+        // consume it before that later check runs.
+        const status = (error as { response?: { status?: number } } | undefined)?.response?.status;
+        const transient = status !== undefined && [502, 503, 504].includes(status);
+        if (!transient || attempt >= attempts) throw error;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+      }
+    }
+  }
+
   private async findId(
     table: string,
     filters: Record<string, string>,
@@ -310,14 +346,16 @@ export class SupabaseSink {
    * Looks for an existing candidate row by, in order, the selected portal
    * candidate id, the normalized email, then the normalized phone recorded in
    * the row's `data->identity` metadata. Cross-checking all three keeps one
-   * person on one row when re-scrapes surface different identifiers.
+   * person on one row when re-scrapes surface different identifiers. The
+   * row's stored email/data come back with the id so the refresh path can
+   * decide whether a contact backfill applies.
    */
-  private async findExistingCandidateId(
+  private async findExistingCandidate(
     portal: string,
     portalCandidateId: string | null,
     email: string | null,
     phone: string | null,
-  ): Promise<number | null> {
+  ): Promise<ExistingCandidateRow | null> {
     const filterSets: Record<string, string>[] = [];
     if (portalCandidateId) {
       filterSets.push({ portal: `eq.${portal}`, portal_candidate_id: `eq.${portalCandidateId}` });
@@ -331,11 +369,117 @@ export class SupabaseSink {
     for (const filters of filterSets) {
       const response = await axios.get(`${this.url}/rest/v1/portal_candidates`, {
         headers: this.headers(),
-        params: { select: "id", limit: 1, ...filters },
+        params: { select: "id,email,data", limit: 1, ...filters },
       });
-      if (response.data[0]) return Number(response.data[0].id);
+      const row = response.data[0];
+      if (row) {
+        return {
+          id: Number(row.id),
+          email: row.email ?? null,
+          data: row.data && typeof row.data === "object" ? row.data : null,
+        };
+      }
     }
     return null;
+  }
+
+  /**
+   * Fill-empty-only contact backfill for an existing candidate row. A portal
+   * can serve masked contact info on first sight (glints strips the mask to
+   * "") and the real value only on a later re-scrape (e.g. the TERHUBUNG
+   * stage), so blank stored contact fields — the email column plus the
+   * contact-bearing keys of `data` — are populated when the new scrape
+   * carries a non-empty value. A stored non-empty value is never overwritten
+   * and a blank scrape never blanks stored data; `data` fields are only
+   * considered when the scrape supplies a data payload at all.
+   */
+  private buildContactBackfill(
+    row: ExistingCandidateRow,
+    c: CandidateInput,
+    email: string | null,
+    phone: string | null,
+  ): Record<string, unknown> {
+    const patch: Record<string, unknown> = {};
+    if (isBlank(row.email) && !isBlank(email)) {
+      patch.email = email;
+    }
+    if (!c.data || typeof c.data !== "object") {
+      return patch;
+    }
+
+    const incoming = c.data as Record<string, any>;
+    const stored = (row.data ?? {}) as Record<string, any>;
+    const merged: Record<string, any> = { ...stored };
+    let changed = false;
+
+    const fill = (target: Record<string, any>, key: string, value: unknown): boolean => {
+      if (isBlank(target[key]) && !isBlank(value)) {
+        target[key] = value;
+        return true;
+      }
+      return false;
+    };
+
+    changed = fill(merged, "email", incoming.email ?? email) || changed;
+
+    const incomingContact =
+      incoming.contact && typeof incoming.contact === "object" ? incoming.contact : {};
+    const contact =
+      merged.contact && typeof merged.contact === "object" ? { ...merged.contact } : {};
+    if (fill(contact, "contact_number", incomingContact.contact_number ?? phone)) {
+      if (isBlank(contact.type) && !isBlank(incomingContact.type)) {
+        contact.type = incomingContact.type;
+      }
+      merged.contact = contact;
+      changed = true;
+    }
+
+    const incomingIdentity =
+      incoming.identity && typeof incoming.identity === "object" ? incoming.identity : {};
+    const identity =
+      merged.identity && typeof merged.identity === "object" ? { ...merged.identity } : {};
+    let identityChanged = fill(identity, "email", incomingIdentity.email ?? email);
+    identityChanged = fill(identity, "phone", incomingIdentity.phone ?? phone) || identityChanged;
+    if (identityChanged) {
+      merged.identity = identity;
+      changed = true;
+    }
+
+    if (changed) {
+      patch.data = merged;
+    }
+    return patch;
+  }
+
+  /**
+   * Refreshes an existing candidate row: last_seen_at plus any fill-empty
+   * contact backfill. A 409 on the email column (another row already holds
+   * that email under the (portal, email) UNIQUE constraint) retries without
+   * the email so the refresh itself never fails the applicant.
+   */
+  private async refreshCandidate(
+    row: ExistingCandidateRow,
+    c: CandidateInput,
+    email: string | null,
+    phone: string | null,
+  ): Promise<number> {
+    const patch: Record<string, unknown> = {
+      last_seen_at: new Date().toISOString(),
+      ...this.buildContactBackfill(row, c, email, phone),
+    };
+    const send = (body: Record<string, unknown>) =>
+      axios.patch(`${this.url}/rest/v1/portal_candidates?id=eq.${row.id}`, body, {
+        headers: this.headers({ Prefer: "return=minimal" }),
+      });
+    try {
+      await send(patch);
+    } catch (error) {
+      const status = (error as { response?: { status?: number } })?.response?.status;
+      if (status !== 409 || !("email" in patch)) throw error;
+      const { email: _conflicting, ...withoutEmail } = patch;
+      await send(withoutEmail);
+    }
+    return row.id;
   }
 
   /**
@@ -345,8 +489,9 @@ export class SupabaseSink {
    * Inserts dedupe on (portal, portal_candidate_id), falling back to
    * (portal, email) when the portal candidate id is missing; a 409 raised by
    * the sibling UNIQUE constraint resolves back through the same lookup.
-   * Existing rows only get a last_seen_at refresh, preserving write-once
-   * content.
+   * Existing rows get a last_seen_at refresh plus a fill-empty-only contact
+   * backfill (see buildContactBackfill); all other stored content stays
+   * write-once.
    * @returns the numeric id of the (inserted or existing) row.
    */
   async upsertCandidate(c: CandidateInput): Promise<number> {
@@ -367,9 +512,9 @@ export class SupabaseSink {
         return id;
       };
 
-      const existingId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-      if (existingId !== null) {
-        return touch(existingId);
+      const existing = await this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+      if (existing !== null) {
+        return this.refreshCandidate(existing, c, email, phone);
       }
 
       const onConflict = portalCandidateId ? "portal,portal_candidate_id" : "portal,email";
@@ -395,18 +540,18 @@ export class SupabaseSink {
       } catch (error) {
         const status = axios.isAxiosError(error) ? error.response?.status : undefined;
         if (status !== 409) throw error;
-        const conflictId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-        if (conflictId === null) throw error;
-        return touch(conflictId);
+        const conflictRow = await this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+        if (conflictRow === null) throw error;
+        return this.refreshCandidate(conflictRow, c, email, phone);
       }
       if (inserted) {
         return touch(Number(inserted.id));
       }
-      const raceId = await this.findExistingCandidateId(c.portal, portalCandidateId, email, phone);
-      if (raceId === null) {
+      const raceRow = await this.findExistingCandidate(c.portal, portalCandidateId, email, phone);
+      if (raceRow === null) {
         throw new Error("SupabaseSink: portal_candidates insert completed but no row was readable");
       }
-      return touch(raceId);
+      return this.refreshCandidate(raceRow, c, email, phone);
     });
   }
 
@@ -470,13 +615,15 @@ export class SupabaseSink {
       const key = `${portal}/${month}/${digest}.${ext}`;
 
       try {
-        await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-          headers: {
-            apikey: this.anonKey,
-            Authorization: `Bearer ${this.anonKey}`,
-            "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
-          },
-        });
+        await this.withTransientRetry(() =>
+          axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+            headers: {
+              apikey: this.anonKey,
+              Authorization: `Bearer ${this.anonKey}`,
+              "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream",
+            },
+          }),
+        );
       } catch (error) {
         const response = axios.isAxiosError(error) ? error.response : undefined;
         const duplicate =
@@ -500,13 +647,15 @@ export class SupabaseSink {
   async uploadDebugArtifact(key: string, bytes: Buffer, contentType: string): Promise<string> {
     return this.guard("uploadDebugArtifact", async () => {
       try {
-        await axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
-          headers: {
-            apikey: this.anonKey,
-            Authorization: `Bearer ${this.anonKey}`,
-            "Content-Type": contentType,
-          },
-        });
+        await this.withTransientRetry(() =>
+          axios.post(`${this.url}/storage/v1/object/${this.bucket}/${key}`, bytes, {
+            headers: {
+              apikey: this.anonKey,
+              Authorization: `Bearer ${this.anonKey}`,
+              "Content-Type": contentType,
+            },
+          }),
+        );
       } catch (error) {
         const response = axios.isAxiosError(error) ? error.response : undefined;
         const duplicate =

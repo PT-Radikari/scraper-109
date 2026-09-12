@@ -148,6 +148,17 @@ Toggle "Auto (hourly)" to have the viewer re-run every scraper once an hour inst
 
 The dashboard also embeds a PageAgent AI chat panel backed by `/api/ai/*`, a loopback-only proxy to `https://9router.aryahanif.xyz/v1` that keeps the upstream API key off the client. Set `NINE_ROUTER_KEY` (or `API_KEY`) in `.env` to enable it.
 
+The same page also renders a **scraping-progress dashboard** (`src/dashboardData.ts`, `/api/dashboard/*`) that reads the central `scrape.*` schema over PostgREST with the anon key — a read-only view independent of the local start/stop controls above, unaffected by which portals this machine happens to be running. It needs `SCORING_SUPABASE_URL`/`SCORING_SUPABASE_ANON_KEY` in `.env`; without them the section shows a "not configured" state instead of erroring. It covers:
+
+- **Portal overview**: Kitalulus, Glints and Jobstreet/SEEK as active; Jooble and Pintarnya always listed and explicitly marked disabled, never hidden.
+- **Per-portal status** (queued/running/completed/partial/auth_expired/failed) derived from the latest `scrape.scrape_runs` row — the writer only ever records `running`/`success`/`failed`, so `partial`/`auth_expired` are inferred from that row's error text, not a richer stored enum.
+- **Per-portal metrics**: last run, next run, duration, vacancies seen, descriptions captured, candidates seen, applications linked, CVs downloaded/uploaded, errors.
+- **Job postings and candidate tables**, each with its own search/filter and a per-portal failure that doesn't block the other sections; job descriptions only ever expose a computed present/absent badge, never the raw jsonb payload, and candidate identity is masked email/phone before it leaves the server.
+- **Run detail view**: `scrape_runs` timeline for a portal with per-stage errors and retry count.
+- A signed-CV-link action that mints the URL server-side only (`POST /api/dashboard/sign-url`): the route re-validates the object key against the candidate row with the anon key before calling Storage with the service key, so the service key never reaches the browser.
+
+Each section polls independently with an in-flight guard so overlapping requests are dropped rather than queued.
+
 ---
 
 ### Individual Scrapers (development mode)
@@ -224,6 +235,51 @@ Then run using the compiled output in `build/`:
 | `npm run start` | Generic |
 
 All `start:*` commands automatically use `xvfb-run` for headless compatibility.
+
+---
+
+### Docker Compose
+
+`docker-compose.yml` runs the production topology as five independent
+containers, all built from the same image (`dockerfile`; one `command:` per
+service picks the portal) so one portal crashing or restarting never touches
+the others:
+
+| Service | Command | Notes |
+|---|---|---|
+| `scraper-kitalulus` | `npm run start:kitalulus:continuous` | Playwright/xvfb |
+| `scraper-glints` | `npm run start:glints:continuous` | Playwright/xvfb |
+| `scraper-jobstreet` | `npm run start:seek:continuous` | Playwright/xvfb (the codebase calls this portal `seek`) |
+| `scraper-sync` | `npm run start:central-sync` | plain Node, no browser |
+| `scraper-viewer` | `npm run dev:viewer` | plain Node (ts-node), exposes port 4000 |
+
+Jooble and Pintarnya are intentionally not included (Jooble is
+classifier-blocked, Pintarnya is deactivated — see AGENTS.md); wire them up
+the same way once that changes.
+
+```
+cp .env.sample .env   # fill in real values; this file must never be committed
+docker compose build
+docker compose up -d
+docker compose logs -f scraper-kitalulus   # or any other service
+docker compose down
+```
+
+- **Secrets**: only via `.env` through `env_file:` — never in the Dockerfile
+  or committed anywhere. `docker compose config` validates even with no
+  `.env` present (an empty/missing `.env` is treated as all-defaults).
+- **Volumes**: one named volume (`scraper-db`) shared by every service for
+  the per-portal SQLite checkpoint files under `db/` (`kitalulus.db`,
+  `glints.db`, `seek.db`, ...) — each portal only ever writes its own
+  filename, and `scraper-viewer` needs to read all of them. Nothing in this
+  codebase opens a persistent Playwright browser profile, so there is no
+  separate browser-profile volume to manage.
+- **Healthchecks**: the browser-driving and sync services check that their
+  built server process is still running; `scraper-viewer` checks that its
+  HTTP port actually answers.
+- **`shm_size: 1gb`** is set on every service — Docker's default 64MB
+  `/dev/shm` is too small for Chromium under Playwright and crashes the
+  renderer ("Target crashed") the moment a real page loads.
 
 ---
 

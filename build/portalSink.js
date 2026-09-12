@@ -30,8 +30,10 @@ function uploadOptionalArtifact(sink, portal, kind, localPath, bytes) {
 /**
  * Writes one applicant straight into the scoring Supabase, mirroring
  * Glints.sendToSink step for step. Idempotent across re-scrapes: vacancies and
- * candidates are write-once (refresh touches last_seen_at only, statuses are
- * never reset) and the application link ignores duplicates.
+ * candidates are write-once (refresh touches last_seen_at plus a fill-empty
+ * contact backfill — see SupabaseSink.upsertCandidate; stored non-empty values
+ * are never overwritten and statuses are never reset) and the application link
+ * ignores duplicates.
  *
  * Errors are sanitized (no PII, no keys) before they are logged and rethrown,
  * so a failing cycle surfaces one loud, safe line per applicant.
@@ -40,7 +42,7 @@ function uploadOptionalArtifact(sink, portal, kind, localPath, bytes) {
  */
 function sendApplicantToSink(sink, a) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r;
         const vacancyId = ((_a = a.vacancy_id) !== null && _a !== void 0 ? _a : "").trim() !== ""
             ? a.vacancy_id.trim()
             : crypto_1.default.createHash("sha1").update(`${a.portal}${a.applied_for}`).digest("hex");
@@ -64,18 +66,19 @@ function sendApplicantToSink(sink, a) {
                 portal_vacancy_id: vacancyId,
                 title: a.applied_for,
                 link: (_c = (_b = a.vacancy_link) !== null && _b !== void 0 ? _b : a.vacancy_url) !== null && _c !== void 0 ? _c : null,
+                description: (_d = a.vacancy_description) !== null && _d !== void 0 ? _d : null,
                 status: "new",
-                raw: { type: "applicant" },
+                raw: Object.assign({ type: "applicant" }, ((_e = a.vacancy_raw) !== null && _e !== void 0 ? _e : {})),
             });
             const candidateRowId = yield sink.upsertCandidate({
                 portal: a.portal,
                 portal_candidate_id: identity.portalCandidateId,
                 email: identity.email,
                 phone: identity.phone,
-                name: (_d = a.name) !== null && _d !== void 0 ? _d : null,
+                name: (_f = a.name) !== null && _f !== void 0 ? _f : null,
                 cv_object_key: cvKey,
                 photo_object_key: photoKey,
-                data: Object.assign(Object.assign({}, ((_e = a.raw) !== null && _e !== void 0 ? _e : {})), { portal: a.portal, applied_for: a.applied_for, applied_date: appliedDate, url_profile: (_f = a.url_profile) !== null && _f !== void 0 ? _f : null, name: (_g = a.name) !== null && _g !== void 0 ? _g : null, email: identity.email, date_of_birth: (_h = a.date_of_birth) !== null && _h !== void 0 ? _h : null, location: (_j = a.location) !== null && _j !== void 0 ? _j : null, contact: { type: "phone", contact_number: (_l = (_k = identity.phone) !== null && _k !== void 0 ? _k : a.phone) !== null && _l !== void 0 ? _l : "" }, work_experience: (_m = a.work_experience) !== null && _m !== void 0 ? _m : [], education: (_o = a.education) !== null && _o !== void 0 ? _o : [], skill: (_p = a.skill) !== null && _p !== void 0 ? _p : [], identity: {
+                data: Object.assign(Object.assign({}, ((_g = a.raw) !== null && _g !== void 0 ? _g : {})), { portal: a.portal, applied_for: a.applied_for, applied_date: appliedDate, url_profile: (_h = a.url_profile) !== null && _h !== void 0 ? _h : null, name: (_j = a.name) !== null && _j !== void 0 ? _j : null, email: identity.email, date_of_birth: (_k = a.date_of_birth) !== null && _k !== void 0 ? _k : null, location: (_l = a.location) !== null && _l !== void 0 ? _l : null, contact: { type: "phone", contact_number: (_o = (_m = identity.phone) !== null && _m !== void 0 ? _m : a.phone) !== null && _o !== void 0 ? _o : "" }, work_experience: (_p = a.work_experience) !== null && _p !== void 0 ? _p : [], education: (_q = a.education) !== null && _q !== void 0 ? _q : [], skill: (_r = a.skill) !== null && _r !== void 0 ? _r : [], identity: {
                         source: identity.source,
                         low_confidence: identity.lowConfidence,
                         email: identity.email,

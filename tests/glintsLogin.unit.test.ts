@@ -734,9 +734,21 @@ describe("Glints.waitForDashboardOrLogin", () => {
     await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
   });
 
-  it("falls back to the URL when no marker renders before the timeout", async () => {
+  it("treats a timeout with no dashboard marker as login, even when the URL never says /login", async () => {
+    // An unauthenticated session can land on a marketing/landing page whose
+    // URL never contains "/login" (observed live: the employer homepage).
+    // The URL substring is not a safe "authenticated" signal on its own, so
+    // the timeout fallback must require the dashboard marker.
     const page = new FakeLoginPage();
     page.currentUrl = "https://employers.glints.id/dashboard";
+
+    await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("login");
+  });
+
+  it("still falls back to dashboard when the marker is present but the URL check raced it", async () => {
+    const page = new FakeLoginPage();
+    page.currentUrl = "https://employers.glints.id/dashboard";
+    page.dashboardMarkerCount = 1;
 
     await expect(scraper.waitForDashboardOrLogin(page)).resolves.toBe("dashboard");
   });
