@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getSignedUrl = exports.getCandidates = exports.maskPhone = exports.maskEmail = exports.getVacancies = exports.getRuns = exports.getPortalSummaries = exports.deriveStatus = exports.portalFilter = exports.DashboardDataError = exports.loadDashboardConfig = exports.ALL_PORTALS = exports.DISABLED_PORTALS = exports.ACTIVE_PORTALS = void 0;
+exports.getSignedUrl = exports.getCandidates = exports.maskPhone = exports.maskEmail = exports.getVacancies = exports.getRuns = exports.getPortalSummaries = exports.deriveStatus = exports.portalFilter = exports.resetVacancyDescriptionExpr = exports.DashboardDataError = exports.loadDashboardConfig = exports.ALL_PORTALS = exports.DISABLED_PORTALS = exports.ACTIVE_PORTALS = void 0;
 const axios_1 = __importDefault(require("axios"));
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
@@ -65,6 +65,57 @@ function sanitize(operation, error) {
     const detail = [status ? String(status) : null, code].filter(Boolean).join(" ");
     return new DashboardDataError(`dashboard: ${operation} failed${detail ? ` (${detail})` : ""}`, status);
 }
+/**
+ * `scrape.portal_vacancies.description` arrived with the
+ * add_vacancy_description migration; before it, the description lived in
+ * `raw->>description`. A deployment whose database is ahead of or behind
+ * that migration must still render, so every read that touches the
+ * description goes through `vacancyDescriptionExpr` and falls back once on
+ * a missing-column error (PostgREST 42703 / PGRST204) — the same
+ * best-effort posture `SupabaseSink.upsertVacancy` already takes on the
+ * write side. The choice latches, so the fallback costs one extra request
+ * per process, not one per read.
+ */
+let vacancyDescriptionExpr = "description";
+let warnedDescriptionFallback = false;
+function isMissingColumnError(error) {
+    var _a;
+    if (!axios_1.default.isAxiosError(error))
+        return false;
+    const data = (_a = error.response) === null || _a === void 0 ? void 0 : _a.data;
+    const code = typeof (data === null || data === void 0 ? void 0 : data.code) === "string" ? data.code : undefined;
+    if (code === "42703" || code === "PGRST204")
+        return true;
+    const message = typeof (data === null || data === void 0 ? void 0 : data.message) === "string" ? data.message : "";
+    return /column .* does not exist|Could not find the '.*' column/i.test(message);
+}
+/**
+ * Runs a read that references the description, retrying once against the
+ * legacy `raw->>description` spelling when the column is not there.
+ */
+function withVacancyDescription(run) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            return yield run(vacancyDescriptionExpr);
+        }
+        catch (error) {
+            if (vacancyDescriptionExpr !== "description" || !isMissingColumnError(error))
+                throw error;
+            vacancyDescriptionExpr = "raw->>description";
+            if (!warnedDescriptionFallback) {
+                warnedDescriptionFallback = true;
+                console.warn("[dashboard] portal_vacancies.description not found — falling back to raw->>description. Apply the add_vacancy_description migration.");
+            }
+            return run(vacancyDescriptionExpr);
+        }
+    });
+}
+/** Test seam: forget the latched choice so each case starts from the column. */
+function resetVacancyDescriptionExpr() {
+    vacancyDescriptionExpr = "description";
+    warnedDescriptionFallback = false;
+}
+exports.resetVacancyDescriptionExpr = resetVacancyDescriptionExpr;
 function anonHeaders(config, extra = {}) {
     return Object.assign({ apikey: config.anonKey, Authorization: `Bearer ${config.anonKey}`, "Accept-Profile": "scrape" }, extra);
 }
@@ -160,7 +211,7 @@ function portalMetrics(config, portal) {
     return __awaiter(this, void 0, void 0, function* () {
         const [vacanciesSeen, descriptionsCaptured, candidatesSeen, applicationsLinked, cvsCaptured, errors] = yield Promise.all([
             countRows(config, "portal_vacancies", { portal: portalFilter(portal) }),
-            countRows(config, "portal_vacancies", { portal: portalFilter(portal), description: "not.is.null" }),
+            withVacancyDescription((expr) => countRows(config, "portal_vacancies", { portal: portalFilter(portal), [expr]: "not.is.null" })),
             countRows(config, "portal_candidates", { portal: portalFilter(portal) }),
             countRows(config, "portal_applications", {
                 "portal_vacancies.portal": portalFilter(portal),
@@ -230,7 +281,6 @@ function getVacancies(config, opts) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
         const params = {
-            select: "id,portal,title,link,total_applicant,status,last_seen_at,description",
             order: "last_seen_at.desc",
             limit: String((_a = opts.limit) !== null && _a !== void 0 ? _a : 100),
             offset: String((_b = opts.offset) !== null && _b !== void 0 ? _b : 0),
@@ -240,10 +290,12 @@ function getVacancies(config, opts) {
         if (opts.search)
             params.title = `ilike.*${opts.search}*`;
         try {
-            const response = yield axios_1.default.get(`${config.url}/rest/v1/portal_vacancies`, {
+            const response = yield withVacancyDescription((expr) => axios_1.default.get(`${config.url}/rest/v1/portal_vacancies`, {
                 headers: anonHeaders(config),
-                params,
-            });
+                params: Object.assign(Object.assign({}, params), { 
+                    // Aliased so the row key is `description` either way.
+                    select: `id,portal,title,link,total_applicant,status,last_seen_at,description:${expr}` }),
+            }));
             // Only a presence flag crosses the wire — never the raw jsonb payload.
             return response.data.map((row) => ({
                 id: row.id,

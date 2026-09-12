@@ -12,6 +12,7 @@ import {
   ACTIVE_PORTALS,
   DISABLED_PORTALS,
   portalFilter,
+  resetVacancyDescriptionExpr,
 } from "../src/dashboardData";
 
 jest.mock("axios");
@@ -179,7 +180,7 @@ describe("getVacancies", () => {
     // migration; reading it back out of raw->>description reports every
     // vacancy as description-less.
     const params = mockedAxios.get.mock.calls[0][1]?.params as Record<string, string>;
-    expect(params.select).toContain("last_seen_at,description");
+    expect(params.select).toContain("last_seen_at,description:description");
     expect(params.select).not.toContain("raw");
   });
 });
@@ -256,5 +257,63 @@ describe("portalFilter", () => {
   it("leaves single-spelling portals on an eq. filter", () => {
     expect(portalFilter("glints")).toBe("eq.glints");
     expect(portalFilter("seek")).toBe("eq.seek");
+  });
+});
+
+describe("description column fallback", () => {
+  // The live database may sit either side of the add_vacancy_description
+  // migration: before it the description is raw->>description, after it its
+  // own column. Reading the column against a database without it is a
+  // PostgREST 42703, which used to surface as a blanket 400 on the whole
+  // dashboard.
+  beforeEach(() => {
+    jest.clearAllMocks();
+    resetVacancyDescriptionExpr();
+  });
+
+  function missingColumn() {
+    const error = Object.assign(new Error("column does not exist"), {
+      isAxiosError: true,
+      response: { status: 400, data: { code: "42703", message: "column portal_vacancies.description does not exist" } },
+    });
+    return error;
+  }
+
+  it("retries getVacancies against raw->>description and still returns rows", async () => {
+    (axios.isAxiosError as unknown as jest.Mock) = jest.fn().mockReturnValue(true);
+    mockedAxios.get
+      .mockRejectedValueOnce(missingColumn() as never)
+      .mockResolvedValueOnce({
+        data: [
+          { id: 1, portal: "kita_lulus", title: "Driver", link: null, total_applicant: 1, status: "new", last_seen_at: "t", description: "Kualifikasi" },
+        ],
+      } as never);
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const rows = await getVacancies({ url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null }, {});
+
+    expect(rows[0].hasDescription).toBe(true);
+    const retried = mockedAxios.get.mock.calls[1][1]?.params as Record<string, string>;
+    expect(retried.select).toContain("description:raw->>description");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("add_vacancy_description"));
+    warn.mockRestore();
+  });
+
+  it("latches the fallback so later reads do not pay the failed request again", async () => {
+    (axios.isAxiosError as unknown as jest.Mock) = jest.fn().mockReturnValue(true);
+    mockedAxios.get
+      .mockRejectedValueOnce(missingColumn() as never)
+      .mockResolvedValue({ data: [] } as never);
+    jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+
+    await getVacancies(config, {});
+    const callsAfterFirst = mockedAxios.get.mock.calls.length;
+    await getVacancies(config, {});
+
+    expect(mockedAxios.get.mock.calls.length).toBe(callsAfterFirst + 1);
+    const second = mockedAxios.get.mock.calls[callsAfterFirst][1]?.params as Record<string, string>;
+    expect(second.select).toContain("description:raw->>description");
+    jest.restoreAllMocks();
   });
 });

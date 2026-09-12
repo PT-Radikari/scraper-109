@@ -112,6 +112,55 @@ function sanitize(operation: string, error: unknown): DashboardDataError {
   return new DashboardDataError(`dashboard: ${operation} failed${detail ? ` (${detail})` : ""}`, status);
 }
 
+/**
+ * `scrape.portal_vacancies.description` arrived with the
+ * add_vacancy_description migration; before it, the description lived in
+ * `raw->>description`. A deployment whose database is ahead of or behind
+ * that migration must still render, so every read that touches the
+ * description goes through `vacancyDescriptionExpr` and falls back once on
+ * a missing-column error (PostgREST 42703 / PGRST204) — the same
+ * best-effort posture `SupabaseSink.upsertVacancy` already takes on the
+ * write side. The choice latches, so the fallback costs one extra request
+ * per process, not one per read.
+ */
+let vacancyDescriptionExpr: "description" | "raw->>description" = "description";
+let warnedDescriptionFallback = false;
+
+function isMissingColumnError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const data = error.response?.data as { code?: unknown; message?: unknown } | undefined;
+  const code = typeof data?.code === "string" ? data.code : undefined;
+  if (code === "42703" || code === "PGRST204") return true;
+  const message = typeof data?.message === "string" ? data.message : "";
+  return /column .* does not exist|Could not find the '.*' column/i.test(message);
+}
+
+/**
+ * Runs a read that references the description, retrying once against the
+ * legacy `raw->>description` spelling when the column is not there.
+ */
+async function withVacancyDescription<T>(run: (expr: string) => Promise<T>): Promise<T> {
+  try {
+    return await run(vacancyDescriptionExpr);
+  } catch (error) {
+    if (vacancyDescriptionExpr !== "description" || !isMissingColumnError(error)) throw error;
+    vacancyDescriptionExpr = "raw->>description";
+    if (!warnedDescriptionFallback) {
+      warnedDescriptionFallback = true;
+      console.warn(
+        "[dashboard] portal_vacancies.description not found — falling back to raw->>description. Apply the add_vacancy_description migration.",
+      );
+    }
+    return run(vacancyDescriptionExpr);
+  }
+}
+
+/** Test seam: forget the latched choice so each case starts from the column. */
+export function resetVacancyDescriptionExpr(): void {
+  vacancyDescriptionExpr = "description";
+  warnedDescriptionFallback = false;
+}
+
 function anonHeaders(config: DashboardConfig, extra: Record<string, string> = {}): Record<string, string> {
   return {
     apikey: config.anonKey,
@@ -215,7 +264,9 @@ async function portalMetrics(config: DashboardConfig, portal: string): Promise<P
   const [vacanciesSeen, descriptionsCaptured, candidatesSeen, applicationsLinked, cvsCaptured, errors] =
     await Promise.all([
       countRows(config, "portal_vacancies", { portal: portalFilter(portal) }),
-      countRows(config, "portal_vacancies", { portal: portalFilter(portal), description: "not.is.null" }),
+      withVacancyDescription((expr) =>
+        countRows(config, "portal_vacancies", { portal: portalFilter(portal), [expr]: "not.is.null" }),
+      ),
       countRows(config, "portal_candidates", { portal: portalFilter(portal) }),
       countRows(config, "portal_applications", {
         "portal_vacancies.portal": portalFilter(portal),
@@ -294,7 +345,6 @@ export async function getVacancies(
   opts: { portal?: string; search?: string; limit?: number; offset?: number },
 ): Promise<VacancyRow[]> {
   const params: Record<string, string> = {
-    select: "id,portal,title,link,total_applicant,status,last_seen_at,description",
     order: "last_seen_at.desc",
     limit: String(opts.limit ?? 100),
     offset: String(opts.offset ?? 0),
@@ -302,10 +352,16 @@ export async function getVacancies(
   if (opts.portal) params.portal = portalFilter(opts.portal);
   if (opts.search) params.title = `ilike.*${opts.search}*`;
   try {
-    const response = await axios.get(`${config.url}/rest/v1/portal_vacancies`, {
-      headers: anonHeaders(config),
-      params,
-    });
+    const response = await withVacancyDescription((expr) =>
+      axios.get(`${config.url}/rest/v1/portal_vacancies`, {
+        headers: anonHeaders(config),
+        params: {
+          ...params,
+          // Aliased so the row key is `description` either way.
+          select: `id,portal,title,link,total_applicant,status,last_seen_at,description:${expr}`,
+        },
+      }),
+    );
     // Only a presence flag crosses the wire — never the raw jsonb payload.
     return response.data.map((row: Record<string, unknown>) => ({
       id: row.id,
