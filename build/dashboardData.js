@@ -277,9 +277,22 @@ function getRuns(config_1, portal_1) {
     });
 }
 exports.getRuns = getRuns;
+function idList(ids) {
+    return `(${ids.filter((id) => Number.isInteger(id)).join(",")})`;
+}
+function applyVisibility(params, opts) {
+    if (opts.onlyIds) {
+        params.id = `in.${idList(opts.onlyIds)}`;
+    }
+    else if (opts.excludeIds && opts.excludeIds.length > 0) {
+        params.id = `not.in.${idList(opts.excludeIds)}`;
+    }
+}
 function getVacancies(config, opts) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
+        if (opts.onlyIds && opts.onlyIds.length === 0)
+            return [];
         const params = {
             order: "last_seen_at.desc",
             limit: String((_a = opts.limit) !== null && _a !== void 0 ? _a : 100),
@@ -289,6 +302,7 @@ function getVacancies(config, opts) {
             params.portal = portalFilter(opts.portal);
         if (opts.search)
             params.title = `ilike.*${opts.search}*`;
+        applyVisibility(params, opts);
         try {
             const response = yield withVacancyDescription((expr) => axios_1.default.get(`${config.url}/rest/v1/portal_vacancies`, {
                 headers: anonHeaders(config),
@@ -352,9 +366,16 @@ function fullIdentity(name, email) {
 function getCandidates(config, opts) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
+        if (opts.onlyIds && opts.onlyIds.length === 0)
+            return [];
+        // Filtering by vacancy needs an inner join, or candidates without that
+        // application would still come back (with an empty application list).
+        const applications = opts.vacancyId !== undefined
+            ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title))"
+            : "portal_applications(applied_for,portal_vacancies(title))";
         const params = {
             select: "id,portal,name,email,phone:data->contact->>contact_number,cv_object_key,photo_object_key,last_seen_at," +
-                "portal_applications(applied_for,portal_vacancies(title))",
+                applications,
             order: "last_seen_at.desc",
             limit: String((_a = opts.limit) !== null && _a !== void 0 ? _a : 100),
             offset: String((_b = opts.offset) !== null && _b !== void 0 ? _b : 0),
@@ -363,6 +384,25 @@ function getCandidates(config, opts) {
             params.portal = portalFilter(opts.portal);
         if (opts.search)
             params.or = `(name.ilike.*${opts.search}*,email.ilike.*${opts.search}*)`;
+        applyVisibility(params, opts);
+        if (opts.hasCv === "yes")
+            params.cv_object_key = "not.is.null";
+        if (opts.hasCv === "no")
+            params.cv_object_key = "is.null";
+        if (opts.hasEmail === "yes")
+            params.email = "not.is.null";
+        if (opts.hasEmail === "no")
+            params.email = "is.null";
+        // A missing phone is stored as "" (contact.contact_number) or absent, so
+        // "no phone" matches both; grouped under `and` so it cannot collide with
+        // the search's top-level `or`.
+        const phone = "data->contact->>contact_number";
+        if (opts.hasPhone === "yes")
+            params[phone] = "neq.";
+        if (opts.hasPhone === "no")
+            params.and = `(or(${phone}.is.null,${phone}.eq.))`;
+        if (opts.vacancyId !== undefined)
+            params["portal_applications.vacancy_id"] = `eq.${opts.vacancyId}`;
         try {
             const response = yield axios_1.default.get(`${config.url}/rest/v1/portal_candidates`, {
                 headers: anonHeaders(config),

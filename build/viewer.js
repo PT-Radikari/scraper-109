@@ -16,6 +16,7 @@ const express_1 = __importDefault(require("express"));
 const axios_1 = __importDefault(require("axios"));
 const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
+const dashboardHidden_1 = require("./dashboardHidden");
 const dashboardData_1 = require("./dashboardData");
 const app = (0, express_1.default)();
 const PORT = 4000;
@@ -312,6 +313,36 @@ app.get("/api/dashboard/runs/:portal", (req, res) => __awaiter(void 0, void 0, v
         dashboardError(res, error);
     }
 }));
+// Hide / restore rows in scrapview. Nothing is deleted from Supabase (the
+// operator chose "hide, don't delete"): the ids are kept in
+// scrapview/hidden.json in the private artifact bucket, read and written only
+// here with the service key, and filtered out of the tables. Restoring brings
+// a row back.
+app.post("/api/dashboard/hide", express_1.default.json(), (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _c, _d, _e;
+    const config = (0, dashboardData_1.loadDashboardConfig)();
+    if (!config) {
+        res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+        return;
+    }
+    const kind = (_c = req.body) === null || _c === void 0 ? void 0 : _c.kind;
+    const action = (_d = req.body) === null || _d === void 0 ? void 0 : _d.action;
+    const ids = Array.isArray((_e = req.body) === null || _e === void 0 ? void 0 : _e.ids)
+        ? req.body.ids.filter((id) => Number.isInteger(id) && id > 0)
+        : [];
+    if ((kind !== "candidates" && kind !== "vacancies") || (action !== "hide" && action !== "restore") || ids.length === 0 || ids.length > 1000) {
+        res.status(400).json({ error: "kind ('candidates'|'vacancies'), action ('hide'|'restore') and 1-1000 row ids are required" });
+        return;
+    }
+    try {
+        const next = (0, dashboardHidden_1.updateHidden)(yield (0, dashboardHidden_1.loadHidden)(config), kind, ids, action);
+        yield (0, dashboardHidden_1.saveHidden)(config, next);
+        res.json({ kind, action, count: ids.length, hiddenTotal: next[kind].length });
+    }
+    catch (error) {
+        dashboardError(res, error);
+    }
+}));
 app.get("/api/dashboard/vacancies", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const config = (0, dashboardData_1.loadDashboardConfig)();
     if (!config) {
@@ -321,7 +352,9 @@ app.get("/api/dashboard/vacancies", (req, res) => __awaiter(void 0, void 0, void
     try {
         const portal = typeof req.query.portal === "string" ? req.query.portal : undefined;
         const search = typeof req.query.search === "string" ? req.query.search : undefined;
-        res.json(yield (0, dashboardData_1.getVacancies)(config, { portal, search }));
+        const hidden = yield (0, dashboardHidden_1.loadHidden)(config);
+        const visibility = req.query.hidden === "1" ? { onlyIds: hidden.vacancies } : { excludeIds: hidden.vacancies };
+        res.json(yield (0, dashboardData_1.getVacancies)(config, Object.assign({ portal, search }, visibility)));
     }
     catch (error) {
         dashboardError(res, error);
@@ -336,7 +369,12 @@ app.get("/api/dashboard/candidates", (req, res) => __awaiter(void 0, void 0, voi
     try {
         const portal = typeof req.query.portal === "string" ? req.query.portal : undefined;
         const search = typeof req.query.search === "string" ? req.query.search : undefined;
-        res.json(yield (0, dashboardData_1.getCandidates)(config, { portal, search }));
+        const presence = (value) => (value === "yes" || value === "no" ? value : undefined);
+        const vacancyId = typeof req.query.vacancy === "string" && /^\d+$/.test(req.query.vacancy) ? Number(req.query.vacancy) : undefined;
+        const hidden = yield (0, dashboardHidden_1.loadHidden)(config);
+        const visibility = req.query.hidden === "1" ? { onlyIds: hidden.candidates } : { excludeIds: hidden.candidates };
+        res.json(yield (0, dashboardData_1.getCandidates)(config, Object.assign({ portal,
+            search, hasCv: presence(req.query.cv), hasPhone: presence(req.query.phone), hasEmail: presence(req.query.email), vacancyId }, visibility)));
     }
     catch (error) {
         dashboardError(res, error);
@@ -346,13 +384,13 @@ app.get("/api/dashboard/candidates", (req, res) => __awaiter(void 0, void 0, voi
 // with the anon key — never in the browser and never from a raw path the
 // client names directly. See getSignedUrl in src/dashboardData.ts.
 app.post("/api/dashboard/sign-url", (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _c;
+    var _f;
     const config = (0, dashboardData_1.loadDashboardConfig)();
     if (!config) {
         res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
         return;
     }
-    const { portal, candidateId, kind } = (_c = req.body) !== null && _c !== void 0 ? _c : {};
+    const { portal, candidateId, kind } = (_f = req.body) !== null && _f !== void 0 ? _f : {};
     if (typeof portal !== "string" ||
         !dashboardData_1.ALL_PORTALS.includes(portal) ||
         !Number.isInteger(candidateId) ||
@@ -705,6 +743,8 @@ const HTML = `<!DOCTYPE html>
     <div class="dashboard-toolbar">
       <select id="postings-portal-filter"><option value="">All portals</option></select>
       <input type="text" id="postings-search" placeholder="Search title..." />
+      <label class="dashboard-toggle"><input type="checkbox" id="postings-show-hidden" /> Tampilkan tersembunyi</label>
+      <button class="btn" id="postings-hide-visible" onclick="hideVisible('vacancies')">Sembunyikan semua yang tampil</button>
     </div>
     <div id="dashboard-postings"><p class="dashboard-empty">Loading…</p></div>
   </div>
@@ -714,6 +754,12 @@ const HTML = `<!DOCTYPE html>
     <div class="dashboard-toolbar">
       <select id="candidates-portal-filter"><option value="">All portals</option></select>
       <input type="text" id="candidates-search" placeholder="Search name/email..." />
+      <select id="candidates-vacancy-filter"><option value="">Semua lowongan</option></select>
+      <select id="candidates-cv-filter"><option value="">CV: semua</option><option value="yes">Ada CV</option><option value="no">Tanpa CV</option></select>
+      <select id="candidates-phone-filter"><option value="">Telepon: semua</option><option value="yes">Ada telepon</option><option value="no">Tanpa telepon</option></select>
+      <select id="candidates-email-filter"><option value="">Email: semua</option><option value="yes">Ada email</option><option value="no">Tanpa email</option></select>
+      <label class="dashboard-toggle"><input type="checkbox" id="candidates-show-hidden" /> Tampilkan tersembunyi</label>
+      <button class="btn" id="candidates-hide-visible" onclick="hideVisible('candidates')">Sembunyikan semua yang tampil</button>
     </div>
     <div id="dashboard-candidates"><p class="dashboard-empty">Loading…</p></div>
   </div>
@@ -1294,6 +1340,48 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
+    // Hide / restore (scrapview only — nothing is deleted from Supabase).
+    const visibleRows = { vacancies: [], candidates: [] };
+
+    function hideButton(kind, id, showingHidden) {
+      const action = showingHidden ? 'restore' : 'hide';
+      const label = showingHidden ? 'Pulihkan' : 'Sembunyikan';
+      return '<button class="detail-btn" onclick="hideRows(\\'' + kind + '\\',[' + id + '],\\'' + action + '\\')">' + label + '</button>';
+    }
+
+    async function hideRows(kind, ids, action) {
+      if (!ids.length) return;
+      try {
+        await loadJSON('/api/dashboard/hide', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ kind, ids, action }),
+        });
+      } catch (err) {
+        alert('Gagal: ' + err.message);
+        return;
+      }
+      if (kind === 'vacancies') pollPostings(); else pollCandidates();
+    }
+
+    function hideVisible(kind) {
+      const showingHidden = document.getElementById(kind === 'vacancies' ? 'postings-show-hidden' : 'candidates-show-hidden').checked;
+      const ids = visibleRows[kind];
+      if (!ids.length) return;
+      const verb = showingHidden ? 'Pulihkan' : 'Sembunyikan';
+      if (!confirm(verb + ' ' + ids.length + ' baris yang sedang tampil? Data tetap tersimpan di Supabase.')) return;
+      hideRows(kind, ids, showingHidden ? 'restore' : 'hide');
+    }
+
+    function fillVacancyFilter(rows) {
+      const select = document.getElementById('candidates-vacancy-filter');
+      if (!select) return;
+      const current = select.value;
+      select.innerHTML = '<option value="">Semua lowongan</option>' +
+        rows.map(v => '<option value="' + v.id + '">' + esc((v.title || '—') + ' (' + v.portal + ')') + '</option>').join('');
+      select.value = current;
+    }
+
     async function pollPostings() {
       if (inFlight.postings || dashboardConfigured === false) return;
       inFlight.postings = true;
@@ -1304,13 +1392,17 @@ const HTML = `<!DOCTYPE html>
         const params = new URLSearchParams();
         if (portal) params.set('portal', portal);
         if (search) params.set('search', search);
+        const showHiddenPostings = document.getElementById('postings-show-hidden').checked;
+        if (showHiddenPostings) params.set('hidden', '1');
         const rows = await loadJSON('/api/dashboard/vacancies?' + params.toString());
+        visibleRows.vacancies = rows.map(r => r.id);
+        if (!showHiddenPostings && !search) fillVacancyFilter(rows);
         if (!rows.length) {
           el.innerHTML = '<p class="dashboard-empty">No job postings match.</p>';
           return;
         }
         el.innerHTML = \`<table><thead><tr>
-            <th>Portal</th><th>Title</th><th>Description</th><th>Applicants</th><th>Source</th><th>Updated</th>
+            <th>Portal</th><th>Title</th><th>Description</th><th>Applicants</th><th>Source</th><th>Updated</th><th></th>
           </tr></thead><tbody>\${rows.map(v => \`
             <tr>
               <td><span class="tag">\${esc(v.portal)}</span></td>
@@ -1321,6 +1413,7 @@ const HTML = `<!DOCTYPE html>
               <td>\${v.total_applicant ?? '—'}</td>
               <td>\${safeHref(v.link) ? '<a href="' + safeHref(v.link) + '" target="_blank">link</a>' : '—'}</td>
               <td>\${esc(fmtTime(v.last_seen_at))}</td>
+              <td>\${hideButton('vacancies', v.id, showHiddenPostings)}</td>
             </tr>\`).join('')}</tbody></table>\`;
       } catch (err) {
         el.innerHTML = '<div class="dashboard-error">Failed to load job postings: ' + esc(err.message) + '</div>';
@@ -1358,13 +1451,20 @@ const HTML = `<!DOCTYPE html>
         const params = new URLSearchParams();
         if (portal) params.set('portal', portal);
         if (search) params.set('search', search);
+        for (const [param, id] of [['vacancy', 'candidates-vacancy-filter'], ['cv', 'candidates-cv-filter'], ['phone', 'candidates-phone-filter'], ['email', 'candidates-email-filter']]) {
+          const value = document.getElementById(id).value;
+          if (value) params.set(param, value);
+        }
+        const showHiddenCandidates = document.getElementById('candidates-show-hidden').checked;
+        if (showHiddenCandidates) params.set('hidden', '1');
         const rows = await loadJSON('/api/dashboard/candidates?' + params.toString());
+        visibleRows.candidates = rows.map(r => r.id);
         if (!rows.length) {
           el.innerHTML = '<p class="dashboard-empty">No candidates match.</p>';
           return;
         }
         el.innerHTML = \`<table><thead><tr>
-            <th>Portal</th><th>Name</th><th>Email</th><th>Phone</th><th>Vacancy</th><th>Application</th><th>CV</th><th>Updated</th>
+            <th>Portal</th><th>Name</th><th>Email</th><th>Phone</th><th>Vacancy</th><th>Application</th><th>CV</th><th>Updated</th><th></th>
           </tr></thead><tbody>\${rows.map(c => \`
             <tr>
               <td><span class="tag">\${esc(c.portal)}</span></td>
@@ -1375,6 +1475,7 @@ const HTML = `<!DOCTYPE html>
               <td>\${c.applicationStatus === 'linked' ? '<span class="badge-yes">linked</span>' : '<span class="badge-no">unlinked</span>'}</td>
               <td>\${c.cvStatus === 'captured' ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'cv\\',this)">Buka CV</button>' : '<span class="badge-no">none</span>'} \${c.hasPhoto ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'photo\\',this)">Foto</button>' : ''}</td>
               <td>\${esc(fmtTime(c.updatedAt))}</td>
+              <td>\${hideButton('candidates', c.id, showHiddenCandidates)}</td>
             </tr>\`).join('')}</tbody></table>\`;
       } catch (err) {
         el.innerHTML = '<div class="dashboard-error">Failed to load candidates: ' + esc(err.message) + '</div>';
@@ -1393,6 +1494,15 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('postings-search').addEventListener('input', pollPostings);
     document.getElementById('candidates-portal-filter').addEventListener('change', pollCandidates);
     document.getElementById('candidates-search').addEventListener('input', pollCandidates);
+    for (const id of ['candidates-vacancy-filter', 'candidates-cv-filter', 'candidates-phone-filter', 'candidates-email-filter']) {
+      document.getElementById(id).addEventListener('change', pollCandidates);
+    }
+    for (const [toggle, button, poll] of [['postings-show-hidden', 'postings-hide-visible', pollPostings], ['candidates-show-hidden', 'candidates-hide-visible', pollCandidates]]) {
+      document.getElementById(toggle).addEventListener('change', (e) => {
+        document.getElementById(button).textContent = e.target.checked ? 'Pulihkan semua yang tampil' : 'Sembunyikan semua yang tampil';
+        poll();
+      });
+    }
 
     pollPortals();
     pollPostings();

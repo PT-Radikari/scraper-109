@@ -329,6 +329,41 @@ export async function getRuns(config: DashboardConfig, portal: string, limit = 5
   }
 }
 
+/**
+ * scrapview's hide/restore view of rows (see src/dashboardHidden.ts): nothing
+ * is deleted, hidden ids are just excluded — or, in the "show hidden" view,
+ * the only rows returned.
+ */
+export interface RowVisibility {
+  /** Rows the operator hid; excluded from the normal view. */
+  excludeIds?: number[];
+  /** Only these rows (the "show hidden" view). An empty list returns nothing. */
+  onlyIds?: number[];
+}
+
+function idList(ids: number[]): string {
+  return `(${ids.filter((id) => Number.isInteger(id)).join(",")})`;
+}
+
+function applyVisibility(params: Record<string, string>, opts: RowVisibility): void {
+  if (opts.onlyIds) {
+    params.id = `in.${idList(opts.onlyIds)}`;
+  } else if (opts.excludeIds && opts.excludeIds.length > 0) {
+    params.id = `not.in.${idList(opts.excludeIds)}`;
+  }
+}
+
+export type Presence = "yes" | "no";
+
+/** Candidate table filters: presence of a CV, phone or email, and one vacancy. */
+export interface CandidateFilters {
+  hasCv?: Presence;
+  hasPhone?: Presence;
+  hasEmail?: Presence;
+  /** Only candidates with an application to this portal_vacancies row id. */
+  vacancyId?: number;
+}
+
 export interface VacancyRow {
   id: number;
   portal: string;
@@ -349,8 +384,9 @@ export interface VacancyRow {
 
 export async function getVacancies(
   config: DashboardConfig,
-  opts: { portal?: string; search?: string; limit?: number; offset?: number },
+  opts: { portal?: string; search?: string; limit?: number; offset?: number } & RowVisibility,
 ): Promise<VacancyRow[]> {
+  if (opts.onlyIds && opts.onlyIds.length === 0) return [];
   const params: Record<string, string> = {
     order: "last_seen_at.desc",
     limit: String(opts.limit ?? 100),
@@ -358,6 +394,7 @@ export async function getVacancies(
   };
   if (opts.portal) params.portal = portalFilter(opts.portal);
   if (opts.search) params.title = `ilike.*${opts.search}*`;
+  applyVisibility(params, opts);
   try {
     const response = await withVacancyDescription((expr) =>
       axios.get(`${config.url}/rest/v1/portal_vacancies`, {
@@ -438,18 +475,37 @@ function fullIdentity(name: string | null, email: string | null): string {
 
 export async function getCandidates(
   config: DashboardConfig,
-  opts: { portal?: string; search?: string; limit?: number; offset?: number },
+  opts: { portal?: string; search?: string; limit?: number; offset?: number } & RowVisibility & CandidateFilters,
 ): Promise<CandidateRow[]> {
+  if (opts.onlyIds && opts.onlyIds.length === 0) return [];
+  // Filtering by vacancy needs an inner join, or candidates without that
+  // application would still come back (with an empty application list).
+  const applications =
+    opts.vacancyId !== undefined
+      ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title))"
+      : "portal_applications(applied_for,portal_vacancies(title))";
   const params: Record<string, string> = {
     select:
       "id,portal,name,email,phone:data->contact->>contact_number,cv_object_key,photo_object_key,last_seen_at," +
-      "portal_applications(applied_for,portal_vacancies(title))",
+      applications,
     order: "last_seen_at.desc",
     limit: String(opts.limit ?? 100),
     offset: String(opts.offset ?? 0),
   };
   if (opts.portal) params.portal = portalFilter(opts.portal);
   if (opts.search) params.or = `(name.ilike.*${opts.search}*,email.ilike.*${opts.search}*)`;
+  applyVisibility(params, opts);
+  if (opts.hasCv === "yes") params.cv_object_key = "not.is.null";
+  if (opts.hasCv === "no") params.cv_object_key = "is.null";
+  if (opts.hasEmail === "yes") params.email = "not.is.null";
+  if (opts.hasEmail === "no") params.email = "is.null";
+  // A missing phone is stored as "" (contact.contact_number) or absent, so
+  // "no phone" matches both; grouped under `and` so it cannot collide with
+  // the search's top-level `or`.
+  const phone = "data->contact->>contact_number";
+  if (opts.hasPhone === "yes") params[phone] = "neq.";
+  if (opts.hasPhone === "no") params.and = `(or(${phone}.is.null,${phone}.eq.))`;
+  if (opts.vacancyId !== undefined) params["portal_applications.vacancy_id"] = `eq.${opts.vacancyId}`;
   try {
     const response = await axios.get(`${config.url}/rest/v1/portal_candidates`, {
       headers: anonHeaders(config),
