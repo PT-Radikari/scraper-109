@@ -89,9 +89,12 @@ const portalRunnerFactories = {
         const jidArg = args[1] && args[1] !== "-" ? args[1] : null;
         const limitArg = Number.parseInt((_a = args[2]) !== null && _a !== void 0 ? _a : "1", 10);
         const limit = Number.isFinite(limitArg) && limitArg > 0 ? Math.min(limitArg, 50) : 1;
+        // glints-promote <jid> 1 <name…>: move only the applicant with this name
+        // (scrapview's per-candidate button).
+        const nameArg = args.length > 3 ? args.slice(3).join(" ").trim() || null : null;
         return () => {
             const scraper = new Glints(config);
-            scraper.enablePromoteMode(jidArg, limit);
+            scraper.enablePromoteMode(jidArg, nameArg ? 1 : limit, nameArg);
             return scraper.Scrape();
         };
     },

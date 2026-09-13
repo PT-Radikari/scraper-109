@@ -371,10 +371,10 @@ function getCandidates(config, opts) {
         // Filtering by vacancy needs an inner join, or candidates without that
         // application would still come back (with an empty application list).
         const applications = opts.vacancyId !== undefined
-            ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title))"
-            : "portal_applications(applied_for,portal_vacancies(title))";
+            ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title,portal_vacancy_id))"
+            : "portal_applications(applied_for,portal_vacancies(title,portal_vacancy_id))";
         const params = {
-            select: "id,portal,name,email,phone:data->contact->>contact_number,cv_object_key,photo_object_key,last_seen_at," +
+            select: "id,portal,name,email,phone:data->contact->>contact_number,profile_url:data->>url_profile,cv_object_key,photo_object_key,last_seen_at," +
                 applications,
             order: "last_seen_at.desc",
             limit: String((_a = opts.limit) !== null && _a !== void 0 ? _a : 100),
@@ -409,10 +409,11 @@ function getCandidates(config, opts) {
                 params,
             });
             return response.data.map((row) => {
-                var _a, _b, _c, _d;
+                var _a, _b, _c, _d, _e;
                 const applications = (_a = row.portal_applications) !== null && _a !== void 0 ? _a : [];
                 const firstApp = applications[0];
                 const vacancyTitle = (_b = firstApp === null || firstApp === void 0 ? void 0 : firstApp.portal_vacancies) === null || _b === void 0 ? void 0 : _b.title;
+                const vacancyJid = presentText((_c = firstApp === null || firstApp === void 0 ? void 0 : firstApp.portal_vacancies) === null || _c === void 0 ? void 0 : _c.portal_vacancy_id);
                 const name = presentText(row.name);
                 const email = presentText(row.email);
                 return {
@@ -421,8 +422,10 @@ function getCandidates(config, opts) {
                     name,
                     email,
                     phone: presentText(row.phone),
+                    profileUrl: presentText(row.profile_url),
+                    vacancyJid,
                     identity: fullIdentity(name, email),
-                    vacancy: (_d = (_c = firstApp === null || firstApp === void 0 ? void 0 : firstApp.applied_for) !== null && _c !== void 0 ? _c : vacancyTitle) !== null && _d !== void 0 ? _d : null,
+                    vacancy: (_e = (_d = firstApp === null || firstApp === void 0 ? void 0 : firstApp.applied_for) !== null && _d !== void 0 ? _d : vacancyTitle) !== null && _e !== void 0 ? _e : null,
                     applicationStatus: applications.length > 0 ? "linked" : "unlinked",
                     cvStatus: row.cv_object_key ? "captured" : "none",
                     hasPhoto: Boolean(row.photo_object_key),

@@ -63,7 +63,7 @@ describe("getCandidates filters", () => {
   it("filters by vacancy through an inner join on the application", async () => {
     await getCandidates(config, { vacancyId: 10168 });
     const params = lastParams();
-    expect(params.select).toContain("portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title))");
+    expect(params.select).toContain("portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title,portal_vacancy_id))");
     expect(params["portal_applications.vacancy_id"]).toBe("eq.10168");
   });
 
@@ -95,5 +95,41 @@ describe("getVacancies visibility", () => {
   it("returns nothing, without querying, for an empty show-hidden list", async () => {
     await expect(getVacancies(config, { onlyIds: [] })).resolves.toEqual([]);
     expect(mockedAxios.get).not.toHaveBeenCalled();
+  });
+});
+
+// scrapview links each candidate to its portal and lets a still-NEW Glints
+// candidate be moved to Terhubung, which needs the applied vacancy's jid.
+describe("getCandidates portal link and vacancy jid", () => {
+  it("returns the stored profile URL and the applied vacancy's portal id", async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: [
+        {
+          id: 865, portal: "glints", name: "Synthetic Applicant", email: null, phone: null,
+          profile_url: "https://employers.glints.id/manage-candidates?jid=ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a&viewApplicationDetailId=abc",
+          cv_object_key: null, photo_object_key: null, last_seen_at: "t",
+          portal_applications: [
+            { applied_for: "Contact Center Agent", portal_vacancies: { title: "Contact Center Agent", portal_vacancy_id: "ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a" } },
+          ],
+        },
+      ],
+    } as never);
+
+    const [row] = await getCandidates(config, {});
+
+    expect(row.profileUrl).toContain("viewApplicationDetailId=abc");
+    expect(row.vacancyJid).toBe("ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a");
+    expect(lastParams().select).toContain("profile_url:data->>url_profile");
+  });
+
+  it("returns nulls when the candidate has no stored link or application", async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: [{ id: 1, portal: "kita_lulus", name: "X", email: null, phone: null, cv_object_key: null, photo_object_key: null, last_seen_at: "t" }],
+    } as never);
+
+    const [row] = await getCandidates(config, {});
+
+    expect(row.profileUrl).toBeNull();
+    expect(row.vacancyJid).toBeNull();
   });
 });

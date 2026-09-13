@@ -435,6 +435,14 @@ export interface CandidateRow {
   name: string | null;
   email: string | null;
   phone: string | null;
+  /**
+   * The candidate on its portal: Glints stores the applicant's own detail
+   * link (viewApplicationDetailId); KitaLulus has no per-applicant URL, so it
+   * is the vacancy's applicants list.
+   */
+  profileUrl: string | null;
+  /** The applied vacancy's portal id (Glints jid) — what per-candidate promotion targets. */
+  vacancyJid: string | null;
   /** "Name · email" for compact displays. */
   identity: string;
   vacancy: string | null;
@@ -482,11 +490,11 @@ export async function getCandidates(
   // application would still come back (with an empty application list).
   const applications =
     opts.vacancyId !== undefined
-      ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title))"
-      : "portal_applications(applied_for,portal_vacancies(title))";
+      ? "portal_applications!inner(applied_for,vacancy_id,portal_vacancies(title,portal_vacancy_id))"
+      : "portal_applications(applied_for,portal_vacancies(title,portal_vacancy_id))";
   const params: Record<string, string> = {
     select:
-      "id,portal,name,email,phone:data->contact->>contact_number,cv_object_key,photo_object_key,last_seen_at," +
+      "id,portal,name,email,phone:data->contact->>contact_number,profile_url:data->>url_profile,cv_object_key,photo_object_key,last_seen_at," +
       applications,
     order: "last_seen_at.desc",
     limit: String(opts.limit ?? 100),
@@ -515,6 +523,7 @@ export async function getCandidates(
       const applications = (row.portal_applications as Array<Record<string, unknown>>) ?? [];
       const firstApp = applications[0];
       const vacancyTitle = (firstApp?.portal_vacancies as Record<string, unknown> | undefined)?.title;
+      const vacancyJid = presentText((firstApp?.portal_vacancies as Record<string, unknown> | undefined)?.portal_vacancy_id);
       const name = presentText(row.name);
       const email = presentText(row.email);
       return {
@@ -523,6 +532,8 @@ export async function getCandidates(
         name,
         email,
         phone: presentText(row.phone),
+        profileUrl: presentText(row.profile_url),
+        vacancyJid,
         identity: fullIdentity(name, email),
         vacancy: (firstApp?.applied_for as string | undefined) ?? (vacancyTitle as string | undefined) ?? null,
         applicationStatus: applications.length > 0 ? "linked" : "unlinked",

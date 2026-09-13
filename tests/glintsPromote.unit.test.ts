@@ -63,9 +63,12 @@ describe("Glints.enablePromoteMode", () => {
     expect((scraper as unknown as { promoteMode: unknown }).promoteMode).toEqual({
       jid: "ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a",
       max: 3,
+      name: null,
     });
     scraper.enablePromoteMode("", -2);
-    expect((scraper as unknown as { promoteMode: unknown }).promoteMode).toEqual({ jid: null, max: 0 });
+    expect((scraper as unknown as { promoteMode: unknown }).promoteMode).toEqual({ jid: null, max: 0, name: null });
+    scraper.enablePromoteMode("ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a", 1, "  Ratna Anjani ");
+    expect((scraper as unknown as { promoteMode: { name: string } }).promoteMode.name).toBe("Ratna Anjani");
     expect(scraper.getPromotedCount()).toBe(0);
   });
 });
@@ -79,6 +82,8 @@ type FakeOptions = {
   placeholderRows?: number;
   /** Stage tab labels always visible on the page (inside a tab list when `inTabList`). */
   tabs?: Array<{ label: string; inTabList: boolean }>;
+  /** The name cell text of each applicant row, in order. */
+  names?: string[];
 };
 
 /**
@@ -87,11 +92,12 @@ type FakeOptions = {
  * submenu's "Terhubung") removes one row. Every click is recorded.
  */
 function fakeNewList(newApplicants: number, options: FakeOptions) {
-  const { menu, submenu = [], placeholderRows = 0, tabs = [] } = options;
+  const { menu, submenu = [], placeholderRows = 0, tabs = [], names = [] } = options;
   const state = {
     rows: newApplicants,
     menuOpen: false,
     submenuOpen: false,
+    menuRow: -1,
     clicks: [] as string[],
     gotos: [] as string[],
   };
@@ -151,16 +157,23 @@ function fakeNewList(newApplicants: number, options: FakeOptions) {
     getByText: (matcher: RegExp) => byMatcher(matcher),
     locator: (selector: string) => {
       if (selector === '[data-testid="modal-close-btn"]') return { count: async () => 0 };
+      if (selector === '[data-testid="next-page"]') return { count: async () => 0 };
       if (selector.includes("EmptySearchResultWrapper")) return { count: async () => (state.rows === 0 ? 1 : 0) };
       const row = (index: number) => ({
         locator: (inner: string) =>
           inner.includes("TableCell")
-            ? { count: async () => (index < placeholderRows ? 1 : 3) }
+            ? {
+                count: async () => (index < placeholderRows ? 1 : 3),
+                nth: (cell: number) => ({
+                  innerText: async () => (cell === 2 ? (names[index - placeholderRows] ?? "") : ""),
+                }),
+              }
             : {
                 last: () => ({
                   count: async () => (index >= placeholderRows && state.rows > 0 ? 1 : 0),
                   click: async () => {
                     state.clicks.push(index < placeholderRows ? "placeholder-row-menu" : "row-menu");
+                    state.menuRow = index - placeholderRows;
                     state.menuOpen = true;
                   },
                 }),
@@ -279,5 +292,86 @@ describe("Glints.promoteNewApplicants", () => {
     await expect(scraper.promoteNewApplicants(page, vacancyUrl, 0)).resolves.toBe(0);
     expect(state.gotos).toEqual([]);
     expect(state.clicks).toEqual([]);
+  });
+});
+
+// scrapview's per-candidate "Pindahkan ke Terhubung" moves one named applicant.
+// It must move exactly that person, and nobody when the name is ambiguous or
+// no longer in the NEW list.
+describe("Glints.promoteOneApplicant", () => {
+  const vacancyUrl = new URL(
+    "https://employers.glints.id/manage-candidates?jid=ebf41bfc-68e4-49f8-b6f9-894ba41a4e7a&source=dashboard_job_card",
+  );
+
+  beforeEach(() => {
+    jest.spyOn(console, "info").mockImplementation(() => undefined);
+    jest.spyOn(console, "warn").mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("moves only the applicant whose row name matches", async () => {
+    const scraper = new Glints(makeConfig());
+    const { page, state } = fakeNewList(3, {
+      menu: LIVE_MENU,
+      submenu: LIVE_SUBMENU,
+      names: ["Budi Santoso 29 tahun", "Ratna Anjani 32 tahun · Jakarta", "Siti Aminah 31 tahun"],
+    });
+
+    await expect(scraper.promoteOneApplicant(page, vacancyUrl, "ratna  anjani")).resolves.toBe(1);
+
+    expect(new URL(state.gotos[0]).searchParams.get("status")).toBe("NEW");
+    expect(state.menuRow).toBe(1);
+    expect(state.clicks).toEqual(["row-menu", "Pindahkan ke", "Terhubung"]);
+    expect(scraper.getPromotedCount()).toBe(1);
+  });
+
+  it("moves nobody when two NEW applicants share the name", async () => {
+    const scraper = new Glints(makeConfig());
+    const { page, state } = fakeNewList(2, {
+      menu: LIVE_MENU,
+      submenu: LIVE_SUBMENU,
+      names: ["Ratna Anjani 32 tahun", "Ratna Anjani 25 tahun"],
+    });
+
+    await expect(scraper.promoteOneApplicant(page, vacancyUrl, "Ratna Anjani")).resolves.toBe(0);
+
+    expect(state.clicks).toEqual([]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("share the requested name"));
+  });
+
+  it("moves nobody when the applicant is no longer in the NEW list", async () => {
+    const scraper = new Glints(makeConfig());
+    const { page, state } = fakeNewList(2, {
+      menu: LIVE_MENU,
+      submenu: LIVE_SUBMENU,
+      names: ["Budi Santoso 29 tahun", "Siti Aminah 31 tahun"],
+    });
+
+    await expect(scraper.promoteOneApplicant(page, vacancyUrl, "Ratna Anjani")).resolves.toBe(0);
+
+    expect(state.clicks).toEqual([]);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("not in this vacancy's NEW list"));
+  });
+
+  it("never logs the applicant's name", async () => {
+    const scraper = new Glints(makeConfig());
+    const { page } = fakeNewList(1, { menu: LIVE_MENU, submenu: LIVE_SUBMENU, names: ["Ratna Anjani 32 tahun"] });
+
+    await scraper.promoteOneApplicant(page, vacancyUrl, "Ratna Anjani");
+
+    const logged = JSON.stringify([...(console.info as jest.Mock).mock.calls, ...(console.warn as jest.Mock).mock.calls]);
+    expect(logged).not.toContain("Ratna");
+  });
+
+  it("does nothing once one applicant has already been moved in this run", async () => {
+    const scraper = new Glints(makeConfig());
+    const { page, state } = fakeNewList(1, { menu: LIVE_MENU, submenu: LIVE_SUBMENU, names: ["Ratna Anjani 32 tahun"] });
+
+    await scraper.promoteOneApplicant(page, vacancyUrl, "Ratna Anjani");
+    await expect(scraper.promoteOneApplicant(page, vacancyUrl, "Ratna Anjani")).resolves.toBe(0);
+    expect(state.clicks.filter((c) => c === "Terhubung")).toHaveLength(1);
   });
 });

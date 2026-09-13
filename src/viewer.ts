@@ -219,6 +219,11 @@ app.post("/api/glints/promote", express.json(), (req, res) => {
     res.status(400).json({ error: "limit must be between 1 and 50" });
     return;
   }
+  const name = typeof req.body?.name === "string" ? req.body.name.replace(/\s+/g, " ").trim() : "";
+  if (name && (name.length > 120 || jid === null)) {
+    res.status(400).json({ error: "moving one candidate needs its vacancy jid and a name of at most 120 characters" });
+    return;
+  }
   if (req.body?.confirm !== true) {
     res.status(400).json({ error: "confirm must be true: moving applicants to Terhubung cannot be undone by the scraper" });
     return;
@@ -227,8 +232,8 @@ app.post("/api/glints/promote", express.json(), (req, res) => {
     res.status(409).json({ error: "a Glints run is already in progress" });
     return;
   }
-  runScraper(GLINTS_PROMOTE, [GLINTS_PROMOTE, jid ?? "-", String(limit)]);
-  res.json({ started: GLINTS_PROMOTE, jid, limit });
+  runScraper(GLINTS_PROMOTE, name ? [GLINTS_PROMOTE, jid ?? "-", "1", name] : [GLINTS_PROMOTE, jid ?? "-", String(limit)]);
+  res.json({ started: GLINTS_PROMOTE, jid, limit: name ? 1 : limit, single: Boolean(name) });
 });
 
 app.get("/api/glints/promote/logs", (_req, res) => {
@@ -390,6 +395,10 @@ app.get("/api/dashboard/candidates", async (req, res) => {
     const portal = typeof req.query.portal === "string" ? req.query.portal : undefined;
     const search = typeof req.query.search === "string" ? req.query.search : undefined;
     const presence = (value: unknown) => (value === "yes" || value === "no" ? value : undefined);
+    const pageSize =
+      typeof req.query.size === "string" && /^\d+$/.test(req.query.size) ? Math.min(Math.max(Number(req.query.size), 1), 500) : 100;
+    const pageIndex =
+      typeof req.query.page === "string" && /^\d+$/.test(req.query.page) ? Math.min(Number(req.query.page), 1000) : 0;
     const vacancyId =
       typeof req.query.vacancy === "string" && /^\d+$/.test(req.query.vacancy) ? Number(req.query.vacancy) : undefined;
     const hidden = await loadHidden(config);
@@ -403,6 +412,8 @@ app.get("/api/dashboard/candidates", async (req, res) => {
         hasEmail: presence(req.query.email),
         vacancyId,
         ...visibility,
+        limit: pageSize,
+        offset: pageIndex * pageSize,
       }),
     );
   } catch (error) {
@@ -793,6 +804,7 @@ const HTML = `<!DOCTYPE html>
       <select id="candidates-email-filter"><option value="">Email: semua</option><option value="yes">Ada email</option><option value="no">Tanpa email</option></select>
       <label class="dashboard-toggle"><input type="checkbox" id="candidates-show-hidden" /> Tampilkan tersembunyi</label>
       <button class="btn" id="candidates-hide-visible" onclick="hideVisible('candidates')">Sembunyikan semua yang tampil</button>
+      <span class="pager"><button class="btn" id="candidates-prev" onclick="changeCandidatePage(-1)">&lsaquo; Sebelumnya</button> <span id="candidates-page-label">Hal. 1</span> <button class="btn" id="candidates-next" onclick="changeCandidatePage(1)">Berikutnya &rsaquo;</button> <select id="candidates-page-size"><option value="100">100/hal</option><option value="250">250/hal</option><option value="500">500/hal</option></select></span>
     </div>
     <div id="dashboard-candidates"><p class="dashboard-empty">Loading…</p></div>
   </div>
@@ -1406,6 +1418,42 @@ const HTML = `<!DOCTYPE html>
       hideRows(kind, ids, showingHidden ? 'restore' : 'hide');
     }
 
+    // Candidate paging, portal links and per-candidate Glints promotion.
+    let candidatePage = 0;
+    let candidateFilterSignature = '';
+    let candidateRowsById = {};
+
+    function changeCandidatePage(delta) {
+      candidatePage = Math.max(0, candidatePage + delta);
+      pollCandidates();
+    }
+
+    function profileCell(c) {
+      const href = safeHref(c.profileUrl);
+      if (!href) return '—';
+      const label = c.portal === 'glints' ? 'Buka di Glints' : 'Lowongan di ' + (c.portal === 'kita_lulus' ? 'KitaLulus' : c.portal);
+      return '<a href="' + href + '" target="_blank" rel="noopener">' + label + '</a>';
+    }
+
+    function promoteButton(c) {
+      if (c.portal !== 'glints' || !c.vacancyJid || c.phone || c.email) return '';
+      return '<button class="detail-btn" style="color:#b45309" onclick="promoteCandidate(' + c.id + ')">Pindahkan ke Terhubung</button>';
+    }
+
+    async function promoteCandidate(id) {
+      const c = candidateRowsById[id];
+      if (!c || !c.name || !c.vacancyJid) { alert('Kandidat ini tidak bisa dipindahkan (nama atau lowongan tidak diketahui).'); return; }
+      if (!confirm('Pindahkan ' + c.name + ' ke Terhubung di Glints?\\n\\nPerpindahan ini terlihat di Glints dan tidak dapat dibatalkan oleh scraper. Setelah dipindahkan, CV, telepon dan email-nya di-scrape.')) return;
+      const res = await fetch('/api/glints/promote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jid: c.vacancyJid, limit: 1, name: c.name, confirm: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { alert('Gagal memulai: ' + (data.error || res.status)); return; }
+      pollPromoteLog();
+    }
+
     function fillVacancyFilter(rows) {
       const select = document.getElementById('candidates-vacancy-filter');
       if (!select) return;
@@ -1490,14 +1538,24 @@ const HTML = `<!DOCTYPE html>
         }
         const showHiddenCandidates = document.getElementById('candidates-show-hidden').checked;
         if (showHiddenCandidates) params.set('hidden', '1');
+        const pageSize = Number(document.getElementById('candidates-page-size').value) || 100;
+        // A changed filter (or page size) starts again from the first page.
+        const signature = params.toString() + '|' + pageSize;
+        if (signature !== candidateFilterSignature) { candidateFilterSignature = signature; candidatePage = 0; }
+        params.set('page', String(candidatePage));
+        params.set('size', String(pageSize));
         const rows = await loadJSON('/api/dashboard/candidates?' + params.toString());
         visibleRows.candidates = rows.map(r => r.id);
+        candidateRowsById = Object.fromEntries(rows.map(r => [r.id, r]));
+        document.getElementById('candidates-page-label').textContent = 'Hal. ' + (candidatePage + 1);
+        document.getElementById('candidates-prev').disabled = candidatePage === 0;
+        document.getElementById('candidates-next').disabled = rows.length < pageSize;
         if (!rows.length) {
           el.innerHTML = '<p class="dashboard-empty">No candidates match.</p>';
           return;
         }
         el.innerHTML = \`<table><thead><tr>
-            <th>Portal</th><th>Name</th><th>Email</th><th>Phone</th><th>Vacancy</th><th>Application</th><th>CV</th><th>Updated</th><th></th>
+            <th>Portal</th><th>Name</th><th>Email</th><th>Phone</th><th>Vacancy</th><th>Application</th><th>CV</th><th>Profil</th><th>Updated</th><th></th>
           </tr></thead><tbody>\${rows.map(c => \`
             <tr>
               <td><span class="tag">\${esc(c.portal)}</span></td>
@@ -1507,8 +1565,9 @@ const HTML = `<!DOCTYPE html>
               <td>\${esc(c.vacancy || '—')}</td>
               <td>\${c.applicationStatus === 'linked' ? '<span class="badge-yes">linked</span>' : '<span class="badge-no">unlinked</span>'}</td>
               <td>\${c.cvStatus === 'captured' ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'cv\\',this)">Buka CV</button>' : '<span class="badge-no">none</span>'} \${c.hasPhoto ? '<button class="detail-btn" onclick="requestSignedLink(\\'' + c.portal + '\\',' + c.id + ',\\'photo\\',this)">Foto</button>' : ''}</td>
+              <td>\${profileCell(c)}</td>
               <td>\${esc(fmtTime(c.updatedAt))}</td>
-              <td>\${hideButton('candidates', c.id, showHiddenCandidates)}</td>
+              <td>\${hideButton('candidates', c.id, showHiddenCandidates)} \${promoteButton(c)}</td>
             </tr>\`).join('')}</tbody></table>\`;
       } catch (err) {
         el.innerHTML = '<div class="dashboard-error">Failed to load candidates: ' + esc(err.message) + '</div>';
@@ -1527,7 +1586,7 @@ const HTML = `<!DOCTYPE html>
     document.getElementById('postings-search').addEventListener('input', pollPostings);
     document.getElementById('candidates-portal-filter').addEventListener('change', pollCandidates);
     document.getElementById('candidates-search').addEventListener('input', pollCandidates);
-    for (const id of ['candidates-vacancy-filter', 'candidates-cv-filter', 'candidates-phone-filter', 'candidates-email-filter']) {
+    for (const id of ['candidates-vacancy-filter', 'candidates-cv-filter', 'candidates-phone-filter', 'candidates-email-filter', 'candidates-page-size']) {
       document.getElementById(id).addEventListener('change', pollCandidates);
     }
     for (const [toggle, button, poll] of [['postings-show-hidden', 'postings-hide-visible', pollPostings], ['candidates-show-hidden', 'candidates-hide-visible', pollCandidates]]) {

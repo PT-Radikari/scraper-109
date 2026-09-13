@@ -1977,12 +1977,20 @@ export class Glints {
    * loop or a plain run: a move is visible in the employer's pipeline and the
    * scraper cannot undo it.
    */
-  private promoteMode: { jid: string | null; max: number } | null = null;
+  private promoteMode: { jid: string | null; max: number; name: string | null } | null = null;
   private promotedCount = 0;
 
-  enablePromoteMode(jid: string | null, max: number): void {
+  /**
+   * @param name When given, move only the applicant with exactly this name
+   * (scrapview's per-candidate button) instead of the first `max` NEW rows.
+   */
+  enablePromoteMode(jid: string | null, max: number, name: string | null = null): void {
     const budget = Number.isFinite(max) ? Math.max(0, Math.floor(max)) : 0;
-    this.promoteMode = { jid: jid && jid.trim() ? jid.trim() : null, max: budget };
+    this.promoteMode = {
+      jid: jid && jid.trim() ? jid.trim() : null,
+      max: budget,
+      name: name && name.trim() ? name.trim() : null,
+    };
     this.promotedCount = 0;
   }
 
@@ -2129,6 +2137,90 @@ export class Glints {
       }
     }
     return moved;
+  }
+
+  /**
+   * Moves one specific NEW applicant — the one whose row name matches `name`
+   * exactly (case and whitespace aside) — to Terhubung, for scrapview's
+   * per-candidate button. Pages through the vacancy's NEW list to find it.
+   * Moves nobody when two rows carry that name (never guess between people)
+   * or when it is not in the NEW list (already moved). Returns 1 or 0. The
+   * name is never logged.
+   */
+  async promoteOneApplicant(page: any, vacancyUrl: URL, name: string): Promise<number> {
+    const wanted = normalizeGlintsApplicantName(name);
+    if (!wanted || this.promotedCount >= 1) return 0;
+
+    const newListUrl = new URL(vacancyUrl.toString());
+    newListUrl.searchParams.set("status", "NEW");
+    await page.goto(newListUrl.toString());
+
+    const rows = page.locator(GLINTS_APPLICANT_ROW_SELECTOR);
+    const emptyMarker = page.locator(".Polaris-IndexTable__EmptySearchResultWrapper");
+
+    for (let listPage = 1; listPage <= 20; listPage++) {
+      let rowCount = 0;
+      let ready = false;
+      for (let i = 0; i < 45 && !ready; i++) {
+        rowCount = await rows.count();
+        for (let r = 0; r < rowCount; r++) {
+          if ((await this.applicantCells(rows.nth(r)).count()) >= 3) {
+            ready = true;
+            break;
+          }
+        }
+        if (ready) break;
+        if (i >= 10 && (await emptyMarker.count()) > 0) break;
+        await page.waitForTimeout(1000);
+      }
+      if (!ready) break;
+
+      const matches: number[] = [];
+      for (let r = 0; r < rowCount; r++) {
+        const row = rows.nth(r);
+        if ((await this.applicantCells(row).count()) < 3) continue;
+        const rowName = await this.extractName(row).catch(() => "");
+        if (normalizeGlintsApplicantName(rowName) === wanted) matches.push(r);
+      }
+
+      if (matches.length > 1) {
+        console.warn(
+          `[GLINTS] Promote: ${matches.length} NEW applicants share the requested name; moving nobody rather than guessing`,
+        );
+        return 0;
+      }
+
+      if (matches.length === 1) {
+        await this.dismissBlockingModal(page);
+        const menuButton = rows.nth(matches[0]).locator("button").last();
+        if ((await menuButton.count()) === 0) {
+          console.warn("[GLINTS] Promote: the requested applicant's row has no menu button; nothing moved");
+          return 0;
+        }
+        await menuButton.click({ timeout: 15000 });
+        await page.waitForTimeout(800);
+        const moveItem = await this.findTerhubungMoveItem(page);
+        if (!moveItem) {
+          console.warn('[GLINTS] Promote: no "Pindahkan ke Terhubung" in the requested applicant\'s menu; nothing moved');
+          await page.keyboard.press("Escape").catch(() => undefined);
+          return 0;
+        }
+        await moveItem.click({ timeout: 15000 });
+        await page.waitForTimeout(1000);
+        await this.confirmStageMoveIfAsked(page);
+        this.promotedCount++;
+        console.info("[GLINTS] Promote: moved the requested applicant to Terhubung");
+        return 1;
+      }
+
+      const next = page.locator('[data-testid="next-page"]');
+      if ((await next.count()) === 0 || (await next.isDisabled().catch(() => true))) break;
+      await next.click();
+      await page.waitForTimeout(2000);
+    }
+
+    console.warn("[GLINTS] Promote: the requested applicant is not in this vacancy's NEW list (already moved?); nothing moved");
+    return 0;
   }
 
   /** The row menu's submenu trigger that lists the pipeline stages. */
@@ -2437,7 +2529,11 @@ export class Glints {
       // any applicant being progressed. Stage tabs are filter-only — a click
       // never moves an applicant between stages.
       if (this.promoteMode) {
-        await this.promoteNewApplicants(page, vacancyUrl, this.promoteMode.max - this.promotedCount);
+        if (this.promoteMode.name) {
+          await this.promoteOneApplicant(page, vacancyUrl, this.promoteMode.name);
+        } else {
+          await this.promoteNewApplicants(page, vacancyUrl, this.promoteMode.max - this.promotedCount);
+        }
       }
 
       // Promote mode scrapes only Terhubung, where the moved applicants'
