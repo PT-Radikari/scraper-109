@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getSignedUrl = exports.getCandidates = exports.maskPhone = exports.maskEmail = exports.getVacancies = exports.getRuns = exports.getPortalSummaries = exports.deriveStatus = exports.portalFilter = exports.resetVacancyDescriptionExpr = exports.DashboardDataError = exports.loadDashboardConfig = exports.ALL_PORTALS = exports.DISABLED_PORTALS = exports.ACTIVE_PORTALS = void 0;
+exports.getSignedUrl = exports.getCandidates = exports.maskPhone = exports.maskEmail = exports.getVacancies = exports.getRuns = exports.getPortalSummaries = exports.deriveStatus = exports.portalFilter = exports.canonicalPortal = exports.resetVacancyDescriptionExpr = exports.DashboardDataError = exports.loadDashboardConfig = exports.ALL_PORTALS = exports.DISABLED_PORTALS = exports.ACTIVE_PORTALS = void 0;
 const axios_1 = __importDefault(require("axios"));
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
@@ -135,6 +135,20 @@ function serviceHeaders(config, extra = {}) {
 const PORTAL_ALIASES = {
     kitalulus: ["kitalulus", "kita_lulus"],
 };
+/**
+ * Reverse the alias map: a stored row spells KitaLulus "kita_lulus", but the
+ * canonical portal name (what ALL_PORTALS holds and getSignedUrl expects) is
+ * "kitalulus". Returns the canonical name for any known alias, else the input
+ * unchanged. Used to validate a portal that came from a row's own portal cell.
+ */
+function canonicalPortal(portal) {
+    for (const [canonical, aliases] of Object.entries(PORTAL_ALIASES)) {
+        if (aliases.includes(portal))
+            return canonical;
+    }
+    return portal;
+}
+exports.canonicalPortal = canonicalPortal;
 function portalFilter(portal) {
     const aliases = PORTAL_ALIASES[portal];
     return aliases ? `in.(${aliases.join(",")})` : `eq.${portal}`;

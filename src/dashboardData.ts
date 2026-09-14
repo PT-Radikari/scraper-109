@@ -193,6 +193,19 @@ const PORTAL_ALIASES: Record<string, readonly string[]> = {
   kitalulus: ["kitalulus", "kita_lulus"],
 };
 
+/**
+ * Reverse the alias map: a stored row spells KitaLulus "kita_lulus", but the
+ * canonical portal name (what ALL_PORTALS holds and getSignedUrl expects) is
+ * "kitalulus". Returns the canonical name for any known alias, else the input
+ * unchanged. Used to validate a portal that came from a row's own portal cell.
+ */
+export function canonicalPortal(portal: string): string {
+  for (const [canonical, aliases] of Object.entries(PORTAL_ALIASES)) {
+    if (aliases.includes(portal)) return canonical;
+  }
+  return portal;
+}
+
 export function portalFilter(portal: string): string {
   const aliases = PORTAL_ALIASES[portal];
   return aliases ? `in.(${aliases.join(",")})` : `eq.${portal}`;

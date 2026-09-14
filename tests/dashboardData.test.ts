@@ -12,6 +12,7 @@ import {
   ACTIVE_PORTALS,
   DISABLED_PORTALS,
   portalFilter,
+  canonicalPortal,
   resetVacancyDescriptionExpr,
 } from "../src/dashboardData";
 
@@ -280,6 +281,20 @@ describe("portalFilter", () => {
   it("leaves single-spelling portals on an eq. filter", () => {
     expect(portalFilter("glints")).toBe("eq.glints");
     expect(portalFilter("seek")).toBe("eq.seek");
+  });
+});
+
+describe("canonicalPortal", () => {
+  // A candidate row's own portal cell carries the sink spelling; the sign-url
+  // route validates against ALL_PORTALS (canonical names), so it must fold the
+  // alias back first or every KitaLulus "Buka CV" click 400s.
+  it("folds the sink alias back to the canonical name", () => {
+    expect(canonicalPortal("kita_lulus")).toBe("kitalulus");
+  });
+
+  it("passes canonical and unknown names through unchanged", () => {
+    expect(canonicalPortal("kitalulus")).toBe("kitalulus");
+    expect(canonicalPortal("glints")).toBe("glints");
   });
 });
 

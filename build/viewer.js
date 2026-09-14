@@ -398,15 +398,18 @@ app.post("/api/dashboard/sign-url", (req, res) => __awaiter(void 0, void 0, void
         return;
     }
     const { portal, candidateId, kind } = (_f = req.body) !== null && _f !== void 0 ? _f : {};
-    if (typeof portal !== "string" ||
-        !dashboardData_1.ALL_PORTALS.includes(portal) ||
+    // Rows carry the sink's portal spelling ("kita_lulus"); canonicalize to the
+    // ALL_PORTALS name ("kitalulus") before validating, or KitaLulus rows 400.
+    const canonical = typeof portal === "string" ? (0, dashboardData_1.canonicalPortal)(portal) : portal;
+    if (typeof canonical !== "string" ||
+        !dashboardData_1.ALL_PORTALS.includes(canonical) ||
         !Number.isInteger(candidateId) ||
         (kind !== "cv" && kind !== "photo")) {
         res.status(400).json({ error: "portal, candidateId (int) and kind ('cv'|'photo') are required" });
         return;
     }
     try {
-        const result = yield (0, dashboardData_1.getSignedUrl)(config, { portal, candidateId, kind });
+        const result = yield (0, dashboardData_1.getSignedUrl)(config, { portal: canonical, candidateId, kind });
         if (!result) {
             res.status(404).json({ error: "no object on file for this candidate" });
             return;
