@@ -122,6 +122,9 @@ describe("normalizeCompanyName", () => {
   it("trims, collapses inner whitespace, and lowercases", () => {
     expect(normalizeCompanyName("  PT   RADIKARI \n")).toBe("pt radikari");
     expect(normalizeCompanyName("pt radikari")).toBe("pt radikari");
+    expect(normalizeCompanyName("PT Rajawali Berdikari Indonesia\n\nTerverifikasi\n\n·\n\nDepok, Jawa Barat")).toBe(
+      "pt rajawali berdikari indonesia",
+    );
   });
 
   it("keeps distinct companies distinct", () => {

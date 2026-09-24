@@ -99,7 +99,15 @@ exports.resetGlintsLoginState = resetGlintsLoginState;
  * whose casing and padding must not defeat the target_company match.
  */
 function normalizeCompanyName(name) {
-    return name.trim().replace(/\s+/g, " ").toLowerCase();
+    // The live switcher option includes company metadata on later lines and can
+    // carry zero-width formatting marks. Compare the company label, not address
+    // or verification metadata, so UI text decoration cannot break selection.
+    return name
+        .replace(/[\u200B-\u200D\uFEFF]/g, "")
+        .split(/\r?\n/)[0]
+        .trim()
+        .replace(/\s+/g, " ")
+        .toLowerCase();
 }
 exports.normalizeCompanyName = normalizeCompanyName;
 /**
@@ -2436,7 +2444,10 @@ class Glints {
                         vacancy_description: vacancyDescription || (detail === null || detail === void 0 ? void 0 : detail.jobDescription) || "",
                         applied_for: job,
                         applied_date: appliedDate,
-                        name: name,
+                        // The application-detail payload is the authoritative candidate
+                        // identity when its name matched the row. It avoids persisting a
+                        // presentation tag if the table layout drifts again.
+                        name: (detail === null || detail === void 0 ? void 0 : detail.applicantName) || name,
                         email: email,
                         summary: summary,
                         contact: wa,
