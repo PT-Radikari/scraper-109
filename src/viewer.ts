@@ -277,7 +277,10 @@ app.post("/api/glints/promote", express.json(), (req, res) => {
     res.status(400).json({ error: "confirm must be true: moving applicants to Terhubung cannot be undone by the scraper" });
     return;
   }
-  if (scraperState.glints?.status === "running" || scraperState[GLINTS_PROMOTE].status === "running") {
+  if (
+    scraperState[GLINTS_PROMOTE].status === "running" ||
+    isAnotherGlintsRowRunning(GLINTS_PROMOTE)
+  ) {
     res.status(409).json({ error: "a Glints run is already in progress" });
     return;
   }
