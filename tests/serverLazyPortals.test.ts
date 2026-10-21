@@ -23,6 +23,8 @@ const ALL_PORTAL_MODULES = ["glints", "kitalulus", "kitalulus-v2", "jooble", "se
 // portal allowed to load pdf-parse/pdfjs-dist; nobody may load sqlite3 eagerly.
 const CASES: Array<{ command: string; ownModules: string[]; allowPdf: boolean }> = [
   { command: "glints", ownModules: ["glints"], allowPdf: false },
+  // The per-account one-shot command: must stay just as lazy as bare "glints".
+  { command: "glints:second-brand", ownModules: ["glints"], allowPdf: false },
   { command: "jooble", ownModules: ["jooble"], allowPdf: false },
   { command: "seek", ownModules: ["seek"], allowPdf: false },
   { command: "pintarnya", ownModules: ["pintarnya"], allowPdf: false },

@@ -30,6 +30,52 @@ function loadPortalConfig(fileName) {
     return JSON.parse(fs_1.default.readFileSync(configPath, "utf-8"));
 }
 /**
+ * Runs one or every configured Glints account's one-shot scrape, sequentially
+ * — never two accounts' browsers open at once in this process, so a loaded
+ * host never runs more Chromium instances than intended and a stuck account
+ * cannot starve the others of CPU/memory. `accountId: null` means every
+ * account `resolveGlintsAccounts` resolves from glints.json (for a
+ * single-account deployment that is just the implicit "default" account, so
+ * this is the original, single-account behavior unchanged); a non-null id
+ * runs only that one account.
+ *
+ * One account failing is logged and does not stop the others from getting
+ * their turn — a credential failure or challenge on one account must never
+ * consume another account's login-attempt budget (already true because each
+ * account's `LoginAttemptGuard` is separate) or skip its scrape. The overall
+ * promise still rejects once every account has run, so the command's exit
+ * code and retry budget reflect the failure.
+ */
+function runGlintsAccounts(config, accountId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const { Glints, resolveGlintsAccounts, buildGlintsAccountConfig } = require("./glints");
+        const accounts = resolveGlintsAccounts(config);
+        const targets = accountId ? accounts.filter((a) => a.id === accountId) : accounts;
+        if (accountId && targets.length === 0) {
+            throw new Error(`[GLINTS] unknown account "${accountId}" — configured accounts: ${accounts.map((a) => a.id).join(", ")}`);
+        }
+        const failures = [];
+        for (const account of targets) {
+            try {
+                yield new Glints(buildGlintsAccountConfig(config, account), account.id).Scrape();
+            }
+            catch (error) {
+                console.error(`[GLINTS] account "${account.id}" failed`, error);
+                failures.push({ id: account.id, error });
+            }
+        }
+        if (failures.length > 0) {
+            throw new Error(`[GLINTS] ${failures.length}/${targets.length} account run(s) failed: ${failures
+                .map((f) => `${f.id} (${f.error instanceof Error ? f.error.message.split("\n")[0] : String(f.error)})`)
+                .join("; ")}`);
+        }
+    });
+}
+/** Matches the one-shot per-account command `glints:<account-id>`. */
+const GLINTS_ACCOUNT_COMMAND = /^glints:([a-z][a-z0-9-]*)$/;
+/** Matches the continuous per-account command `glints:<account-id>-continuous`. */
+const GLINTS_ACCOUNT_CONTINUOUS_COMMAND = /^glints:([a-z][a-z0-9-]*)-continuous$/;
+/**
  * Lazy factories for the Playwright portal runs, keyed by their CLI command.
  *
  * Each factory `require`s its portal module and reads its config only when its
@@ -74,9 +120,8 @@ const portalRunnerFactories = {
         return () => new Seek(config).Scrape();
     },
     glints: () => {
-        const { Glints } = require("./glints");
         const config = loadPortalConfig("glints.json");
-        return () => new Glints(config).Scrape();
+        return () => runGlintsAccounts(config, null);
     },
     // Human-triggered only (scrapview's "Pindahkan ke Terhubung" button):
     //   glints-promote <jid|-> <limit>
@@ -106,10 +151,18 @@ const portalRunnerFactories = {
 };
 /**
  * Loads the requested portal's module and config, and builds its runner.
- * @param command CLI command naming the portal run.
+ * @param command CLI command naming the portal run — including `glints:<id>`,
+ *   which targets one specific configured Glints account (bare `glints` keeps
+ *   targeting every configured account, as `runGlintsAccounts` above does).
  * @returns A runner creating a fresh scraper instance per call.
  */
 function buildPortalRunner(command) {
+    const glintsAccountMatch = command.match(GLINTS_ACCOUNT_COMMAND);
+    if (glintsAccountMatch) {
+        const config = loadPortalConfig("glints.json");
+        const accountId = glintsAccountMatch[1];
+        return () => runGlintsAccounts(config, accountId);
+    }
     const factory = portalRunnerFactories[command];
     if (!factory) {
         throw new Error(`unknown portal command: ${command}`);
@@ -176,13 +229,13 @@ function getRunRecordingSink() {
  * its config load only when its `<portal>-continuous` command is dispatched,
  * and each call of the built factory constructs a fresh scraper instance so a
  * retried attempt never inherits state from the attempt that failed.
+ *
+ * Glints has no entry here: it drives one or every configured account
+ * sequentially (see `runGlintsContinuous`), which does not fit this map's
+ * one-scraper-per-portal shape. `runContinuousPortal` special-cases it before
+ * ever consulting this map.
  */
 const continuousScraperFactories = {
-    glints: () => {
-        const { Glints } = require("./glints");
-        const config = loadPortalConfig("glints.json");
-        return () => new Glints(config);
-    },
     jooble: () => {
         const { Jooble } = require("./jooble");
         const config = loadPortalConfig("jooble.json");
@@ -272,14 +325,21 @@ exports.runPortalCycle = runPortalCycle;
  * Every cycle writes one row to scrape.scrape_runs via runPortalCycle. An
  * expired portal session shows up here as one loud failed cycle (the scraper
  * throws a "[PORTAL] Session expired ..." line) and the loop keeps cycling.
+ *
+ * @param accountId For `portal === "glints"` only: a specific configured
+ *   account to loop on its own, instead of every configured account.
  */
-function runContinuousPortal(portal) {
-    return __awaiter(this, void 0, void 0, function* () {
+function runContinuousPortal(portal_1) {
+    return __awaiter(this, arguments, void 0, function* (portal, accountId = null) {
         var _a;
         const rawInterval = Number((_a = process.env.SCRAPER_INTERVAL_MS) !== null && _a !== void 0 ? _a : 300000);
         const intervalMs = Number.isFinite(rawInterval) && rawInterval > 0
             ? rawInterval
             : 300000;
+        if (portal === "glints") {
+            yield runGlintsContinuous(accountId, intervalMs);
+            return;
+        }
         // Loaded once up front: the continuous loop only ever drives one portal, and
         // a broken portal module or config should fail the service loudly at boot
         // rather than on every cycle.
@@ -291,6 +351,36 @@ function runContinuousPortal(portal) {
         for (;;) {
             yield runPortalCycle(portal, buildScraper, getRunRecordingSink());
             console.info(`[scheduler] ${portal}: next newest-first cycle in ${intervalMs}ms`);
+            yield new Promise((resolve) => setTimeout(resolve, intervalMs));
+        }
+    });
+}
+/**
+ * The continuous loop for Glints: every pass scrapes one or every configured
+ * account in turn, sequentially — one browser/account at a time, never two
+ * at once in this process. `accountId: null` means every account (for a
+ * single-account deployment, that is just the implicit "default" account, so
+ * this is the original behavior unchanged); scrape_runs rows are labeled
+ * "glints" for that account and "glints:<id>" for every other one, so the
+ * dashboard's existing `glints`-named run history keeps lining up with the
+ * account that has always produced it.
+ */
+function runGlintsContinuous(accountId, intervalMs) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const { Glints, resolveGlintsAccounts, buildGlintsAccountConfig } = require("./glints");
+        const config = loadPortalConfig("glints.json");
+        const accounts = resolveGlintsAccounts(config);
+        const targets = accountId ? accounts.filter((a) => a.id === accountId) : accounts;
+        if (accountId && targets.length === 0) {
+            throw new Error(`unknown glints account: ${accountId} — configured accounts: ${accounts.map((a) => a.id).join(", ")}`);
+        }
+        for (;;) {
+            for (const account of targets) {
+                const label = account.id === "default" ? "glints" : `glints:${account.id}`;
+                const accountConfig = buildGlintsAccountConfig(config, account);
+                yield runPortalCycle(label, () => new Glints(accountConfig, account.id), getRunRecordingSink());
+            }
+            console.info(`[scheduler] glints: next sequential pass over ${targets.map((a) => a.id).join(", ")} in ${intervalMs}ms`);
             yield new Promise((resolve) => setTimeout(resolve, intervalMs));
         }
     });
@@ -308,13 +398,19 @@ function logBootBanner(command) {
 function main() {
     const command = args[0];
     logBootBanner(command);
+    const glintsContinuousMatch = command === null || command === void 0 ? void 0 : command.match(GLINTS_ACCOUNT_CONTINUOUS_COMMAND);
     const continuousMatch = command === null || command === void 0 ? void 0 : command.match(/^([a-z-]+)-continuous$/);
-    if (continuousMatch &&
-        Object.prototype.hasOwnProperty.call(continuousScraperFactories, continuousMatch[1])) {
+    if (glintsContinuousMatch) {
+        void runContinuousPortal("glints", glintsContinuousMatch[1]);
+    }
+    else if (continuousMatch &&
+        (continuousMatch[1] === "glints" ||
+            Object.prototype.hasOwnProperty.call(continuousScraperFactories, continuousMatch[1]))) {
         void runContinuousPortal(continuousMatch[1]);
     }
     else if (command &&
-        Object.prototype.hasOwnProperty.call(portalRunnerFactories, command)) {
+        (Object.prototype.hasOwnProperty.call(portalRunnerFactories, command) ||
+            GLINTS_ACCOUNT_COMMAND.test(command))) {
         void runPortal(command);
     }
     else {

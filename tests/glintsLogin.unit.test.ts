@@ -686,6 +686,96 @@ describe("Glints.ensureAuthenticated", () => {
   });
 });
 
+describe("Glints multi-account isolation", () => {
+  const SECOND_EMAIL = "second@example.com";
+  const SECOND_PASSWORD = "an0ther-s3cret";
+
+  afterEach(() => {
+    delete process.env.GLINTS_EMAIL;
+    delete process.env.GLINTS_PASSWORD;
+    delete process.env.GLINTS_SECOND_EMAIL;
+    delete process.env.GLINTS_SECOND_PASSWORD;
+    resetGlintsLoginState();
+    resetGlintsLoginState("second");
+  });
+
+  it("reads each account's credentials from its own env prefix", async () => {
+    process.env.GLINTS_EMAIL = EMAIL;
+    process.env.GLINTS_PASSWORD = PASSWORD;
+    process.env.GLINTS_SECOND_EMAIL = SECOND_EMAIL;
+    process.env.GLINTS_SECOND_PASSWORD = SECOND_PASSWORD;
+
+    const defaultScraper = new Glints(makeConfig());
+    const secondScraper = new Glints(makeConfig(), "second");
+
+    const defaultPage = new FakeLoginPage();
+    defaultPage.onSubmit = () => {
+      defaultPage.currentUrl = "https://employers.glints.id/dashboard";
+      defaultPage.dashboardMarkerCount = 1;
+    };
+    await defaultScraper.ensureAuthenticated(defaultPage, fakeContext);
+    expect(defaultPage.fills['input[name="email"]']).toBe(EMAIL);
+
+    const secondPage = new FakeLoginPage();
+    secondPage.onSubmit = () => {
+      secondPage.currentUrl = "https://employers.glints.id/dashboard";
+      secondPage.dashboardMarkerCount = 1;
+    };
+    await secondScraper.ensureAuthenticated(secondPage, fakeContext);
+    expect(secondPage.fills['input[name="email"]']).toBe(SECOND_EMAIL);
+  });
+
+  it("names the missing env prefix of a non-default account that has no credentials", async () => {
+    const secondScraper = new Glints(makeConfig(), "second");
+    const page = new FakeLoginPage();
+
+    await expect(secondScraper.ensureAuthenticated(page, fakeContext)).rejects.toThrow(
+      /GLINTS_SECOND_EMAIL/,
+    );
+  });
+
+  it("keeps each account's refreshed session and login guard separate", async () => {
+    process.env.GLINTS_EMAIL = EMAIL;
+    process.env.GLINTS_PASSWORD = PASSWORD;
+    process.env.GLINTS_SECOND_EMAIL = SECOND_EMAIL;
+    process.env.GLINTS_SECOND_PASSWORD = SECOND_PASSWORD;
+
+    const defaultScraper = new Glints(makeConfig());
+    const secondScraper = new Glints(makeConfig(), "second");
+
+    // Exhaust the default account's login guard with two interstitial failures.
+    const interstitialPage = () => {
+      const page = new FakeLoginPage();
+      page.onSubmit = () => {
+        page.currentUrl = "https://employers.glints.id/onboarding";
+      };
+      return page;
+    };
+    await expect(
+      defaultScraper.ensureAuthenticated(interstitialPage(), fakeContext),
+    ).rejects.toThrow(/GLINTS_LOGIN_FAILED/);
+    await expect(
+      defaultScraper.ensureAuthenticated(interstitialPage(), fakeContext),
+    ).rejects.toThrow(/GLINTS_LOGIN_FAILED/);
+    await expect(
+      defaultScraper.ensureAuthenticated(interstitialPage(), fakeContext),
+    ).rejects.toThrow(/skipped/);
+
+    // The second account's own guard is untouched — it can still log in.
+    const secondPage = new FakeLoginPage();
+    secondPage.onSubmit = () => {
+      secondPage.currentUrl = "https://employers.glints.id/dashboard";
+      secondPage.dashboardMarkerCount = 1;
+    };
+    await secondScraper.ensureAuthenticated(secondPage, fakeContext);
+    expect(secondPage.fills['input[name="email"]']).toBe(SECOND_EMAIL);
+
+    // And the default account's session store stays untouched by the second
+    // account's successful login.
+    expect(glintsSessionStore.get()).toBeNull();
+  });
+});
+
 describe("Glints.waitForDashboardOrLogin", () => {
   let scraper: Glints;
 
