@@ -116,4 +116,27 @@ describe("runPortalCycle", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("syncs to the sheet only after a cycle that actually succeeded", async () => {
+    const syncToSheets = jest.fn().mockResolvedValue(undefined);
+    await runPortalCycle("jooble", fakeScraper, fakeRunSink(), syncToSheets);
+    expect(syncToSheets).toHaveBeenCalledWith("jooble");
+  });
+
+  it("skips the sheet sync when the cycle exhausted its retry budget", async () => {
+    const syncToSheets = jest.fn().mockResolvedValue(undefined);
+    const scraper = fakeScraper({ Scrape: jest.fn().mockRejectedValue(new Error("boom")) });
+    await runPortalCycle("jooble", () => scraper, fakeRunSink(), syncToSheets);
+    expect(syncToSheets).not.toHaveBeenCalled();
+  });
+
+  it("never lets a failing sheet sync escape the cycle", async () => {
+    const syncToSheets = jest.fn().mockRejectedValue(new Error("sheets down"));
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(runPortalCycle("jooble", fakeScraper, fakeRunSink(), syncToSheets)).resolves.toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });

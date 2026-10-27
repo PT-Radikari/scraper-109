@@ -2,6 +2,7 @@ import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
+import { syncPortalResultsToSheets } from "./googleSheetsSync";
 import fs from "fs";
 import path from "path";
 
@@ -301,6 +302,7 @@ export async function runPortalCycle(
   portal: string,
   buildScraper: () => ContinuousScraper,
   sink: Pick<SupabaseSink, "recordRunStart" | "recordRunEnd"> | null,
+  syncToSheets: (portal: string) => Promise<unknown> = syncPortalResultsToSheets,
 ): Promise<void> {
   const config = loadRetryConfig();
   let lastScraper: ContinuousScraper | null = null;
@@ -349,6 +351,19 @@ export async function runPortalCycle(
       });
     } catch (error) {
       console.warn(`[scheduler] failed to record ${portal} run end`, error);
+    }
+  }
+
+  // Mirrors this portal's current scrape.* rows into the Google Sheet, only
+  // after a cycle that actually succeeded. syncPortalResultsToSheets already
+  // swallows its own errors (unconfigured or failing sync must never affect
+  // the scraping cycle); this catch is defense-in-depth for an injected
+  // override that doesn't.
+  if (!cycleError) {
+    try {
+      await syncToSheets(portal);
+    } catch (error) {
+      console.warn(`[scheduler] ${portal}: sheets sync failed`, error);
     }
   }
 }

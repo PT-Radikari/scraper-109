@@ -347,3 +347,45 @@ and the legacy paths still use the native `sqlite3` dependency; if `node_modules
 host with a different OS/architecture, reinstall dependencies for the current
 platform or run `npm rebuild sqlite3`. The Docker image installs its own
 dependencies during the build, so rebuilding locally cannot break the container.
+
+## Google Sheet sync
+
+An optional mirror of the scrape results into a Google Sheet, alongside the Supabase sink above
+and the scrapview dashboard — for operators who want the results in a spreadsheet. Implemented in
+`src/googleSheetsSync.ts` and talks the Sheets API v4 directly over axios + a service-account JWT
+signed with Node's own `crypto` (no `googleapis` dependency), the same "REST over axios, no
+SDK/driver" posture `src/supabaseSink.ts` takes with Supabase.
+
+- **Trigger**: `src/server.ts`'s `runPortalCycle` calls it once, after a cycle that finished
+  successfully (never on a failed cycle, and a sync failure itself never fails the cycle — same
+  "must never abort a scraping run" rule the central-ingestion bridge follows). It is a mirror, not
+  a new standing service: no extra container, no polling loop.
+- **Grain / tabs**: two tabs, `Vacancies` (one row per `scrape.portal_vacancies` row) and
+  `Candidates` (one row per `scrape.portal_candidates` row, each carrying its first linked
+  application's `applied_for`/`applied_date`). Each sync call re-pages through every row the
+  triggering portal currently has in Supabase (not just what changed) and **upserts in place**,
+  keyed by the sheet row's first two columns — `(portal, portal_vacancy_id)` for Vacancies,
+  `(portal, portal_candidate_id)` for Candidates — so a re-scrape updates its existing line and
+  never appends a duplicate. A tab is created (and given its header row) on first use if it doesn't
+  exist yet.
+- **Fields and PII handling** (decided 2026-10-27): `email`, `phone`, `date_of_birth` and
+  `location` are masked before they ever leave the process (`maskEmail`/`maskPhone` from
+  `src/dashboardData.ts`; `maskDateOfBirth`/`maskLocation` in `src/googleSheetsSync.ts`) — a sheet
+  is far more exportable/forwardable than the authenticated dashboard, so it never gets the
+  dashboard's unmasked view. `cv_object_key`/`photo_object_key` never appear as links or raw keys,
+  only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
+  isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
+  `src/googleSheetsSync.ts` for the exact column list.
+- **Failure behavior**: unconfigured (either env var below missing) is a silent no-op — existing
+  scraper behavior is unchanged on a fresh checkout. A misconfigured credential (malformed JSON) or
+  any Sheets API failure (including a 403 from the sheet not being shared with the service account)
+  is logged as `[sheets-sync] ...` and otherwise swallowed; it never fails or alters the scrape
+  cycle that triggered it.
+- **Config** (`.env.sample`):
+  - `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` — the full JSON key of a Google Cloud service account with
+    the Sheets API enabled, as one line. Runtime secret, deployment env only — never commit the
+    real value.
+  - `GOOGLE_SHEETS_SPREADSHEET_ID` — the target spreadsheet's id (the segment of its URL between
+    `/d/` and `/edit`).
+  - The sheet must be shared with that service account's `client_email` as an **Editor**, or every
+    write fails with a 403.

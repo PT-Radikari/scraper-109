@@ -7,6 +7,8 @@ import {
   getPortalSummaries,
   getVacancies,
   getCandidates,
+  getVacanciesForSync,
+  getCandidatesForSync,
   getSignedUrl,
   DashboardDataError,
   ACTIVE_PORTALS,
@@ -236,6 +238,71 @@ describe("getCandidates", () => {
     await getCandidates(config, { search: "Ada" });
     const callParams = mockedAxios.get.mock.calls[0][1]?.params as Record<string, string>;
     expect(callParams.or).toBe("(name.ilike.*Ada*,email.ilike.*Ada*)");
+  });
+});
+
+describe("getVacanciesForSync", () => {
+  it("maps rows to the sync shape, including the natural key the dashboard's own VacancyRow omits", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValue({
+      data: [
+        {
+          portal: "kitalulus", portal_vacancy_id: "vac-1", title: "Warehouse Staff", link: "https://x",
+          status: "new", total_applicant: 2, last_seen_at: "t", description: "Full JD",
+        },
+      ],
+    } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    const rows = await getVacanciesForSync(config, "kitalulus");
+    expect(rows).toEqual([
+      {
+        portal: "kitalulus", portalVacancyId: "vac-1", title: "Warehouse Staff", link: "https://x",
+        status: "new", totalApplicant: 2, description: "Full JD", lastSeenAt: "t",
+      },
+    ]);
+  });
+
+  it("pages through every row for the portal instead of stopping at one page", async () => {
+    jest.clearAllMocks();
+    const fullPage = Array.from({ length: 500 }, (_, i) => ({
+      portal: "kitalulus", portal_vacancy_id: `vac-${i}`, title: "t", link: null,
+      status: "new", total_applicant: 0, last_seen_at: "t", description: null,
+    }));
+    const lastPage = [
+      { portal: "kitalulus", portal_vacancy_id: "vac-500", title: "t", link: null, status: "new", total_applicant: 0, last_seen_at: "t", description: null },
+    ];
+    mockedAxios.get.mockResolvedValueOnce({ data: fullPage } as never).mockResolvedValueOnce({ data: lastPage } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    const rows = await getVacanciesForSync(config, "kitalulus");
+    expect(rows).toHaveLength(501);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(2);
+    const secondCallParams = mockedAxios.get.mock.calls[1][1]?.params as Record<string, string>;
+    expect(secondCallParams.offset).toBe("500");
+  });
+});
+
+describe("getCandidatesForSync", () => {
+  it("maps rows to the sync shape with date_of_birth/location, which getCandidates doesn't select", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValue({
+      data: [
+        {
+          portal: "glints", portal_candidate_id: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
+          phone: "081234567890", date_of_birth: "1998-05-12", location: "Jakarta", cv_object_key: "x.pdf",
+          photo_object_key: null, last_seen_at: "t",
+          portal_applications: [{ applied_for: "Analyst", applied_date: "2026-10-01" }],
+        },
+      ],
+    } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    const rows = await getCandidatesForSync(config, "glints");
+    expect(rows).toEqual([
+      {
+        portal: "glints", portalCandidateId: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
+        phone: "081234567890", dateOfBirth: "1998-05-12", location: "Jakarta",
+        appliedFor: "Analyst", appliedDate: "2026-10-01", hasCv: true, hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
   });
 });
 
