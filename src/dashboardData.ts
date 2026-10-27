@@ -236,6 +236,15 @@ async function countRows(
   }
 }
 
+/** Exact row count for one portal's table via PostgREST `count=exact` — used by the Google Sheet backfill's verification step (src/googleSheetsSync.ts) to confirm nothing was dropped between the paginated fetch and the sheet write. */
+export async function countPortalRows(
+  config: DashboardConfig,
+  table: "portal_vacancies" | "portal_candidates",
+  portal: string,
+): Promise<number> {
+  return countRows(config, table, { portal: portalFilter(portal) });
+}
+
 async function fetchLatestRun(config: DashboardConfig, portal: string): Promise<ScrapeRunRow | null> {
   try {
     const response = await axios.get(`${config.url}/rest/v1/scrape_runs`, {

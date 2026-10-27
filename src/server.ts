@@ -2,7 +2,7 @@ import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
-import { syncPortalResultsToSheets } from "./googleSheetsSync";
+import { syncPortalResultsToSheets, backfillAllPortalsToSheets } from "./googleSheetsSync";
 import fs from "fs";
 import path from "path";
 
@@ -513,6 +513,31 @@ function main(): void {
           await service.init();
           console.log(await service.stats());
           await service.close();
+        })();
+        break;
+      }
+
+      // One-shot, manually-invoked catch-up for populating the Google Sheet
+      // with every portal's existing scrape.* rows (see
+      // backfillAllPortalsToSheets in src/googleSheetsSync.ts). Never part of
+      // the scraping pipeline or the continuous loop — run by hand once the
+      // Google credential and sheet access are verified.
+      case "sheets-backfill": {
+        console.log("Will run the one-shot Google Sheets backfill");
+        void (async () => {
+          try {
+            const report = await backfillAllPortalsToSheets();
+            console.log(JSON.stringify(report, null, 2));
+            if (!report.allRowCountsMatch) {
+              console.error(
+                "[sheets-backfill] row count mismatch against Supabase for one or more portals - see report above",
+              );
+              process.exitCode = 1;
+            }
+          } catch (error) {
+            console.error("[sheets-backfill] failed:", error instanceof Error ? error.message : error);
+            process.exitCode = 1;
+          }
         })();
         break;
       }

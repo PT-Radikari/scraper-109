@@ -352,9 +352,10 @@ dependencies during the build, so rebuilding locally cannot break the container.
 
 An optional mirror of the scrape results into a Google Sheet, alongside the Supabase sink above
 and the scrapview dashboard — for operators who want the results in a spreadsheet. Implemented in
-`src/googleSheetsSync.ts` and talks the Sheets API v4 directly over axios + a service-account JWT
-signed with Node's own `crypto` (no `googleapis` dependency), the same "REST over axios, no
-SDK/driver" posture `src/supabaseSink.ts` takes with Supabase.
+`src/googleSheetsSync.ts` and talks the Sheets API v4 directly over axios (no `googleapis`
+dependency), the same "REST over axios, no SDK/driver" posture `src/supabaseSink.ts` takes with
+Supabase. Supports two credential shapes — a service account (JWT signed with Node's own `crypto`)
+or an authorized_user OAuth refresh token read from two local files — see **Config** below.
 
 - **Trigger**: `src/server.ts`'s `runPortalCycle` calls it once, after a cycle that finished
   successfully (never on a failed cycle, and a sync failure itself never fails the cycle — same
@@ -376,16 +377,33 @@ SDK/driver" posture `src/supabaseSink.ts` takes with Supabase.
   only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
   isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
   `src/googleSheetsSync.ts` for the exact column list.
-- **Failure behavior**: unconfigured (either env var below missing) is a silent no-op — existing
-  scraper behavior is unchanged on a fresh checkout. A misconfigured credential (malformed JSON) or
-  any Sheets API failure (including a 403 from the sheet not being shared with the service account)
+- **Failure behavior**: unconfigured (`GOOGLE_SHEETS_SPREADSHEET_ID` plus one full credential shape
+  missing) is a silent no-op — existing scraper behavior is unchanged on a fresh checkout. A
+  misconfigured credential (malformed JSON, an unreadable token/client-secret file, a token file
+  with no `refresh_token`) or any Sheets/OAuth API failure (including a 403 from the sheet not being
+  shared with the credential's account, or an `invalid_grant` from an expired/revoked refresh token)
   is logged as `[sheets-sync] ...` and otherwise swallowed; it never fails or alters the scrape
-  cycle that triggered it.
-- **Config** (`.env.sample`):
-  - `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` — the full JSON key of a Google Cloud service account with
-    the Sheets API enabled, as one line. Runtime secret, deployment env only — never commit the
-    real value.
-  - `GOOGLE_SHEETS_SPREADSHEET_ID` — the target spreadsheet's id (the segment of its URL between
-    `/d/` and `/edit`).
-  - The sheet must be shared with that service account's `client_email` as an **Editor**, or every
-    write fails with a 403.
+  cycle that triggered it. The one-shot backfill (below) throws instead of swallowing — there is no
+  scrape cycle to protect there, so a failure should be loud.
+- **Config** (`.env.sample`): `GOOGLE_SHEETS_SPREADSHEET_ID` — the target spreadsheet's id (the
+  segment of its URL between `/d/` and `/edit`) — plus exactly one of:
+  - **Service account**: `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` — the full JSON key of a Google Cloud
+    service account with the Sheets API enabled, as one line. Runtime secret, deployment env
+    only — never commit the real value. The sheet must be shared with that service account's
+    `client_email` as an **Editor**, or every write fails with a 403.
+  - **Authorized user (OAuth refresh token)**: `GOOGLE_TOKEN_PATH` (alias
+    `GOOGLE_APPLICATION_CREDENTIALS`) — path to a token file holding a `refresh_token` — and
+    `GOOGLE_CLIENT_SECRET_PATH` — path to the OAuth client's `client_secret_*.json`. Only the
+    *paths* are env vars; the files themselves are never committed, and their contents (refresh
+    token, client secret, minted access token) never appear in a log line or thrown error — only
+    the file path and, on an OAuth failure, Google's error code (e.g. `invalid_grant`). The token's
+    own Google account needs edit access on the sheet, same as a service account would. Takes
+    priority only when `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` is unset. `GOOGLE_SHEETS_SCOPES` is
+    consulted only by the service-account flow.
+- **One-shot backfill**: `npm run sheets:backfill` mirrors every portal's *current* rows into the
+  sheet immediately (`backfillAllPortalsToSheets` in `src/googleSheetsSync.ts`), instead of waiting
+  for each portal's next scrape cycle — for populating a sheet that predates the sync. Same
+  upsert-by-key path as the per-cycle sync (read-only against Supabase beyond that), plus an
+  independent re-count of each portal's Supabase rows compared against what was written, so a
+  dropped row or a silently-truncated page is caught rather than assumed; exits non-zero on a
+  mismatch. Never runs on its own — it is not part of the scraping pipeline or the continuous loop.

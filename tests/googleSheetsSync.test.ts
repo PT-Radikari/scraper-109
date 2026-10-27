@@ -1,5 +1,8 @@
 import axios from "axios";
 import crypto from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 jest.mock("axios");
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -10,6 +13,7 @@ jest.mock("../src/dashboardData", () => {
     ...actual,
     getVacanciesForSync: jest.fn(),
     getCandidatesForSync: jest.fn(),
+    countPortalRows: jest.fn(),
   };
 });
 
@@ -20,10 +24,11 @@ import {
   maskLocation,
   upsertRows,
   syncPortalResultsToSheets,
+  backfillAllPortalsToSheets,
   resetGoogleSheetsTokenCache,
   GoogleSheetsConfig,
 } from "../src/googleSheetsSync";
-import { getVacanciesForSync, getCandidatesForSync } from "../src/dashboardData";
+import { getVacanciesForSync, getCandidatesForSync, countPortalRows, ALL_PORTALS } from "../src/dashboardData";
 
 async function withEnv(vars: Record<string, string | undefined>, run: () => void | Promise<void>) {
   const prev: Record<string, string | undefined> = {};
@@ -71,8 +76,7 @@ describe("loadGoogleSheetsConfig", () => {
       () => {
         expect(loadGoogleSheetsConfig()).toEqual({
           spreadsheetId: "sheet1",
-          clientEmail: "a@b.iam.gserviceaccount.com",
-          privateKey: "key",
+          auth: { kind: "service_account", clientEmail: "a@b.iam.gserviceaccount.com", privateKey: "key" },
         });
       },
     );
@@ -94,6 +98,123 @@ describe("loadGoogleSheetsConfig", () => {
         expect(() => loadGoogleSheetsConfig()).toThrow(/missing client_email\/private_key/);
       },
     );
+  });
+
+  describe("authorized_user (OAuth refresh token) credential", () => {
+    let tmpDir: string;
+    let tokenPath: string;
+    let clientSecretPath: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sheets-sync-test-"));
+      tokenPath = path.join(tmpDir, "google_token.json");
+      clientSecretPath = path.join(tmpDir, "google_client_secret.json");
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("resolves client_id/client_secret from the separate client_secret file (installed shape)", () => {
+      fs.writeFileSync(tokenPath, JSON.stringify({ refresh_token: "refresh-abc" }));
+      fs.writeFileSync(clientSecretPath, JSON.stringify({ installed: { client_id: "id-1", client_secret: "secret-1" } }));
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: tokenPath,
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
+          expect(loadGoogleSheetsConfig()).toEqual({
+            spreadsheetId: "sheet1",
+            auth: { kind: "authorized_user", clientId: "id-1", clientSecret: "secret-1", refreshToken: "refresh-abc" },
+          });
+        },
+      );
+    });
+
+    it("accepts GOOGLE_APPLICATION_CREDENTIALS as an alias for GOOGLE_TOKEN_PATH", () => {
+      fs.writeFileSync(tokenPath, JSON.stringify({ refresh_token: "refresh-abc", client_id: "id-2", client_secret: "secret-2" }));
+      fs.writeFileSync(clientSecretPath, JSON.stringify({}));
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: undefined,
+          GOOGLE_APPLICATION_CREDENTIALS: tokenPath,
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
+          // Token file already embeds client_id/client_secret, so the (empty) client_secret file is never needed for those fields.
+          expect(loadGoogleSheetsConfig()).toEqual({
+            spreadsheetId: "sheet1",
+            auth: { kind: "authorized_user", clientId: "id-2", clientSecret: "secret-2", refreshToken: "refresh-abc" },
+          });
+        },
+      );
+    });
+
+    it("returns null when only one of the two credential files is configured", () => {
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: tokenPath,
+          GOOGLE_CLIENT_SECRET_PATH: undefined,
+        },
+        () => {
+          expect(loadGoogleSheetsConfig()).toBeNull();
+        },
+      );
+    });
+
+    it("throws when the token file has no refresh_token", () => {
+      fs.writeFileSync(tokenPath, JSON.stringify({ client_id: "id", client_secret: "secret" }));
+      fs.writeFileSync(clientSecretPath, JSON.stringify({}));
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: tokenPath,
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
+          expect(() => loadGoogleSheetsConfig()).toThrow(/has no refresh_token/);
+        },
+      );
+    });
+
+    it("throws when the token file points at a path that doesn't exist, naming only the path", () => {
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: "/nonexistent/google_token.json",
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
+          expect(() => loadGoogleSheetsConfig()).toThrow("google sheets: could not read GOOGLE_TOKEN_PATH/GOOGLE_APPLICATION_CREDENTIALS at /nonexistent/google_token.json");
+        },
+      );
+    });
+
+    it("service account takes priority when both credential shapes are configured", () => {
+      fs.writeFileSync(tokenPath, JSON.stringify({ refresh_token: "refresh-abc" }));
+      fs.writeFileSync(clientSecretPath, JSON.stringify({ client_id: "id", client_secret: "secret" }));
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "a@b.iam.gserviceaccount.com", private_key: "key" }),
+          GOOGLE_TOKEN_PATH: tokenPath,
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
+          const config = loadGoogleSheetsConfig();
+          expect(config?.auth.kind).toBe("service_account");
+        },
+      );
+    });
   });
 });
 
@@ -141,8 +262,7 @@ describe("maskLocation", () => {
 
 const CONFIG: GoogleSheetsConfig = {
   spreadsheetId: "sheet-xyz",
-  clientEmail: "sync@test.iam.gserviceaccount.com",
-  privateKey: "",
+  auth: { kind: "service_account", clientEmail: "sync@test.iam.gserviceaccount.com", privateKey: "" },
 };
 
 function mockTokenMint() {
@@ -157,7 +277,7 @@ function mockTokenMint() {
 beforeEach(() => {
   jest.clearAllMocks();
   resetGoogleSheetsTokenCache();
-  CONFIG.privateKey = privateKeyPem;
+  if (CONFIG.auth.kind === "service_account") CONFIG.auth.privateKey = privateKeyPem;
 });
 
 describe("upsertRows", () => {
@@ -326,5 +446,122 @@ describe("syncPortalResultsToSheets", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+});
+
+describe("authorized_user access-token refresh", () => {
+  const AUTH_USER_CONFIG: GoogleSheetsConfig = {
+    spreadsheetId: "sheet-xyz",
+    auth: { kind: "authorized_user", clientId: "client-id", clientSecret: "client-secret", refreshToken: "refresh-abc" },
+  };
+
+  it("sends the standard refresh_token grant and never leaks the refresh token/secret on failure", async () => {
+    mockedAxios.get.mockResolvedValue({ data: {} });
+    let capturedBody: string | undefined;
+    mockedAxios.post.mockImplementation((url: string, body?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        capturedBody = body as string;
+        return Promise.resolve({ data: { access_token: "user-token", expires_in: 3599 } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    await upsertRows(AUTH_USER_CONFIG, "Vacancies", ["portal", "portal_vacancy_id"], [["glints", "vac-1"]]);
+
+    expect(capturedBody).toBe(
+      "grant_type=refresh_token&refresh_token=refresh-abc&client_id=client-id&client_secret=client-secret",
+    );
+  });
+
+  it("surfaces the OAuth error code (e.g. invalid_grant) but never the refresh token or client secret", async () => {
+    mockedAxios.post.mockImplementation((url: string) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        const error = new Error("Request failed") as Error & { isAxiosError: boolean; response: unknown };
+        error.isAxiosError = true;
+        error.response = { status: 400, data: { error: "invalid_grant", error_description: "Token has been expired or revoked." } };
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.isAxiosError.mockReturnValueOnce(true);
+
+    let caught: Error | undefined;
+    try {
+      await upsertRows(AUTH_USER_CONFIG, "Vacancies", ["portal", "portal_vacancy_id"], [["glints", "vac-1"]]);
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught?.message).toContain("invalid_grant");
+    expect(caught?.message).not.toContain("refresh-abc");
+    expect(caught?.message).not.toContain("client-secret");
+  });
+});
+
+describe("backfillAllPortalsToSheets", () => {
+  it("throws rather than returning null when unconfigured — a one-shot run fails loudly", async () => {
+    await withEnv(
+      { GOOGLE_SHEETS_SPREADSHEET_ID: undefined, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined },
+      async () => {
+        await expect(backfillAllPortalsToSheets(["glints"])).rejects.toThrow(/not configured/);
+      },
+    );
+  });
+
+  it("writes every named portal and flags a mismatch between what was written and Supabase's own count", async () => {
+    (getVacanciesForSync as jest.Mock).mockImplementation((_config, portal: string) =>
+      Promise.resolve(portal === "glints" ? [{ portal, portalVacancyId: "v1", title: "t", link: null, status: "new", totalApplicant: null, description: null, lastSeenAt: "t" }] : []),
+    );
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([]);
+    // Supabase reports one more vacancy row than was actually fetched/written — a dropped-row scenario the verification step must catch.
+    (countPortalRows as jest.Mock).mockImplementation((_config, table: string, portal: string) =>
+      Promise.resolve(table === "portal_vacancies" && portal === "glints" ? 2 : 0),
+    );
+    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies" } }, { properties: { title: "Candidates" } }], values: [["portal"]] } });
+    mockedAxios.post.mockImplementation((url: string) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      return Promise.resolve({ data: {} });
+    });
+
+    await withEnv(
+      {
+        GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+        GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com", private_key: privateKeyPem }),
+        SCORING_SUPABASE_URL: "http://supabase.local",
+        SCORING_SUPABASE_ANON_KEY: "anon-key",
+      },
+      async () => {
+        const report = await backfillAllPortalsToSheets(["glints", "jooble"]);
+        expect(report.portals.map((p) => p.portal)).toEqual(["glints", "jooble"]);
+        const glints = report.portals.find((p) => p.portal === "glints")!;
+        expect(glints.vacanciesWritten).toBe(1);
+        expect(glints.vacanciesInSupabase).toBe(2);
+        expect(glints.rowCountsMatch).toBe(false);
+        expect(report.allRowCountsMatch).toBe(false);
+      },
+    );
+  });
+
+  it("defaults to every ALL_PORTALS entry when no portal list is given", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([]);
+    (countPortalRows as jest.Mock).mockResolvedValue(0);
+    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies" } }, { properties: { title: "Candidates" } }], values: [["portal"]] } });
+    mockedAxios.post.mockImplementation((url: string) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      return Promise.resolve({ data: {} });
+    });
+
+    await withEnv(
+      {
+        GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+        GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com", private_key: privateKeyPem }),
+        SCORING_SUPABASE_URL: "http://supabase.local",
+        SCORING_SUPABASE_ANON_KEY: "anon-key",
+      },
+      async () => {
+        const report = await backfillAllPortalsToSheets();
+        expect(report.portals.map((p) => p.portal)).toEqual([...ALL_PORTALS]);
+      },
+    );
   });
 });

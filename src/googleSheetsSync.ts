@@ -1,12 +1,16 @@
 import axios from "axios";
 import crypto from "crypto";
 import dotenv from "dotenv";
+import fs from "fs";
 import {
   loadDashboardConfig,
   getVacanciesForSync,
   getCandidatesForSync,
+  countPortalRows,
   maskEmail,
   maskPhone,
+  ALL_PORTALS,
+  DashboardConfig,
   VacancySyncRow,
   CandidateSyncRow,
 } from "./dashboardData";
@@ -17,20 +21,32 @@ dotenv.config();
  * Best-effort mirror of one portal's scrape.* rows into a Google Sheet, for
  * operators who want the scrape results in a spreadsheet instead of (or
  * alongside) the scrapview dashboard. Talks the Sheets API v4 directly over
- * axios + a service-account JWT signed with Node's own crypto — no
- * `googleapis` dependency, the same "REST over axios, no driver/SDK" posture
- * src/supabaseSink.ts takes with Supabase.
+ * axios — no `googleapis` dependency, the same "REST over axios, no
+ * driver/SDK" posture src/supabaseSink.ts takes with Supabase.
+ *
+ * Supports two credential shapes (loadGoogleSheetsConfig picks whichever is
+ * configured, service account taking priority when both are set):
+ *   - A service account: GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON, minting its own
+ *     access token via a JWT signed with Node's own crypto.
+ *   - An authorized_user OAuth token: GOOGLE_TOKEN_PATH (alias
+ *     GOOGLE_APPLICATION_CREDENTIALS) pointing at a token file with a
+ *     refresh_token, plus GOOGLE_CLIENT_SECRET_PATH pointing at the OAuth
+ *     client's client_secret file (Cloud Console's downloaded
+ *     client_secret_*.json shape) — refreshed via the standard
+ *     grant_type=refresh_token flow. Only file *paths* are read from env;
+ *     their contents (refresh token, client secret, access token) are never
+ *     logged or included in a thrown error.
  *
  * Inert by default: loadGoogleSheetsConfig() returns null without
- * GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON / GOOGLE_SHEETS_SPREADSHEET_ID in env,
- * same posture as every other optional integration in this repo
+ * GOOGLE_SHEETS_SPREADSHEET_ID plus one of the two credential shapes above in
+ * env, same posture as every other optional integration in this repo
  * (loadDashboardConfig, central ingestion). A sync failure here must never
  * fail or alter the scraping cycle that triggered it — syncPortalResultsToSheets
  * swallows its own errors, matching src/central/portalBridge.ts's rule for
  * the central mirror.
  */
 
-const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
+const DEFAULT_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets";
 
@@ -63,10 +79,13 @@ export const CANDIDATES_HEADER = [
   "last_seen_at",
 ];
 
+export type GoogleSheetsAuth =
+  | { kind: "service_account"; clientEmail: string; privateKey: string }
+  | { kind: "authorized_user"; clientId: string; clientSecret: string; refreshToken: string };
+
 export interface GoogleSheetsConfig {
   spreadsheetId: string;
-  clientEmail: string;
-  privateKey: string;
+  auth: GoogleSheetsAuth;
 }
 
 interface ServiceAccountJson {
@@ -74,28 +93,99 @@ interface ServiceAccountJson {
   private_key?: string;
 }
 
+interface AuthorizedUserTokenJson {
+  refresh_token?: string;
+  client_id?: string;
+  client_secret?: string;
+}
+
+interface ClientSecretJson {
+  installed?: { client_id?: string; client_secret?: string };
+  web?: { client_id?: string; client_secret?: string };
+  client_id?: string;
+  client_secret?: string;
+}
+
+/** Reads and parses a local credential file. Only `filePath`/`label` ever reach a thrown message — never the file's contents. */
+function readJsonFile<T>(filePath: string, label: string): T {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(filePath, "utf-8");
+  } catch {
+    throw new Error(`google sheets: could not read ${label} at ${filePath}`);
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(`google sheets: ${filePath} (${label}) is not valid JSON`);
+  }
+}
+
 /**
- * Loads the service-account credential and target spreadsheet id from env.
- * Returns null when either is absent (fresh checkout / not configured yet) —
- * the sync is then skipped entirely rather than guessing. Throws only when
- * GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is present but malformed, since that is
- * a misconfiguration worth surfacing loudly rather than silently no-op-ing.
+ * Resolves the authorized_user (OAuth refresh token) credential from the two
+ * local files. The token file alone is accepted if it already embeds
+ * client_id/client_secret (ADC's authorized_user shape); otherwise both come
+ * from the separate client_secret file (Cloud Console's downloaded
+ * client_secret_*.json, under "installed" or "web").
+ */
+function loadAuthorizedUserAuth(tokenPath: string, clientSecretPath: string): GoogleSheetsAuth {
+  const token = readJsonFile<AuthorizedUserTokenJson>(tokenPath, "GOOGLE_TOKEN_PATH/GOOGLE_APPLICATION_CREDENTIALS");
+  const clientSecretFile = readJsonFile<ClientSecretJson>(clientSecretPath, "GOOGLE_CLIENT_SECRET_PATH");
+  const fromFile = clientSecretFile.installed ?? clientSecretFile.web ?? clientSecretFile;
+
+  const refreshToken = token.refresh_token;
+  const clientId = token.client_id ?? fromFile.client_id;
+  const clientSecret = token.client_secret ?? fromFile.client_secret;
+
+  if (!refreshToken) {
+    throw new Error(`google sheets: ${tokenPath} has no refresh_token`);
+  }
+  if (!clientId || !clientSecret) {
+    throw new Error(`google sheets: could not resolve client_id/client_secret from ${clientSecretPath}`);
+  }
+  return { kind: "authorized_user", clientId, clientSecret, refreshToken };
+}
+
+/**
+ * Loads the Google Sheets credential and target spreadsheet id from env.
+ * Returns null when unconfigured (fresh checkout) — the sync is then skipped
+ * entirely rather than guessing. Throws only when a credential is partially
+ * configured but malformed/incomplete, since that is a misconfiguration worth
+ * surfacing loudly rather than silently no-op-ing. A service account takes
+ * priority when both credential shapes are present.
  */
 export function loadGoogleSheetsConfig(): GoogleSheetsConfig | null {
   const spreadsheetId = (process.env.GOOGLE_SHEETS_SPREADSHEET_ID ?? "").trim();
-  const raw = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON ?? "";
-  if (!spreadsheetId || !raw.trim()) return null;
+  if (!spreadsheetId) return null;
 
-  let parsed: ServiceAccountJson;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is not valid JSON");
+  const serviceAccountRaw = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON ?? "";
+  if (serviceAccountRaw.trim()) {
+    let parsed: ServiceAccountJson;
+    try {
+      parsed = JSON.parse(serviceAccountRaw);
+    } catch {
+      throw new Error("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is not valid JSON");
+    }
+    if (!parsed.client_email || !parsed.private_key) {
+      throw new Error("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is missing client_email/private_key");
+    }
+    return {
+      spreadsheetId,
+      auth: { kind: "service_account", clientEmail: parsed.client_email, privateKey: parsed.private_key },
+    };
   }
-  if (!parsed.client_email || !parsed.private_key) {
-    throw new Error("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is missing client_email/private_key");
-  }
-  return { spreadsheetId, clientEmail: parsed.client_email, privateKey: parsed.private_key };
+
+  const tokenPath = (process.env.GOOGLE_TOKEN_PATH ?? process.env.GOOGLE_APPLICATION_CREDENTIALS ?? "").trim();
+  const clientSecretPath = (process.env.GOOGLE_CLIENT_SECRET_PATH ?? "").trim();
+  if (!tokenPath || !clientSecretPath) return null;
+
+  return { spreadsheetId, auth: loadAuthorizedUserAuth(tokenPath, clientSecretPath) };
+}
+
+/** Comma-separated GOOGLE_SHEETS_SCOPES, or the spreadsheets-only default. Only consulted by the service-account JWT's `scope` claim — a refresh_token grant keeps whatever scopes the original consent granted and does not take a scope parameter. */
+function loadScope(): string {
+  const raw = (process.env.GOOGLE_SHEETS_SCOPES ?? "").trim();
+  return raw ? raw.split(",").map((s) => s.trim()).filter(Boolean).join(" ") : DEFAULT_SCOPE;
 }
 
 function base64url(input: Buffer | string): string {
@@ -110,42 +200,75 @@ export function resetGoogleSheetsTokenCache(): void {
   cachedToken = null;
 }
 
-async function getAccessToken(config: GoogleSheetsConfig): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  if (cachedToken && cachedToken.expiresAt - 60 > now) return cachedToken.token;
-
+async function mintServiceAccountToken(
+  auth: { clientEmail: string; privateKey: string },
+  now: number,
+): Promise<{ access_token: string; expires_in: number }> {
   const header = base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claims = base64url(
-    JSON.stringify({
-      iss: config.clientEmail,
-      scope: SHEETS_SCOPE,
-      aud: TOKEN_URL,
-      iat: now,
-      exp: now + 3600,
-    }),
+    JSON.stringify({ iss: auth.clientEmail, scope: loadScope(), aud: TOKEN_URL, iat: now, exp: now + 3600 }),
   );
   const signingInput = `${header}.${claims}`;
-  const signature = base64url(crypto.createSign("RSA-SHA256").update(signingInput).sign(config.privateKey));
+  const signature = base64url(crypto.createSign("RSA-SHA256").update(signingInput).sign(auth.privateKey));
   const assertion = `${signingInput}.${signature}`;
 
   try {
     const response = await axios.post(
       TOKEN_URL,
+      new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }).toString(),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } },
+    );
+    return response.data as { access_token: string; expires_in: number };
+  } catch (error) {
+    // Never let a raw axios error escape: its request config carries the signed assertion.
+    throw new Error(
+      `google sheets: failed to mint service-account access token (${axios.isAxiosError(error) ? error.response?.status ?? "network" : "network"})`,
+    );
+  }
+}
+
+async function refreshUserAccessToken(auth: {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}): Promise<{ access_token: string; expires_in: number }> {
+  try {
+    const response = await axios.post(
+      TOKEN_URL,
       new URLSearchParams({
-        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        assertion,
+        grant_type: "refresh_token",
+        refresh_token: auth.refreshToken,
+        client_id: auth.clientId,
+        client_secret: auth.clientSecret,
       }).toString(),
       { headers: { "Content-Type": "application/x-www-form-urlencoded" } },
     );
-    const data = response.data as { access_token: string; expires_in: number };
-    cachedToken = { token: data.access_token, expiresAt: now + data.expires_in };
-    return data.access_token;
+    return response.data as { access_token: string; expires_in: number };
   } catch (error) {
-    // Never let a raw axios error escape: its config carries the signed assertion.
+    // Never let the raw axios error escape: its request body carries the
+    // refresh token and client secret. Google's OAuth error code (e.g.
+    // "invalid_grant") is not itself a secret and is worth keeping — it is
+    // the difference between "expired/revoked token" and any other failure.
+    const isAxios = axios.isAxiosError(error);
+    const status = isAxios ? error.response?.status : undefined;
+    const oauthError = isAxios ? (error.response?.data as { error?: string } | undefined)?.error : undefined;
     throw new Error(
-      `google sheets: failed to mint access token (${axios.isAxiosError(error) ? error.response?.status ?? "network" : "network"})`,
+      `google sheets: failed to refresh user access token (${status ?? "network"}${oauthError ? `: ${oauthError}` : ""})`,
     );
   }
+}
+
+async function getAccessToken(config: GoogleSheetsConfig): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedToken && cachedToken.expiresAt - 60 > now) return cachedToken.token;
+
+  const minted =
+    config.auth.kind === "service_account"
+      ? await mintServiceAccountToken(config.auth, now)
+      : await refreshUserAccessToken(config.auth);
+
+  cachedToken = { token: minted.access_token, expiresAt: now + minted.expires_in };
+  return minted.access_token;
 }
 
 async function sheetsRequest<T>(
@@ -326,6 +449,21 @@ export interface SheetsSyncResult {
   candidates: number;
 }
 
+/** Fetches one portal's current rows and upserts both tabs. Shared by the per-cycle sync and the one-shot backfill below. */
+async function syncOnePortal(
+  sheetsConfig: GoogleSheetsConfig,
+  dashboardConfig: DashboardConfig,
+  portal: string,
+): Promise<{ vacancies: VacancySyncRow[]; candidates: CandidateSyncRow[] }> {
+  const [vacancies, candidates] = await Promise.all([
+    getVacanciesForSync(dashboardConfig, portal),
+    getCandidatesForSync(dashboardConfig, portal),
+  ]);
+  await upsertRows(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER, vacancies.map(vacancyRow));
+  await upsertRows(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER, candidates.map(candidateRow));
+  return { vacancies, candidates };
+}
+
 /**
  * Mirrors one portal's current scrape.portal_vacancies/portal_candidates
  * rows into the Vacancies/Candidates tabs, upserting by (portal,
@@ -339,7 +477,7 @@ export async function syncPortalResultsToSheets(portal: string): Promise<SheetsS
   try {
     sheetsConfig = loadGoogleSheetsConfig();
   } catch (error) {
-    console.error("[sheets-sync] bad GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON, skipping:", error instanceof Error ? error.message : error);
+    console.error("[sheets-sync] bad Google Sheets credential config, skipping:", error instanceof Error ? error.message : error);
     return null;
   }
   const dashboardConfig = loadDashboardConfig();
@@ -348,18 +486,79 @@ export async function syncPortalResultsToSheets(portal: string): Promise<SheetsS
   try {
     await ensureTab(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER);
     await ensureTab(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER);
-
-    const [vacancies, candidates] = await Promise.all([
-      getVacanciesForSync(dashboardConfig, portal),
-      getCandidatesForSync(dashboardConfig, portal),
-    ]);
-
-    await upsertRows(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER, vacancies.map(vacancyRow));
-    await upsertRows(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER, candidates.map(candidateRow));
-
+    const { vacancies, candidates } = await syncOnePortal(sheetsConfig, dashboardConfig, portal);
     return { vacancies: vacancies.length, candidates: candidates.length };
   } catch (error) {
     console.error(`[sheets-sync] ${portal}: failed, scrape cycle unaffected:`, error instanceof Error ? error.message : error);
     return null;
   }
+}
+
+/** One portal's row counts in the one-shot backfill: what was written to the sheet vs. an independent re-count straight from Supabase. */
+export interface PortalBackfillResult {
+  portal: string;
+  vacanciesWritten: number;
+  candidatesWritten: number;
+  vacanciesInSupabase: number;
+  candidatesInSupabase: number;
+  rowCountsMatch: boolean;
+}
+
+export interface BackfillReport {
+  portals: PortalBackfillResult[];
+  allRowCountsMatch: boolean;
+}
+
+/**
+ * One-shot backfill: mirrors every portal's current scrape.* rows into the
+ * sheet via the same upsert-by-key path syncPortalResultsToSheets uses per
+ * cycle, then independently re-counts scrape.portal_vacancies/
+ * portal_candidates in Supabase per portal (a fresh PostgREST
+ * `count=exact` request, not a reuse of the rows just fetched) and compares
+ * against what was written, so a silently-truncated page or dropped row is
+ * caught rather than assumed. Read-only against Supabase beyond that; all
+ * the actual writes land only in the Sheet.
+ *
+ * Does not run on its own and is never called from the scraping pipeline —
+ * this is the explicit, manually-invoked one-shot catch-up for populating a
+ * sheet that predates the sync, run directly from a worktree once the Google
+ * credential and sheet access are verified. Unlike syncPortalResultsToSheets,
+ * it throws on failure (unconfigured, bad credential, or any Sheets/Supabase
+ * error) rather than swallowing it — there is no scrape cycle here to
+ * protect, and a one-shot run should fail loudly instead of reporting a
+ * false "done".
+ */
+export async function backfillAllPortalsToSheets(
+  portals: readonly string[] = ALL_PORTALS,
+): Promise<BackfillReport> {
+  const sheetsConfig = loadGoogleSheetsConfig();
+  if (!sheetsConfig) {
+    throw new Error("google sheets backfill: not configured (GOOGLE_SHEETS_SPREADSHEET_ID plus a credential are required)");
+  }
+  const dashboardConfig = loadDashboardConfig();
+  if (!dashboardConfig) {
+    throw new Error("google sheets backfill: Supabase dashboard config is not set (SCORING_SUPABASE_URL/SCORING_SUPABASE_ANON_KEY)");
+  }
+
+  await ensureTab(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER);
+  await ensureTab(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER);
+
+  const results: PortalBackfillResult[] = [];
+  for (const portal of portals) {
+    const { vacancies, candidates } = await syncOnePortal(sheetsConfig, dashboardConfig, portal);
+    const [vacanciesInSupabase, candidatesInSupabase] = await Promise.all([
+      countPortalRows(dashboardConfig, "portal_vacancies", portal),
+      countPortalRows(dashboardConfig, "portal_candidates", portal),
+    ]);
+    results.push({
+      portal,
+      vacanciesWritten: vacancies.length,
+      candidatesWritten: candidates.length,
+      vacanciesInSupabase,
+      candidatesInSupabase,
+      rowCountsMatch: vacancies.length === vacanciesInSupabase && candidates.length === candidatesInSupabase,
+    });
+  }
+
+  return { portals: results, allRowCountsMatch: results.every((r) => r.rowCountsMatch) };
 }
