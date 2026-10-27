@@ -1,7 +1,4 @@
-import axios from "axios";
 import playwright from "playwright";
-import type sqlite3 from 'sqlite3';
-import { ingestPortalApplicant, ingestPortalVacancy } from "./central/portalBridge";
 import { SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { sendApplicantToSink, SinkArtifactBytes } from "./portalSink";
 import fs from "fs";
@@ -30,20 +27,6 @@ const INDONESIAN_MONTHS = [
 type JobVacancy = {
   position: string;
   location: string;
-}
-
-/**
- * Represents a jobVacancy in the database.
- * @interface JobVacancyDB
- * @extends JobVacancy
- * @property {number} id - The id.
- * @property {string} pintarnya_job_id - The Pintarnya job id.
- * @property {number} applicants - The number of applicants.
- */
-type JobVacancyDB = JobVacancy & {
-  id: number;
-  pintarnya_job_id: string;
-  applicants: number;
 }
 
 /**
@@ -339,17 +322,6 @@ type Applicant = {
   cv: File | null;
 };
 
-/**
- * Represents an applicant for a jobVacancy position in the database.
- */
-type ApplicantDB = Pick<Applicant, "applied_for_id"| "email"> & {
-  id: number;
-}
-
-type CountApplicantByPintarnyaJobIdRes = {
-  count: number;
-}
-
 type FAILED_COLLECTED_APPLICANT = {
   data: Applicant;
   error: any;
@@ -360,15 +332,12 @@ export class Pintarnya {
   private EMAIL: string = "";
   private PASSWORD: string = "";
   private LIMIT: number = 0;
-  private API_DESTINATION: string = "";
   private JOB_VACANCIES: JobVacancy[] = [];
-  private DB_PATH: string = "";
   private DELAY: number = 0;
   private DELAY_AFTER: number = 0;
   private TIMEOUT: number = 30000;
   private MAX_RETRY: number = 3;
 
-  private DB?: sqlite3.Database;
   private sink: SupabaseSink | null = null;
 
   private COLLECTED_APPLICANT: number = 0;
@@ -410,9 +379,6 @@ export class Pintarnya {
     this.LIMIT = config.limit;
     console.info("Loaded limit %O", this.LIMIT);
 
-    console.info("Loaded API destination %s", config.api_destination);
-    this.API_DESTINATION = config.api_destination;
-
     console.info("Loaded vacancies %O", config.job_vacancies);
     this.JOB_VACANCIES = config.job_vacancies;
 
@@ -421,9 +387,6 @@ export class Pintarnya {
 
     console.info("Loaded delay after %s", config.delay_after);
     this.DELAY_AFTER = config.delay_after;
-
-    console.info("Loaded db path %s", config.db_path);
-    this.DB_PATH = path.join(__dirname, config.db_path);
 
     this.TIMEOUT = config.timeout;
 
@@ -448,12 +411,6 @@ export class Pintarnya {
   /** Number of applicants successfully persisted by this run. */
   getCollectedCount(): number {
     return this.COLLECTED_APPLICANT;
-  }
-
-  private async ensureLegacyDatabase(): Promise<void> {
-    if (this.DB) return;
-    await this.createDatabaseConnection();
-    await this.createRequiredTables();
   }
 
   /** Converts an in-memory File download into the sink's bytes shape. */
@@ -1117,88 +1074,6 @@ export class Pintarnya {
   }
 
   /**
-   * Sends a request with the provided applicant data.
-   * @param param - The applicant data.
-   * @returns A Promise that resolves when the request is sent successfully.
-   */
-  /**
-   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
-   * insert and central mirror. Kept untouched but bypassed: pintarnya now
-   * lands applicants directly in the scoring Supabase via sendToSink().
-   */
-  async sendRequest(param: Applicant): Promise<void> {
-    if (param.contact.contact_number === "") {
-      console.info(`[SKIP] "${param.fullname}" has no phone number. Not sending to API.`);
-      return;
-    }
-
-    console.info(`[API] Sending "${param.fullname}" (${param.contact.contact_number}) to ${this.API_DESTINATION}...`);
-    try {
-      const bodyFormData = new FormData();
-      bodyFormData.append("channel", param.channel);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("applied_for", param.applied_for);
-      bodyFormData.append("applied_for_id", param.applied_for_id);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("fullname", param.fullname);
-      // bodyFormData.append("nickname", param.nickname);
-      bodyFormData.append("photo", param.photo ?? "");
-      bodyFormData.append("date_of_birth", param.date_of_birth);
-      bodyFormData.append("age", param.age.toString());
-      bodyFormData.append("contact", JSON.stringify(param.contact));
-      // bodyFormData.append("summary", param.summary);
-      bodyFormData.append("latest_salary", param.latest_salary.toString());
-      bodyFormData.append("salary_expectation", param.salary_expectation.toString());
-      bodyFormData.append("work_experiences", JSON.stringify(param.work_experiences));
-      bodyFormData.append("educations", JSON.stringify(param.educations));
-      bodyFormData.append("skills", JSON.stringify(param.skills));
-      bodyFormData.append("location", param.location);
-      bodyFormData.append("cv", param.cv ?? "");
-      // bodyFormData.append("reference_links", JSON.stringify(param.reference_links));
-      bodyFormData.append("gender", param.gender);
-
-      await axios({
-        method: "post",
-        url: this.API_DESTINATION,
-        data: bodyFormData,
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-
-      console.info(`[API] Success: "${param.fullname}" sent.`);
-    } catch (error) {
-      const curl = `curl --location --globoff ${this.API_DESTINATION} --form 'channel=${param.channel}' --form 'type=${param.type}' --form 'applied_for=${param.applied_for}' --form 'applied_for_id=${param.applied_for_id}' --form 'applied_date=${param.applied_date}' --form 'email=${param.email}' --form 'fullname=${param.fullname}' --form 'nickname=${param.nickname}' --form 'photo=${param.photo}' --form 'date_of_birth=${param.date_of_birth}' --form 'age=${param.age}' --form 'contact=${JSON.stringify(param.contact)}' --form 'summary=${param.summary}' --form 'latest_salary=${param.latest_salary}' --form 'salary_expectation=${param.salary_expectation}' --form 'work_experiences=${JSON.stringify(param.work_experiences)}' --form 'educations=${JSON.stringify(param.educations)}' --form 'skills=${JSON.stringify(param.skills)}' --form 'location=${param.location}' --form 'cv=${param.cv}' --form 'reference_links=${JSON.stringify(param.reference_links)}'`;
-      console.error(`[ERROR] API failed for "${param.fullname}". curl:`, curl);
-
-      let errorResponse = null
-
-      if(typeof  (error as any).response === "undefined") {
-        errorResponse = (error as any).response
-        console.error("Error sending request with response:", (error as any).response);
-      } else {
-        errorResponse = (error as any).response.data
-        console.error("Error sending request with response:", (error as any).response.data);
-      }
-
-      this.FAILED_COLLECTED_APPLICANT = [
-        ...this.FAILED_COLLECTED_APPLICANT,
-        {
-          data: param,
-          error: errorResponse
-        }
-      ]
-    }
-
-    console.info("[DB] Inserting applicant into local DB...");
-    const databaseKey = param.email || param.contact.contact_number;
-    await this.ensureLegacyDatabase();
-    await this.insertApplicant(databaseKey, param.applied_for_id, param);
-    this.COLLECTED_APPLICANT++;
-    console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED_APPLICANT}`);
-  }
-
-  /**
    * Clean the job description.
    * All characters except letters, numbers, spaces, commas, and periods, (, and ) will be removed.
    */
@@ -1851,322 +1726,6 @@ export class Pintarnya {
     if (newOnPage === 0) {
       console.info("[PAGINATION] Full page already seen. Stopping pagination for this vacancy.");
     }
-  }
-
-  /**
-   * Establishes a connection to the SQLite database.
-   * @returns {sqlite3.Database} The database connection.
-   */
-  async createDatabaseConnection(): Promise<sqlite3.Database> {
-    /**
-     * Create the database file if it does not exist.
-     */
-    if (!fs.existsSync(this.DB_PATH)) {
-      fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
-      fs.writeFileSync(this.DB_PATH, "");
-    }
-
-    /**
-     * Open the database connection. sqlite3 is required lazily so the sink
-     * path never loads the native binding (see AGENTS.md sharp edges).
-     */
-    const sqlite = require("sqlite3") as typeof import("sqlite3");
-    return new Promise((resolve, reject) => {
-      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
-        if (err) {
-          console.error("Error opening database", err.message);
-          reject(err.message);
-        } else {
-          console.log("Connected to the database.");
-          resolve(this.DB!);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the job_vacancies table in the database.
-   */
-  async createJobVacanciesTable() {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS job_vacancies (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        position TEXT NOT NULL,
-        location TEXT NOT NULL,
-        applicants INTEGER NOT NULL DEFAULT 0,
-        pintarnya_job_id TEXT NOT NULL
-      )
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.run(createTableQuery, (err) => {
-        if (err) {
-          console.error("Error creating job_vacancies table", err.message);
-          reject(err.message);
-        } else {
-          resolve(console.log("Created job_vacancies table."));
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the applicants table in the database.
-   */
-  async createApplicantsTable() {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS applicants (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL,
-        applied_for_id TEXT NOT NULL,
-        data TEXT
-      )
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.run(createTableQuery, (err) => {
-        if (err) {
-          console.error("Error creating applicants table", err.message);
-          reject(err.message);
-        } else {
-          resolve(console.log("Created applicants table."));
-        }
-      });
-    });
-  }
-
-  /**
-   * Checks if a table exists in the database.
-   */
-  async isTableExist(tableName: string): Promise<boolean> {
-    console.info(`Checking if table ${tableName} exists...`);
-    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => {
-        if (err) {
-          console.error("Error checking table", err.message);
-          reject(err.message);
-        } else {
-          if (row !== undefined) {
-            console.log(`Table ${tableName} exists.`);
-          }
-          resolve(row !== undefined);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the required tables in the database.
-   * The required tables are the job_vacancies and applicants tables.
-   */
-  async createRequiredTables() {
-    const isTableJobVacanciesExist = await this.isTableExist("job_vacancies");
-    if (!isTableJobVacanciesExist) {
-      console.info("Creating job_vacancies table...");
-      await this.createJobVacanciesTable();
-    }
-
-    const isTableApplicantsExist = await this.isTableExist("applicants");
-    if (!isTableApplicantsExist) {
-      console.info("Creating applicants table...");
-      await this.createApplicantsTable();
-    } else {
-      // Migrate existing table to add data column if missing
-      await new Promise<void>((resolve) => {
-        this.DB!.run('ALTER TABLE applicants ADD COLUMN data TEXT', () => resolve());
-      });
-    }
-  }
-
-  /**
-   * Inserts a vacancy into the database.
-   * @param {string} position The position of the vacancy.
-   * @param {string} location The location of the vacancy.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<void>} A promise that resolves when the vacancy is inserted.
-   * @example insertVacancy("Software Engineer", "Jakarta", "283020")
-   */
-  async insertJobVacancy(position: string, location: string, pintarnyaJobId: string, applicants: number): Promise<void> {
-    console.info(`Inserting vacancy ${position} into the database...`);
-
-    const insertQuery = `
-      INSERT INTO job_vacancies (position, location, pintarnya_job_id, applicants)
-      VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting vacancy", err.message);
-          reject(err.message);
-        } else {
-          resolve(console.log("Inserted vacancy."));
-        }
-      });
-    });
-
-    // Dual-write: mirror the vacancy into the central Supabase database.
-    await ingestPortalVacancy({
-      source_portal: "pintarnya",
-      source_vacancy_id: pintarnyaJobId,
-      position,
-      location,
-      applicants_count: applicants,
-    });
-  }
-
-  /**
-   * Gets a vacancy by the Pintarnya job ID.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<JobVacancyDB>} A promise that resolves with the vacancy.
-   * @example getVacancyByPintarnyaJobId("283020")
-   */
-  async getVacancyByPintarnyaJobId(pintarnyaJobId: string): Promise<JobVacancyDB> {
-    console.info(`Getting vacancy by Pintarnya job ID ${pintarnyaJobId}...`);
-
-    const selectQuery = `
-      SELECT * FROM job_vacancies WHERE pintarnya_job_id = '${pintarnyaJobId}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<JobVacancyDB>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error getting vacancy", err.message);
-          reject(err.message);
-        } else {
-          console.log("Got vacancy", row);
-          resolve(row);
-        }
-      });
-    });
-  }
-
-  /**
-   * Counts the applicant by the Pintarnya job ID.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<number>} A promise that resolves with the applicant count.
-   * @example countApplicantByPintarnyaJobId("283020")
-   * @returns 31
-   */
-  countApplicantByPintarnyaJobId(pintarnyaJobId: string): Promise<number> {
-    console.info(`Counting applicant by Pintarnya job ID ${pintarnyaJobId}...`);
-
-    const selectQuery = `
-      SELECT COUNT(*) as count FROM applicants WHERE applied_for_id = '${pintarnyaJobId}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<CountApplicantByPintarnyaJobIdRes>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error counting applicant", err.message);
-          reject(err.message);
-        } else {
-          console.log("Counted applicant", row);
-          resolve(row.count);
-        }
-      });
-    });
-  }
-
-  /**
-   * Inserts an applicant into the database.
-   * @param {string} email The email of the applicant.
-   * @param {string} appliedForId The applied for ID.
-   * @returns {Promise<void>} A promise that resolves when the applicant is inserted.
-   * @example insertApplicant("johndoe@mail.app", "283020")
-   * @returns Promise<void>
-   */
-  async insertApplicant(email: string, appliedForId: string, param: Applicant): Promise<void> {
-    console.info(`Inserting applicant ${email} into the database...`);
-
-    const normalized = {
-      name: param.fullname,
-      email: param.email,
-      applied_for: param.applied_for,
-      applied_date: param.applied_date,
-        portal: 'pintarnya',
-        gender: param.gender,
-        age: param.age,
-        location: param.location,
-        summary: param.summary,
-        latest_salary: param.latest_salary,
-        salary_expectation: param.salary_expectation,
-        work_experience: param.work_experiences,
-        education: param.educations,
-        skill: param.skills,
-        contact: param.contact,
-        date_of_birth: param.date_of_birth,
-        reference_links: param.reference_links,
-      };
-    const data = JSON.stringify(normalized).replace(/'/g, "''");
-
-    const insertQuery = `
-      INSERT INTO applicants (email, applied_for_id, data)
-      VALUES ('${email}', '${appliedForId}', '${data}')
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting applicant", err.message);
-          reject(err.message);
-        } else {
-          resolve(console.log("Inserted applicant."));
-        }
-      });
-    });
-
-    // Dual-write: the local SQLite row above stays the fallback, this mirrors
-    // the applicant into the central Supabase database.
-    await ingestPortalApplicant(
-      { email, applied_for_id: appliedForId, portal: "pintarnya" },
-      "pintarnya"
-    );
-  }
-
-  /**
-   * Gets an applicant by the email.
-   * @param {string} email The email of the applicant.
-   * @returns {Promise<ApplicantDB>} A promise that resolves with the applicant.
-   * @example getApplicantByEmail("johndoe@mail.app")
-   */
-  async getApplicantByEmail(email: string): Promise<ApplicantDB> {
-    console.info(`Getting applicant by email ${email}...`);
-
-    const safeEmail = email.replace(/'/g, "''");
-    const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${safeEmail}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error getting applicant", err.message);
-          reject(err.message);
-        } else {
-          console.log("Got applicant", row);
-          resolve(row);
-        }
-      });
-    });
-  }
-
-  /**
-   * Closes the database connection.
-   */
-  async closeDatabaseConnection() {
-    new Promise((resolve, reject) => {
-      this.DB!.close((err) => {
-        if (err) {
-          console.error("Error closing database", err.message);
-          reject(err.message);
-        } else {
-          resolve(console.log("Scraping completed."));
-        }
-      });
-    });
   }
 
   /**

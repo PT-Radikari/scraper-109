@@ -1,10 +1,6 @@
 import playwright from "playwright";
 import fs from "fs";
-import path from "path";
-import axios from "axios";
-import FormData from "form-data";
 import { trackBrowser } from "./browserRegistry";
-import type sqlite3 from "sqlite3";
 import { SupabaseSink } from "./supabaseSink";
 import { sendApplicantToSink } from "./portalSink";
 
@@ -128,9 +124,6 @@ export class Seek {
   private LOCALSTORAGE: LocalStorageItem[] = [];
   private EMAIL: string = "";
   private PASSWORD: string = "";
-  private APIDESTINATION: string = "";
-  private DB_PATH: string = "";
-  private DB?: sqlite3.Database;
   private TIMEOUT: number = 60000;
   private SLOWMO: number = 1000;
   private COLLECTED: number = 0;
@@ -154,8 +147,6 @@ export class Seek {
     this.LOCALSTORAGE = config.local_storage;
     this.EMAIL = config.email ?? "";
     this.PASSWORD = config.password ?? "";
-    this.APIDESTINATION = config.api_destination;
-    this.DB_PATH = path.join(__dirname, config.db_path);
     this.TIMEOUT = config.timeout ?? this.TIMEOUT;
     this.SLOWMO = config.slowmo ?? this.SLOWMO;
     this.JOB_ADS_URLS = config.job_ads_urls?.length ? config.job_ads_urls : this.JOB_ADS_URLS;
@@ -200,27 +191,6 @@ export class Seek {
         executablePath: fallbackExecutablePath,
       });
     }
-  }
-
-  async createDatabaseConnection(): Promise<sqlite3.Database> {
-    if (!fs.existsSync(this.DB_PATH)) {
-      fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
-      fs.writeFileSync(this.DB_PATH, "");
-    }
-    // sqlite3 is required lazily so the sink path never loads the native
-    // binding (see AGENTS.md sharp edges).
-    const sqlite = require("sqlite3") as typeof import("sqlite3");
-    return new Promise((resolve, reject) => {
-      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
-        if (err) { reject(err); } else { resolve(this.DB!); }
-      });
-    });
-  }
-
-  private async ensureLegacyDatabase(): Promise<void> {
-    if (this.DB) return;
-    await this.createDatabaseConnection();
-    await this.createRequiredTables();
   }
 
   /**
@@ -300,86 +270,6 @@ export class Seek {
       status: "new",
       raw: { type: "vacancy", location: vacancy.location, description: vacancy.description },
     });
-  }
-
-  async createApplicantsTable(): Promise<void> {
-    const query = `CREATE TABLE IF NOT EXISTS applicants (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, data TEXT NOT NULL)`;
-    return new Promise((resolve, reject) => {
-      this.DB!.run(query, (err) => { err ? reject(err) : resolve(); });
-    });
-  }
-
-  async isTableExist(tableName: string): Promise<boolean> {
-    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => { err ? reject(err) : resolve(row !== undefined); });
-    });
-  }
-
-  async createRequiredTables(): Promise<void> {
-    const exists = await this.isTableExist("applicants");
-    if (!exists) await this.createApplicantsTable();
-  }
-
-  async getApplicantByEmail(email: string): Promise<any> {
-    const safeEmail = email.replace(/'/g, "''");
-    const query = `SELECT * FROM applicants WHERE email = '${safeEmail}'`;
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => { err ? reject(err) : resolve(row); });
-    });
-  }
-
-  async insertApplicant(data: Applicant): Promise<void> {
-    const safeEmail = data.email.replace(/'/g, "''");
-    const json = JSON.stringify(data).replace(/'/g, "''");
-    const query = `INSERT INTO applicants (email, data) VALUES ('${safeEmail}', '${json}')`;
-    return new Promise((resolve, reject) => {
-      this.DB!.run(query, (err) => { err ? reject(err) : resolve(); });
-    });
-  }
-
-  /**
-   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
-   * insert. Kept untouched but bypassed: seek now lands applicants directly
-   * in the scoring Supabase via sendToSink().
-   * @param param - The applicant data.
-   * @returns A Promise that resolves when the request is sent successfully.
-   */
-  async sendRequest(param: Applicant, databaseKey: string = param.email || param.phone): Promise<void> {
-    try {
-      const bodyFormData = new FormData();
-      bodyFormData.append("channel", param.portal);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("applied_for", param.applied_for);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("fullname", param.name);
-      bodyFormData.append("contact", JSON.stringify({ type: "phone", contact_number: param.phone }));
-      bodyFormData.append("summary", "");
-      bodyFormData.append("salary_expectation", param.salary_expectation);
-      bodyFormData.append("work_experiences", JSON.stringify(param.work_experience));
-      bodyFormData.append("educations", JSON.stringify(param.education));
-      bodyFormData.append("skills", JSON.stringify(param.skill));
-      bodyFormData.append("location", param.location);
-      if (param.cv !== "" && fs.existsSync(param.cv)) {
-        bodyFormData.append("cv", fs.createReadStream(param.cv));
-      }
-
-      await axios({
-        method: "post",
-        url: this.APIDESTINATION,
-        data: bodyFormData,
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-      console.info("Success sending param", param);
-    } catch (error) {
-      console.info("Error sending param", param);
-      console.error("Error sending request with response:", (error as any).response?.data ?? (error as any).message);
-    }
-
-    await this.ensureLegacyDatabase();
-    await this.insertApplicant({ ...param, email: databaseKey });
   }
 
   async ExtractListVacancyPage(page: any): Promise<VacancyPage[]> {

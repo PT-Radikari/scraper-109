@@ -2,10 +2,7 @@ import playwright from "playwright";
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
-import FormData from "form-data";
 import axios from "axios";
-import type sqlite3 from 'sqlite3';
-import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { sendApplicantToSink } from "./portalSink";
 import { trackBrowser } from "./browserRegistry";
@@ -143,13 +140,6 @@ type OpenVacancy = {
 /** tab heading -> field label -> field value, as read off the detail page. */
 type VacancyDetailSections = Record<string, Record<string, string>>;
 
-/**
- * Represents an applicant for a jobVacancy position in the database.
- */
-type ApplicantDB = Pick<Applicant, "email"> & {
-  id: number;
-}
-
 type ApplicantDetailHandle = {
   page: playwright.Page;
   cleanup: () => Promise<void>;
@@ -229,13 +219,10 @@ export class KitaLulus {
   private BASE_URL: string | undefined = "";
   private EMAIL: string | undefined = "";
   private PASSWORD: string | undefined = "";
-  private APIDESTINATION: string | undefined = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
   private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
-  private DB_PATH: string = "";
-  private DB?: sqlite3.Database;
   private COOKIES: KitaLulusCookie[] = [];
   private sink: SupabaseSink | null = null;
   private pendingTempFiles: string[] = [];
@@ -268,10 +255,8 @@ export class KitaLulus {
     this.EMAIL = config.email;
     this.PASSWORD = config.password;
     this.LIMIT = config.limit;
-    this.APIDESTINATION = config.api_destination;
     this.TIMEOUT = config.timeout;
     this.SLOWMO = config.slowmo;
-    this.DB_PATH = path.join(__dirname, config.db_path);
     this.COOKIES = config.cookies ?? [];
     console.info("CONFIG KITA LULUS LOADED");
   }
@@ -294,12 +279,6 @@ export class KitaLulus {
   /** Number of applicants successfully persisted by this run. */
   getCollectedCount(): number {
     return this.COLLECTED;
-  }
-
-  private async ensureLegacyDatabase(): Promise<void> {
-    if (this.DB) return;
-    await this.createDatabaseConnection();
-    await this.createRequiredTables();
   }
 
   /**
@@ -416,62 +395,6 @@ export class KitaLulus {
     }
 
     return text.replace(pattern, "");
-  }
-
-  /**
-   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
-   * insert and central mirror. Kept untouched but bypassed: kitalulus now
-   * lands applicants directly in the scoring Supabase via sendToSink().
-   * @param param - The applicant data.
-   * @returns A Promise that resolves to void.
-   */
-  async sendRequest(param: Applicant): Promise<void> {
-    console.info(`[API] Sending "${param.name}" to ${this.APIDESTINATION}...`);
-    try {
-      const bodyFormData = new FormData();
-      bodyFormData.append("channel", param.portal);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("applied_for", param.applied_for);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("fullname", param.name);
-      bodyFormData.append("nickname", param.nick_name);
-      bodyFormData.append("gender", param.gender);
-      bodyFormData.append("date_of_birth", param.date_of_birth);
-      bodyFormData.append("age", param.age);
-      bodyFormData.append("contact", JSON.stringify(param.whatapps));
-      bodyFormData.append("summary", param.summary);
-      bodyFormData.append("latest_salary", "");
-      bodyFormData.append("salary_expectation", param.salary_expectation);
-      bodyFormData.append("work_experiences", JSON.stringify(param.workExperience));
-      bodyFormData.append("educations", JSON.stringify(param.education));
-      bodyFormData.append("skills", JSON.stringify(param.skill));
-      bodyFormData.append("location", param.location);
-      bodyFormData.append("reference_links", JSON.stringify(param.reference_link));
-      if (param.photo !== "") {
-        bodyFormData.append("photo", fs.createReadStream(param.photo));
-      }
-      if (param.cv !== "") {
-        bodyFormData.append("cv", fs.createReadStream(param.cv));
-      }
-
-      await axios({
-        method: "post",
-        url: this.APIDESTINATION,
-        data: bodyFormData,
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-      console.info(`[API] Success for "${param.name}".`);
-    } catch (error) {
-      console.error(`[ERROR] API request failed for "${param.name}":`, error);
-    }
-
-    console.info("[DB] Inserting applicant into local DB...");
-    await this.ensureLegacyDatabase();
-    await this.insertApplicant(param);
-    this.COLLECTED++;
-    console.info(`[DB] Inserted. Total collected so far: ${this.COLLECTED}`);
   }
 
   /**
@@ -1215,9 +1138,6 @@ export class KitaLulus {
     } finally {
       if (browser) {
         await browser.close();
-      }
-      if (this.DB) {
-        await this.closeDatabaseConnection();
       }
     }
   }
@@ -2397,207 +2317,4 @@ export class KitaLulus {
     }
   }
 
-  /**
-   * Establishes a connection to the SQLite database.
-   * @returns {sqlite3.Database} The database connection.
-   */
-  async createDatabaseConnection(): Promise<sqlite3.Database> {
-    /**
-     * Create the database file if it does not exist.
-     */
-    if (!fs.existsSync(this.DB_PATH)) {
-      fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
-      fs.writeFileSync(this.DB_PATH, "");
-    }
-
-    /**
-     * Open the database connection. sqlite3 is required lazily so the sink
-     * path never loads the native binding (see AGENTS.md sharp edges).
-     */
-    const sqlite = require("sqlite3") as typeof import("sqlite3");
-    return new Promise((resolve, reject) => {
-      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
-        if (err) {
-          console.error("Error opening database", err.message);
-          reject(err);
-        } else {
-          console.log("Connected to the database.");
-          resolve(this.DB!);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the applicants table in the database.
-   */
-  async createApplicantsTable() {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS applicants (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL,
-        data TEXT NOT NULL
-      )
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.run(createTableQuery, (err) => {
-        if (err) {
-          console.error("Error creating applicants table", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Created applicants table."));
-        }
-      });
-    });
-  }
-
-  /**
-   * Checks if a table exists in the database.
-   */
-  async isTableExist(tableName: string): Promise<boolean> {
-    console.info(`Checking if table ${tableName} exists...`);
-    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => {
-        if (err) {
-          console.error("Error checking table", err.message);
-          reject(err);
-        } else {
-          if (row !== undefined) {
-            console.log(`Table ${tableName} exists.`);
-          }
-          resolve(row !== undefined);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the required tables in the database.
-   * The required tables are the job_vacancies and applicants tables.
-   */
-  async createRequiredTables() {
-    const isTableApplicantsExist = await this.isTableExist("applicants");
-    if (!isTableApplicantsExist) {
-      console.info("Creating applicants table...");
-      await this.createApplicantsTable();
-    }
-  }
-
-  /**
-   * Inserts a vacancy into the database.
-   * @param {string} position The position of the vacancy.
-   * @param {string} location The location of the vacancy.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<void>} A promise that resolves when the vacancy is inserted.
-   * @example insertVacancy("Software Engineer", "Jakarta", "283020")
-   */
-  async insertJobVacancy(position: string, location: string, pintarnyaJobId: string, applicants: number): Promise<void> {
-    console.info(`Inserting vacancy ${position} into the database...`);
-
-    const insertQuery = `
-      INSERT INTO job_vacancies (position, location, pintarnya_job_id, applicants)
-      VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting vacancy", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted vacancy."));
-        }
-      });
-    });
-
-    // Dual-write: mirror the vacancy into the central Supabase database.
-    await ingestPortalVacancy({
-      source_portal: "kitalulus",
-      source_vacancy_id: pintarnyaJobId,
-      position,
-      location,
-      applicants_count: applicants,
-    });
-  }
-
-  /**
-   * Inserts an applicant into the database.
-   * @param {string} email The email of the applicant.
-   * @param {string} appliedForId The applied for ID.
-   * @returns {Promise<void>} A promise that resolves when the applicant is inserted.
-   * @example insertApplicant("johndoe@mail.app", "283020")
-   * @returns Promise<void>
-   */
-  async insertApplicant(data: Applicant): Promise<void> {
-    console.info(`Inserting applicant ${data.email} into the database...`);
-
-    const safeEmail = data.email.replace(/'/g, "''");
-    const safeData = JSON.stringify(data).replace(/'/g, "''");
-    const insertQuery = `
-      INSERT INTO applicants (email, data)
-      VALUES ('${safeEmail}', '${safeData}')
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting applicant", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted applicant."));
-        }
-      });
-    });
-
-    // Dual-write: the local SQLite row above stays the fallback, this mirrors
-    // the applicant into the central Supabase database.
-    await ingestPortalApplicant(data as unknown as PortalApplicant, "kitalulus");
-  }
-
-  /**
-   * Gets an applicant by the email.
-   * @param {string} email The email of the applicant.
-   * @returns {Promise<ApplicantDB>} A promise that resolves with the applicant.
-   * @example getApplicantByEmail("johndoe@mail.app")
-   */
-  async getApplicantByEmail(email: string): Promise<ApplicantDB> {
-    console.info(`Getting applicant by email ${email}...`);
-
-    const safeEmail = email.replace(/'/g, "''");
-    const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${safeEmail}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error getting applicant", err.message);
-          reject(err);
-        } else {
-          console.log("Got applicant", row);
-          resolve(row);
-        }
-      });
-    });
-  }
-
-  /**
-   * Closes the database connection.
-   */
-  async closeDatabaseConnection() {
-    return new Promise<void>((resolve, reject) => {
-      this.DB!.close((err) => {
-        if (err) {
-          console.error("Error closing database", err.message);
-          reject(err);
-        } else {
-          console.log("Scraping completed.");
-          resolve();
-        }
-      });
-    });
-  }
 }
