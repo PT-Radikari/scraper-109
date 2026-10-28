@@ -16,6 +16,7 @@ const express_1 = __importDefault(require("express"));
 const axios_1 = __importDefault(require("axios"));
 const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
+const glintsAccountRows_1 = require("./glintsAccountRows");
 const dashboardHidden_1 = require("./dashboardHidden");
 const dashboardData_1 = require("./dashboardData");
 const app = (0, express_1.default)();
@@ -63,7 +64,24 @@ const TS_NODE = path_1.default.join(ROOT_DIR, "node_modules/.bin/ts-node");
 // runs compiled from build/ (no .ts files there) as well as via ts-node from
 // src/: either way ROOT_DIR is the repo root, where src/server.ts always is.
 const SERVER = path_1.default.join(ROOT_DIR, "src/server.ts");
-const SCRAPERS = ["glints", "jooble", "seek", "pintarnya", "kitalulus"];
+/**
+ * One row per configured Glints account (the implicit "default" account —
+ * row name "glints", unchanged — plus one "glints:<id>" row per entry in
+ * glints.json's "accounts" array; see src/glintsAccountRows.ts), followed by
+ * every other portal. Each Glints row spawns its own
+ * `ts-node src/server.ts glints[:<id>]` process (src/server.ts's per-account
+ * dispatch) and gets its own status/log, independent of every other
+ * account's row. Read once at startup — a restart is needed to pick up an
+ * edited glints.json, matching how every other portal's config here loads
+ * once per process.
+ */
+const SCRAPERS = [
+    ...(0, glintsAccountRows_1.glintsScraperNamesFromConfig)(path_1.default.join(ROOT_DIR, "glints.json")),
+    "jooble",
+    "seek",
+    "pintarnya",
+    "kitalulus",
+];
 const scraperState = {};
 const scraperProcesses = {};
 let scheduleEnabled = false;
@@ -87,10 +105,33 @@ function hasXvfb() {
     const result = (0, child_process_1.spawnSync)("which", ["xvfb-run"]);
     return result.status === 0;
 }
+/**
+ * Whether some other Glints row (any account, or the promote flow) is
+ * already driving a browser. Two Glints accounts' browsers running at once
+ * on this host is exactly what the account-aware server dispatch is meant to
+ * avoid (`runGlintsContinuous`/`runGlintsAccounts` in src/server.ts already
+ * run configured accounts one at a time within a single command — this
+ * guard keeps the viewer's independent per-row triggers from defeating that
+ * by starting two accounts' *separate* processes concurrently).
+ */
+function isAnotherGlintsRowRunning(exceptName) {
+    return Object.keys(scraperState).some((name) => {
+        var _a;
+        return name !== exceptName &&
+            ((0, glintsAccountRows_1.isGlintsRow)(name) || name === GLINTS_PROMOTE) &&
+            ((_a = scraperState[name]) === null || _a === void 0 ? void 0 : _a.status) === "running";
+    });
+}
 function runScraper(name, serverArgs = [name]) {
     var _a;
     if (((_a = scraperState[name]) === null || _a === void 0 ? void 0 : _a.status) === "running")
         return;
+    if (((0, glintsAccountRows_1.isGlintsRow)(name) || name === GLINTS_PROMOTE) && isAnotherGlintsRowRunning(name)) {
+        // Leave this row idle rather than start a second Glints browser; the next
+        // status poll shows it still idle, and it can be started once the other
+        // Glints row finishes.
+        return;
+    }
     scraperState[name] = { status: "running", log: [] };
     const [command, args] = hasXvfb()
         ? ["xvfb-run", ["-a", TS_NODE, SERVER, ...serverArgs]]
@@ -113,6 +154,12 @@ function runScraper(name, serverArgs = [name]) {
     });
 }
 function scheduleAll() {
+    // When more than one Glints account is configured, runScraper's
+    // isAnotherGlintsRowRunning guard lets only the first Glints row in
+    // SCRAPERS actually start this pass — the rest stay idle rather than open
+    // a second Glints browser. They are not queued for later in the same pass;
+    // they simply get their own turn whenever the already-running Glints row
+    // finishes before the next hourly tick starts the loop over.
     for (const name of SCRAPERS) {
         if (scraperState[name].status !== "running") {
             runScraper(name);
@@ -821,7 +868,7 @@ const HTML = `<!DOCTYPE html>
     let statusInterval = null;
     let schedule = { enabled: false, nextRunAt: null };
     let openLogs = new Set();
-    const SCRAPERS = ['glints', 'jooble', 'seek', 'pintarnya', 'kitalulus'];
+    const SCRAPERS = ${JSON.stringify(SCRAPERS)};
 
     // ── Log rendering ──────────────────────────────────────────────
 

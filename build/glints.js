@@ -35,7 +35,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Glints = exports.replayableGlintsHeaders = exports.descriptionKeyPaths = exports.normalizeGlintsApplicantName = exports.stripGlintsContactMask = exports.parseGlintsApplicationDetail = exports.glintsDescriptionText = exports.classifyGlintsLoginResult = exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = exports.GLINTS_VERIFICATION_METHOD_SELECTOR = exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = exports.normalizeCompanyName = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_PIPELINE_STAGES = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
+exports.Glints = exports.replayableGlintsHeaders = exports.descriptionKeyPaths = exports.normalizeGlintsApplicantName = exports.stripGlintsContactMask = exports.parseGlintsApplicationDetail = exports.glintsDescriptionText = exports.classifyGlintsLoginResult = exports.GLINTS_VERIFICATION_SUBMIT_TEXT_SELECTOR = exports.GLINTS_VERIFICATION_SUBMIT_SELECTOR = exports.GLINTS_VERIFICATION_METHOD_SELECTOR = exports.GLINTS_VERIFICATION_EMAIL_BUTTON_SELECTOR = exports.normalizeCompanyName = exports.buildGlintsAccountConfig = exports.resolveGlintsAccounts = exports.glintsBucketSessionKey = exports.glintsCredentialEnvPrefix = exports.resetGlintsLoginState = exports.glintsSessionStore = exports.GLINTS_PIPELINE_STAGES = exports.GLINTS_APPLICANT_ROW_SELECTOR = void 0;
 const playwright_1 = __importDefault(require("playwright"));
 const fs_1 = __importDefault(require("fs"));
 const axios_1 = __importDefault(require("axios"));
@@ -74,25 +74,115 @@ const GLINTS_LOGIN_URL = "https://employers.glints.id/login";
 const GLINTS_LOGIN_EMAIL_SELECTOR = 'input[name="email"]';
 const GLINTS_LOGIN_PASSWORD_SELECTOR = 'input[name="password"]';
 const GLINTS_LOGIN_SUBMIT_SELECTOR = 'button[type="submit"]';
+const glintsAccountStates = new Map();
+function getGlintsAccountState(accountId) {
+    let state = glintsAccountStates.get(accountId);
+    if (!state) {
+        state = {
+            loginGuard: new portalLogin_1.LoginAttemptGuard({ maxConsecutiveFailures: 2 }),
+            sessionStore: new portalLogin_1.InMemorySessionStore(),
+        };
+        glintsAccountStates.set(accountId, state);
+    }
+    return state;
+}
 /**
- * Per-process login attempt cap. Module-level on purpose: the continuous loop
- * constructs a fresh Glints instance per attempt/cycle, and the cap must
- * survive those instances so a wrong password fails twice, loudly, and then
- * backs off instead of retrying every cycle into an account lockout.
+ * The "default" account's refreshed session, held in memory only (never
+ * written to disk or the repo). Kept as a named export for the single-account
+ * shape every existing caller and test already relies on; other accounts'
+ * session stores are reached only through their own `Glints` instance.
  */
-const glintsLoginGuard = new portalLogin_1.LoginAttemptGuard({ maxConsecutiveFailures: 2 });
-/**
- * The refreshed session captured after a successful credential login, held in
- * memory only (never written to disk or the repo). Subsequent cycles in the
- * same process replay it instead of the committed glints.json warm-start.
- */
-exports.glintsSessionStore = new portalLogin_1.InMemorySessionStore();
-/** Clears the login guard and session store. Test-only. */
-function resetGlintsLoginState() {
-    glintsLoginGuard.reset();
-    exports.glintsSessionStore.clear();
+exports.glintsSessionStore = getGlintsAccountState("default").sessionStore;
+/** Clears one account's login guard and session store. Test-only. */
+function resetGlintsLoginState(accountId = "default") {
+    const state = getGlintsAccountState(accountId);
+    state.loginGuard.reset();
+    state.sessionStore.clear();
 }
 exports.resetGlintsLoginState = resetGlintsLoginState;
+const GLINTS_ACCOUNT_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+/** The `${prefix}_EMAIL`/`${prefix}_PASSWORD` env prefix for a Glints account id. */
+function glintsCredentialEnvPrefix(accountId) {
+    return accountId === "default"
+        ? "GLINTS"
+        : `GLINTS_${accountId.toUpperCase().replace(/-/g, "_")}`;
+}
+exports.glintsCredentialEnvPrefix = glintsCredentialEnvPrefix;
+/**
+ * The private bucket object an account's refreshed session is persisted to.
+ * The "default" account keeps the legacy key so an already-running
+ * single-account deployment's persisted session is not orphaned by this
+ * change; every other account gets its own namespaced key.
+ */
+function glintsBucketSessionKey(accountId) {
+    return accountId === "default"
+        ? GLINTS_SESSION_OBJECT_KEY
+        : `glints/accounts/${accountId}/session/current.json`;
+}
+exports.glintsBucketSessionKey = glintsBucketSessionKey;
+/**
+ * Resolves the full, ordered list of Glints accounts a run can target: the
+ * implicit "default" account (the config's top-level cookies/local_storage/
+ * target_company — unchanged from the original single-account shape) first,
+ * then every entry in `config.accounts`.
+ *
+ * Validates eagerly — malformed/duplicate ids and missing credential pairs
+ * throw here, before any browser launches, rather than surfacing only once a
+ * multi-account run reaches that account hours in.
+ */
+function resolveGlintsAccounts(config, env = process.env) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const accounts = [
+        {
+            id: "default",
+            targetCompany: (_a = config.target_company) !== null && _a !== void 0 ? _a : "",
+            cookies: (_b = config.cookies) !== null && _b !== void 0 ? _b : [],
+            localStorage: (_c = config.local_storage) !== null && _c !== void 0 ? _c : [],
+            credentialEnvPrefix: glintsCredentialEnvPrefix("default"),
+            bucketSessionKey: glintsBucketSessionKey("default"),
+        },
+    ];
+    const seenIds = new Set(["default"]);
+    for (const entry of (_d = config.accounts) !== null && _d !== void 0 ? _d : []) {
+        const id = typeof entry.id === "string" ? entry.id.trim() : "";
+        if (!GLINTS_ACCOUNT_ID_PATTERN.test(id)) {
+            throw new Error(`[GLINTS] invalid account id ${JSON.stringify(entry.id)} in glints.json's "accounts" — ids must be lowercase alphanumeric with hyphen separators (e.g. "second-brand"); "default" is reserved for the top-level config`);
+        }
+        if (seenIds.has(id)) {
+            throw new Error(`[GLINTS] duplicate account id "${id}" in glints.json's "accounts" — account ids must be unique (and distinct from the reserved "default")`);
+        }
+        seenIds.add(id);
+        const credentialEnvPrefix = glintsCredentialEnvPrefix(id);
+        const credentials = (0, portalLogin_1.loadPortalCredentials)(credentialEnvPrefix, env);
+        if (!credentials) {
+            throw new Error(`[GLINTS] account "${id}" is configured in glints.json but ${credentialEnvPrefix}_EMAIL/${credentialEnvPrefix}_PASSWORD are not set — every configured Glints account needs its own credential pair`);
+        }
+        accounts.push({
+            id,
+            targetCompany: (_e = entry.target_company) !== null && _e !== void 0 ? _e : "",
+            cookies: (_f = entry.cookies) !== null && _f !== void 0 ? _f : [],
+            localStorage: (_g = entry.local_storage) !== null && _g !== void 0 ? _g : [],
+            credentialEnvPrefix,
+            bucketSessionKey: glintsBucketSessionKey(id),
+        });
+    }
+    return accounts;
+}
+exports.resolveGlintsAccounts = resolveGlintsAccounts;
+/**
+ * Builds the per-account `GlintsConfigJson` a `Glints` instance should be
+ * constructed with: the base config's shared settings (headless, limit,
+ * timeout, slowmo, api_destination) with the account's own cookies,
+ * local_storage and target_company, and a db_path namespaced per account (the
+ * field is dead on Glints' sink-routed path today, but namespacing it costs
+ * nothing and avoids two accounts ever sharing a SQLite file if that changes).
+ */
+function buildGlintsAccountConfig(base, account) {
+    return Object.assign(Object.assign({}, base), { cookies: account.cookies, local_storage: account.localStorage, target_company: account.targetCompany, db_path: account.id === "default"
+            ? base.db_path
+            : base.db_path.replace(/(\.[^./\\]*)?$/, (ext) => `-${account.id}${ext}`) });
+}
+exports.buildGlintsAccountConfig = buildGlintsAccountConfig;
 /**
  * Normalizes a company display name for comparison: trims, collapses inner
  * whitespace, and lowercases. The switcher renders names like "PT RADIKARI"
@@ -406,8 +496,12 @@ class Glints {
      * Represents a Glints object.
      * @constructor
      * @param {GlintsConfigJson} config - The configuration object for Glints.
+     * @param {string} accountId - Which configured account to log in as; defaults
+     *   to "default" (the top-level config's own account — the original,
+     *   single-account behavior, unchanged). See `resolveGlintsAccounts` for how
+     *   multiple accounts are declared and resolved.
      */
-    constructor(config) {
+    constructor(config, accountId = "default") {
         var _a;
         this.HEADLESS = true;
         this.LIMIT = 0;
@@ -462,7 +556,13 @@ class Glints {
         this.DB_PATH = path_1.default.join(__dirname, config.db_path);
         this.TARGETCOMPANY = (_a = config.target_company) !== null && _a !== void 0 ? _a : '';
         this.sink = null;
-        console.info("CONFIG GLINTS LOADED");
+        this.ACCOUNT_ID = accountId;
+        this.CREDENTIAL_ENV_PREFIX = glintsCredentialEnvPrefix(accountId);
+        this.BUCKET_SESSION_KEY = glintsBucketSessionKey(accountId);
+        const state = getGlintsAccountState(accountId);
+        this.loginGuard = state.loginGuard;
+        this.sessionStore = state.sessionStore;
+        console.info(`CONFIG GLINTS LOADED (account: ${accountId})`);
     }
     getBrowserFallbackExecutablePath() {
         const candidates = [
@@ -675,11 +775,11 @@ class Glints {
      */
     ensureAuthenticated(page, context) {
         return __awaiter(this, void 0, void 0, function* () {
-            const credentials = (0, portalLogin_1.loadPortalCredentials)("GLINTS");
+            const credentials = (0, portalLogin_1.loadPortalCredentials)(this.CREDENTIAL_ENV_PREFIX);
             if (!credentials) {
-                throw new Error("[GLINTS] Session expired: dashboard redirected to login and GLINTS_EMAIL/GLINTS_PASSWORD are not set — configure the credentials or export a fresh session into glints.json");
+                throw new Error(`[GLINTS] Session expired: dashboard redirected to login and ${this.CREDENTIAL_ENV_PREFIX}_EMAIL/${this.CREDENTIAL_ENV_PREFIX}_PASSWORD are not set — configure the credentials or export a fresh session into glints.json`);
             }
-            const gate = glintsLoginGuard.canAttempt();
+            const gate = this.loginGuard.canAttempt();
             if (!gate.allowed) {
                 throw new Error(`[GLINTS] Session expired and credential login skipped: ${gate.reason}`);
             }
@@ -689,7 +789,7 @@ class Glints {
                 outcome = yield this.attemptCredentialLogin(page, credentials);
             }
             catch (error) {
-                glintsLoginGuard.recordFailure("error");
+                this.loginGuard.recordFailure("error");
                 // A blocked or never-rendered login form (e.g. a bot-check page served
                 // to the datacenter IP) surfaces here — capture what was on screen so
                 // this server-only shape self-documents too.
@@ -707,7 +807,7 @@ class Glints {
                     return;
                 }
                 case "challenge": {
-                    glintsLoginGuard.recordFailure("challenge");
+                    this.loginGuard.recordFailure("challenge");
                     throw new Error("[GLINTS] GLINTS_LOGIN_CHALLENGE: captcha/rate-limit wall detected — a human login or fresh session export is required; the loop keeps cycling on its normal schedule");
                 }
                 case "otp_required": {
@@ -715,11 +815,11 @@ class Glints {
                     break;
                 }
                 case "invalid_credentials": {
-                    glintsLoginGuard.recordFailure("invalid_credentials");
+                    this.loginGuard.recordFailure("invalid_credentials");
                     throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: the portal rejected the configured credentials — fix GLINTS_EMAIL/GLINTS_PASSWORD");
                 }
                 default: {
-                    glintsLoginGuard.recordFailure("error");
+                    this.loginGuard.recordFailure("error");
                     yield this.captureLoginDebug(page, "login submit produced no dashboard, error banner, challenge or OTP page", credentials);
                     throw new Error(`[GLINTS] GLINTS_LOGIN_FAILED: login submit produced no dashboard, error banner or challenge within ${this.TIMEOUT}ms — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state`);
                 }
@@ -735,7 +835,7 @@ class Glints {
      */
     throwOtpRequired(page, credentials) {
         return __awaiter(this, void 0, void 0, function* () {
-            glintsLoginGuard.recordFailure("otp_required");
+            this.loginGuard.recordFailure("otp_required");
             yield this.captureLoginDebug(page, "OTP/device-verification page detected after login submit", credentials);
             throw new Error("[GLINTS] GLINTS_LOGIN_OTP_REQUIRED: the portal is asking for an email OTP / device verification code — a human must complete the verification (check the GLINTS_EMAIL inbox) or export a fresh session into glints.json; in-process login attempts are parked so the inbox is not flooded");
         });
@@ -768,11 +868,11 @@ class Glints {
                 if (observed === "otp_required" || observed === "device_verification") {
                     yield this.throwOtpRequired(page, credentials);
                 }
-                glintsLoginGuard.recordFailure("error");
+                this.loginGuard.recordFailure("error");
                 yield this.captureLoginDebug(page, "login submit left /login but the dashboard never rendered", credentials);
                 throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: login submit left /login but the dashboard never rendered — the portal is likely holding the session on an interstitial (password reset, onboarding) that needs a human login; see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
             }
-            glintsLoginGuard.recordSuccess();
+            this.loginGuard.recordSuccess();
             yield this.persistSession(page, context);
             console.info("[GLINTS] Credential login succeeded — refreshed session held in memory for subsequent cycles");
         });
@@ -803,12 +903,17 @@ class Glints {
             if (!sink || !sink.hasServiceAccess()) {
                 // No hand-off channel: park the budget exactly like the legacy OTP
                 // outcome so cycles do not keep re-submitting credentials pointlessly.
-                glintsLoginGuard.recordFailure("otp_required");
+                this.loginGuard.recordFailure("otp_required");
                 throw new Error("[GLINTS] GLINTS_VERIFICATION_UNAVAILABLE: the device-verification page is up but SCORING_SUPABASE_SERVICE_KEY is not configured, so there is no channel to hand a code to this process — configure the key or export a fresh session into glints.json; login attempts are parked");
             }
             // Rate-cap the "send code" click on the durable row timestamps — module
             // state would reset with the container, and a restart loop must not turn
-            // into a code-email storm.
+            // into a code-email storm. scrape.glints_verification carries no account
+            // column, so this cadence is shared across every Glints account; accounts
+            // run sequentially (never two device verifications at once in this
+            // process), so the only effect is one account's recent request can make a
+            // different account wait out the same cadence before requesting its own
+            // code — acceptable for a rare, human-handled interstitial.
             const recent = yield sink.latestVerificationRequest();
             if (recent) {
                 const age = Math.max(0, Date.now() - Date.parse(recent.requested_at));
@@ -822,12 +927,12 @@ class Glints {
             }
             catch (error) {
                 yield this.settleVerification(sink, requestId, "expired");
-                glintsLoginGuard.recordFailure("error");
+                this.loginGuard.recordFailure("error");
                 yield this.captureLoginDebug(page, "device-verification email button did not accept the click", credentials);
                 const message = error instanceof Error ? error.message : String(error);
                 throw new Error(`[GLINTS] GLINTS_LOGIN_FAILED: the device-verification page rendered but the email-code button could not be clicked (UI drift?): ${(0, portalLogin_1.maskSecrets)(message, [credentials.password])} — see the LOGIN_DEBUG_ARTIFACTS line above`);
             }
-            console.error(`[GLINTS] GLINTS_VERIFICATION_CODE_NEEDED (check email ${credentials.email}; insert code into scrape.glints_verification row ${requestId})`);
+            console.error(`[GLINTS] GLINTS_VERIFICATION_CODE_NEEDED (account ${this.ACCOUNT_ID}; check email ${credentials.email}; insert code into scrape.glints_verification row ${requestId})`);
             const attempts = Math.max(1, Math.ceil(this.VERIFICATION_CODE_WAIT_MS / this.VERIFICATION_POLL_INTERVAL_MS));
             let code = null;
             for (let i = 0; i < attempts; i++) {
@@ -864,7 +969,7 @@ class Glints {
             }
             if (page.url().includes("/login")) {
                 yield this.settleVerification(sink, requestId, "rejected", new Date().toISOString());
-                glintsLoginGuard.recordFailure("error");
+                this.loginGuard.recordFailure("error");
                 yield this.captureLoginDebug(page, "device-verification code was submitted but the portal stayed on /login", credentials);
                 throw new Error(`[GLINTS] GLINTS_VERIFICATION_CODE_REJECTED: the code from scrape.glints_verification row ${requestId} did not log the session in (mistyped or expired) — see the LOGIN_DEBUG_ARTIFACTS line above; a fresh code can be requested after the cadence window`);
             }
@@ -910,7 +1015,7 @@ class Glints {
                 yield page.waitForTimeout(1000);
             }
             if (count === 0) {
-                glintsLoginGuard.recordFailure("error");
+                this.loginGuard.recordFailure("error");
                 yield this.captureLoginDebug(page, "no code input rendered after requesting the email verification code", credentials);
                 throw new Error("[GLINTS] GLINTS_LOGIN_FAILED: the email verification code was requested but no code input ever rendered — see the LOGIN_DEBUG_ARTIFACTS line above for the captured page state");
             }
@@ -974,7 +1079,7 @@ class Glints {
                 localStorage: yield this.readLocalStorageSnapshot(page),
                 capturedAt: Date.now(),
             };
-            exports.glintsSessionStore.set(snapshot);
+            this.sessionStore.set(snapshot);
             const bucketStore = this.getBucketSessionStore();
             if (bucketStore) {
                 yield bucketStore.persist(snapshot);
@@ -996,7 +1101,7 @@ class Glints {
         }
         if (!sink.hasServiceAccess())
             return null;
-        return new portalLogin_1.BucketSessionStore(sink, GLINTS_SESSION_OBJECT_KEY, (message) => console.warn(`[GLINTS] ${message}`));
+        return new portalLogin_1.BucketSessionStore(sink, this.BUCKET_SESSION_KEY, (message) => console.warn(`[GLINTS] ${message}`));
     }
     /**
      * Fills and submits the employer login form, then polls until the portal
@@ -1104,7 +1209,11 @@ class Glints {
         return __awaiter(this, void 0, void 0, function* () {
             yield (0, portalLogin_1.captureLoginDebugArtifacts)({
                 page,
-                portal: "glints",
+                // Keeps each account's login-debug artifacts under its own bucket
+                // prefix (glints/accounts/<id>/login-debug/...) instead of mixing
+                // several accounts' screenshots/HTML under the one shared "glints/"
+                // prefix. "default" keeps the original, unprefixed path.
+                portal: this.ACCOUNT_ID === "default" ? "glints" : `glints/accounts/${this.ACCOUNT_ID}`,
                 reason,
                 getUploader: () => this.getSink(),
                 // The email is the captain's own infra address and is allowed to appear.
@@ -2015,13 +2124,13 @@ class Glints {
             // the bucket-persisted session from a previous container, which beats the
             // committed glints.json export (only an optional warm-start). The bucket
             // hop is what keeps a device-verified session trusted across restarts.
-            let storedSession = exports.glintsSessionStore.get();
+            let storedSession = this.sessionStore.get();
             if (!storedSession) {
                 const bucketStore = this.getBucketSessionStore();
                 if (bucketStore) {
                     storedSession = yield bucketStore.restore();
                     if (storedSession) {
-                        exports.glintsSessionStore.set(storedSession);
+                        this.sessionStore.set(storedSession);
                         console.info("[GLINTS] Restored persisted session from the artifact bucket");
                     }
                 }

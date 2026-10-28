@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import { spawn, spawnSync, ChildProcess } from "child_process";
 import path from "path";
+import { glintsScraperNamesFromConfig, isGlintsRow } from "./glintsAccountRows";
 import { loadHidden, saveHidden, updateHidden, HiddenKind } from "./dashboardHidden";
 import {
   loadDashboardConfig,
@@ -63,7 +64,24 @@ const TS_NODE = path.join(ROOT_DIR, "node_modules/.bin/ts-node");
 // src/: either way ROOT_DIR is the repo root, where src/server.ts always is.
 const SERVER = path.join(ROOT_DIR, "src/server.ts");
 
-const SCRAPERS = ["glints", "jooble", "seek", "pintarnya", "kitalulus"];
+/**
+ * One row per configured Glints account (the implicit "default" account —
+ * row name "glints", unchanged — plus one "glints:<id>" row per entry in
+ * glints.json's "accounts" array; see src/glintsAccountRows.ts), followed by
+ * every other portal. Each Glints row spawns its own
+ * `ts-node src/server.ts glints[:<id>]` process (src/server.ts's per-account
+ * dispatch) and gets its own status/log, independent of every other
+ * account's row. Read once at startup — a restart is needed to pick up an
+ * edited glints.json, matching how every other portal's config here loads
+ * once per process.
+ */
+const SCRAPERS = [
+  ...glintsScraperNamesFromConfig(path.join(ROOT_DIR, "glints.json")),
+  "jooble",
+  "seek",
+  "pintarnya",
+  "kitalulus",
+];
 
 type ScraperStatus = "idle" | "running" | "done" | "error";
 
@@ -94,8 +112,32 @@ function hasXvfb(): boolean {
   return result.status === 0;
 }
 
+/**
+ * Whether some other Glints row (any account, or the promote flow) is
+ * already driving a browser. Two Glints accounts' browsers running at once
+ * on this host is exactly what the account-aware server dispatch is meant to
+ * avoid (`runGlintsContinuous`/`runGlintsAccounts` in src/server.ts already
+ * run configured accounts one at a time within a single command — this
+ * guard keeps the viewer's independent per-row triggers from defeating that
+ * by starting two accounts' *separate* processes concurrently).
+ */
+function isAnotherGlintsRowRunning(exceptName: string): boolean {
+  return Object.keys(scraperState).some(
+    (name) =>
+      name !== exceptName &&
+      (isGlintsRow(name) || name === GLINTS_PROMOTE) &&
+      scraperState[name]?.status === "running",
+  );
+}
+
 function runScraper(name: string, serverArgs: string[] = [name]) {
   if (scraperState[name]?.status === "running") return;
+  if ((isGlintsRow(name) || name === GLINTS_PROMOTE) && isAnotherGlintsRowRunning(name)) {
+    // Leave this row idle rather than start a second Glints browser; the next
+    // status poll shows it still idle, and it can be started once the other
+    // Glints row finishes.
+    return;
+  }
 
   scraperState[name] = { status: "running", log: [] };
 
@@ -124,6 +166,12 @@ function runScraper(name: string, serverArgs: string[] = [name]) {
 }
 
 function scheduleAll() {
+  // When more than one Glints account is configured, runScraper's
+  // isAnotherGlintsRowRunning guard lets only the first Glints row in
+  // SCRAPERS actually start this pass — the rest stay idle rather than open
+  // a second Glints browser. They are not queued for later in the same pass;
+  // they simply get their own turn whenever the already-running Glints row
+  // finishes before the next hourly tick starts the loop over.
   for (const name of SCRAPERS) {
     if (scraperState[name].status !== "running") {
       runScraper(name);
@@ -177,7 +225,10 @@ app.post("/api/glints/promote", express.json(), (req, res) => {
     res.status(400).json({ error: "confirm must be true: moving applicants to Terhubung cannot be undone by the scraper" });
     return;
   }
-  if (scraperState.glints?.status === "running" || scraperState[GLINTS_PROMOTE].status === "running") {
+  if (
+    scraperState[GLINTS_PROMOTE].status === "running" ||
+    isAnotherGlintsRowRunning(GLINTS_PROMOTE)
+  ) {
     res.status(409).json({ error: "a Glints run is already in progress" });
     return;
   }
@@ -783,7 +834,7 @@ const HTML = `<!DOCTYPE html>
     let statusInterval = null;
     let schedule = { enabled: false, nextRunAt: null };
     let openLogs = new Set();
-    const SCRAPERS = ['glints', 'jooble', 'seek', 'pintarnya', 'kitalulus'];
+    const SCRAPERS = ${JSON.stringify(SCRAPERS)};
 
     // ── Log rendering ──────────────────────────────────────────────
 
