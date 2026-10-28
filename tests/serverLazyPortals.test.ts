@@ -7,9 +7,6 @@
  * image bundled a Node too old for kitalulus' pdf-parse@2, and server.ts'
  * then-eager portal imports made the glints container crash at module load on
  * a dependency glints never uses ("ReferenceError: DOMMatrix is not defined").
- *
- * Since the direct-sink rollout every sink-routed portal also loads sqlite3
- * lazily, so no portal runner may pull in the native binding at build time.
  */
 
 import { execFileSync } from "child_process";
@@ -17,10 +14,10 @@ import path from "path";
 
 const repoRoot = path.join(__dirname, "..");
 
-const ALL_PORTAL_MODULES = ["glints", "kitalulus", "kitalulus-v2", "jooble", "seek", "pintarnya"];
+const ALL_PORTAL_MODULES = ["glints", "kitalulus", "jooble", "seek", "pintarnya"];
 
 // Per portal: the modules its runner is allowed to load. kitalulus is the only
-// portal allowed to load pdf-parse/pdfjs-dist; nobody may load sqlite3 eagerly.
+// portal allowed to load pdf-parse/pdfjs-dist.
 const CASES: Array<{ command: string; ownModules: string[]; allowPdf: boolean }> = [
   { command: "glints", ownModules: ["glints"], allowPdf: false },
   // The per-account one-shot command: must stay just as lazy as bare "glints".
@@ -36,12 +33,11 @@ const CASES: Array<{ command: string; ownModules: string[]; allowPdf: boolean }>
 // production require graph.
 function buildProbe(command: string, ownModules: string[], allowPdf: boolean): string {
   const forbiddenPortals = ALL_PORTAL_MODULES.filter((m) => !ownModules.includes(m))
-    // "kitalulus" must not match the "kitalulus-v2" file (or vice versa), so
-    // match the exact module file name.
+    // Match the exact module file name, not a prefix of another one.
     .map((m) => `[\\\\/]src[\\\\/]${m.replace(/[-]/g, "\\-")}\\.(ts|js)`);
   const forbiddenDeps = allowPdf
-    ? ["[\\\\/]node_modules[\\\\/]sqlite3[\\\\/]"]
-    : ["[\\\\/]node_modules[\\\\/](pdf-parse|pdfjs-dist|sqlite3)[\\\\/]"];
+    ? []
+    : ["[\\\\/]node_modules[\\\\/](pdf-parse|pdfjs-dist)[\\\\/]"];
   const forbidden = [...forbiddenPortals, ...forbiddenDeps].join("|");
 
   return `

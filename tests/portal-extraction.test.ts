@@ -10,15 +10,6 @@ import {
 } from "../src/glints";
 import type { SeekConfigJson } from "../src/seek";
 
-const sqliteAvailable = (() => {
-  try {
-    require("sqlite3");
-    return true;
-  } catch {
-    return false;
-  }
-})();
-
 function dbPathForSource(tempDir: string, fileName: string): string {
   return path.relative(path.join(process.cwd(), "src"), path.join(tempDir, fileName));
 }
@@ -134,7 +125,7 @@ describe("portal extraction helpers", () => {
     expect(processedOrder).toEqual([1, 2, 0]);
   });
 
-  (sqliteAvailable ? it : it.skip)("extracts visible Seek applicants without moving phone numbers into email", async () => {
+  it("extracts visible Seek applicants without moving phone numbers into email", async () => {
     const { Seek } = await import("../src/seek");
     const config: SeekConfigJson = {
       headless: true,

@@ -47,7 +47,7 @@ export interface GlintsConfigJson {
   cookies: Cookie[];
   local_storage: LocalStorageItem[];
   limit: number;
-  /** @deprecated Only kitalulus-v2 still POSTs here. The sink-routed portals write to the scoring Supabase via SupabaseSink. */
+  /** @deprecated Unused — every portal now writes to the scoring Supabase via SupabaseSink. */
   api_destination: string;
   timeout: number;
   slowmo: number;

@@ -1,4 +1,3 @@
-import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
@@ -98,27 +97,6 @@ const portalRunnerFactories: Record<string, () => () => Promise<void>> = {
       loadPortalConfig<import("./kitalulus").KitaLulusConfigJson>("kitalulus.json");
     return () => new KitaLulus(config).Scrape();
   },
-  "kitalulus-v2-vacancies": () => {
-    const { KitaLulusV2 } =
-      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
-    const config =
-      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
-    return () => new KitaLulusV2(config).ScrapeVacancy();
-  },
-  "kitalulus-v2-applicants": () => {
-    const { KitaLulusV2 } =
-      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
-    const config =
-      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
-    return () => new KitaLulusV2(config).ScrapeApplicant();
-  },
-  "kitalulus-v2-process-applicants": () => {
-    const { KitaLulusV2 } =
-      require("./kitalulus-v2") as typeof import("./kitalulus-v2");
-    const config =
-      loadPortalConfig<import("./kitalulus-v2").KitaLulusConfigJsonV2>("kitalulus-v2.json");
-    return () => new KitaLulusV2(config).ProcessApplicant();
-  },
   jooble: () => {
     const { Jooble } = require("./jooble") as typeof import("./jooble");
     const config =
@@ -216,11 +194,6 @@ async function runPortal(command: string): Promise<void> {
       `[fatal] ${command}: exiting 1 - retry budget exhausted, last error ${errorClass}: ${firstLine}`,
     );
     process.exitCode = 1;
-  } finally {
-    // The last candidates of a run may still be sitting in the stream's flush
-    // window; draining here gets them into `talent_scraping` now instead of
-    // leaving them for the next sync pass.
-    await closeIngestionService();
   }
 }
 
@@ -334,8 +307,6 @@ export async function runPortalCycle(
   } catch (error) {
     cycleError = error;
     console.error(`${portal} cycle exhausted its attempt budget`, error);
-  } finally {
-    await closeIngestionService();
   }
 
   if (sink && runId !== null) {
@@ -486,39 +457,6 @@ function main(): void {
     void runPortal(command);
   } else {
     switch (command) {
-      case "central-sync": {
-        console.log("Will run central Supabase sync daemon");
-        const { startCentralSyncDaemon } =
-          require("./central/syncRunner") as typeof import("./central/syncRunner");
-        void startCentralSyncDaemon();
-        break;
-      }
-
-      case "central-sync-once": {
-        console.log("Will run a single central Supabase sync pass");
-        const { CentralSyncRunner } =
-          require("./central/syncRunner") as typeof import("./central/syncRunner");
-        void (async () => {
-          const runner = new CentralSyncRunner();
-          await runner.runOnce();
-          await runner.stop();
-        })();
-        break;
-      }
-
-      case "central-stats": {
-        console.log("Will report central ingestion outbox stats");
-        const { CentralIngestionService } =
-          require("./central/ingestion") as typeof import("./central/ingestion");
-        void (async () => {
-          const service = new CentralIngestionService();
-          await service.init();
-          console.log(await service.stats());
-          await service.close();
-        })();
-        break;
-      }
-
       // One-shot, manually-invoked catch-up for populating the Google Sheet
       // with every portal's existing scrape.* rows (see
       // backfillAllPortalsToSheets in src/googleSheetsSync.ts). Never part of
