@@ -658,6 +658,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
             "id,portal,portal_candidate_id,name,email,phone:data->contact->>contact_number," +
             "date_of_birth:data->>date_of_birth,location:data->>location,cv_object_key,photo_object_key," +
             "last_seen_at,portal_applications(applied_for,applied_date)",
+          "portal_applications.order": "applied_date.desc",
         },
       });
       page = response.data;
