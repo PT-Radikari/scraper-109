@@ -1,10 +1,7 @@
 import playwright from "playwright";
 import fs from "fs";
 import axios from "axios";
-import FormData from "form-data";
 import path from "path";
-import type sqlite3 from 'sqlite3';
-import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
 import { sanitizeSinkError, SupabaseSink, SupabaseSinkError } from "./supabaseSink";
 import { sendApplicantToSink } from "./portalSink";
@@ -170,13 +167,6 @@ type VacancyPage = {
   editLink?: string;
   description?: string;
 };
-
-/**
- * Represents an applicant for a jobVacancy position in the database.
- */
-type ApplicantDB = Pick<Applicant, "email"> & {
-  id: number;
-}
 
 export const GLINTS_APPLICANT_ROW_SELECTOR =
   '.Polaris-IndexTable__TableRow, [data-testid="candidate-row"], tbody tr';
@@ -769,13 +759,10 @@ export class Glints {
   private LIMIT: number = 0;
   private COOKIES: Cookie[] = [];
   private LOCALSTORAGE: LocalStorageItem[] = [];
-  private APIDESTINATION: string = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
   private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
-  private DB_PATH: string = "";
-  private DB?: sqlite3.Database;
   private sink: SupabaseSink | null;
 
   private CACHE_DIR: string = '';
@@ -812,10 +799,8 @@ export class Glints {
     this.LIMIT = config.limit;
     this.COOKIES = config.cookies;
     this.LOCALSTORAGE = config.local_storage;
-    this.APIDESTINATION = config.api_destination;
     this.TIMEOUT = config.timeout;
     this.SLOWMO = config.slowmo;
-    this.DB_PATH = path.join(__dirname, config.db_path);
     this.TARGETCOMPANY = config.target_company ?? '';
     this.sink = null;
     this.ACCOUNT_ID = accountId;
@@ -1636,64 +1621,6 @@ export class Glints {
       );
     } catch {
       return [];
-    }
-  }
-
-  private async ensureLegacyDatabase(): Promise<void> {
-    if (this.DB) return;
-    this.DB = await this.createDatabaseConnection();
-    await this.createRequiredTables();
-  }
-
-  /**
-   * @deprecated Legacy HTTP hop to `api_destination`. Kept untouched so
-   * kitalulus-v2 (the last non-sink portal) can keep using the pattern.
-   * glints now lands candidates directly in the scoring Supabase via
-   * sendToSink().
-   * @param param - The applicant data to be sent.
-   * @returns A Promise that resolves when the request is successfully sent.
-   */
-  async sendRequest(param: Applicant): Promise<void> {
-    try {
-      const bodyFormData = new FormData();
-      bodyFormData.append("channel", param.portal);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("applied_for", param.applied_for);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("url_profile", param.url_profile);
-      bodyFormData.append("fullname", param.name);
-      bodyFormData.append("summary", param.summary);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("contact", JSON.stringify(param.contact));
-      bodyFormData.append("date_of_birth", param.date_of_birth);
-      bodyFormData.append("salary_expectation", param.salary_expectation);
-      bodyFormData.append("work_experiences", JSON.stringify(param.work_experience));
-      bodyFormData.append("educations", JSON.stringify(param.education));
-      bodyFormData.append("skills", JSON.stringify(param.skill));
-      bodyFormData.append("location", param.location);
-      bodyFormData.append("gender", param.gender);
-      if (param.photo !== "") {
-        bodyFormData.append("photo", fs.createReadStream(param.photo));
-      }
-      if (param.cv !== "") {
-        bodyFormData.append("cv", fs.createReadStream(param.cv));
-      }
-
-      await axios({
-        method: "post",
-        url: this.APIDESTINATION,
-        data: bodyFormData,
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-      console.info("Success sending param", param);
-      await this.ensureLegacyDatabase();
-      await this.insertApplicant(param);
-      this.COLLECTED++;
-    } catch (error) {
-      console.info("Error sending param", param);
-      console.error("Error sending request with error:", error);
-      console.error("Error sending request with response:", (error as any).response?.data ?? (error as any).message);
     }
   }
 
@@ -3777,209 +3704,4 @@ async convertDateMMDDToYYYY(text: string): Promise<string> {
     }
   }
 
-  /**
-   * Establishes a connection to the SQLite database.
-   * @returns {sqlite3.Database} The database connection.
-   */
-  async createDatabaseConnection(): Promise<sqlite3.Database> {
-    const sqliteModule = await import("sqlite3");
-    const Sqlite = sqliteModule.default;
-    /**
-     * Create the database file if it does not exist.
-     */
-    if (!fs.existsSync(this.DB_PATH)) {
-      fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
-      fs.writeFileSync(this.DB_PATH, "");
-    }
-
-    /**
-     * Open the database connection.
-     */
-    return new Promise((resolve, reject) => {
-      const database = new Sqlite.Database(this.DB_PATH, (err) => {
-        if (err) {
-          console.error("Error opening database", err.message);
-          reject(err);
-        } else {
-          console.log("Connected to the database.");
-          this.DB = database;
-          resolve(database);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the applicants table in the database.
-   */
-  async createApplicantsTable() {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS applicants (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL,
-        data TEXT NOT NULL
-      )
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.run(createTableQuery, (err) => {
-        if (err) {
-          console.error("Error creating applicants table", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Created applicants table."));
-        }
-      });
-    });
-  }
-
-  /**
-   * Checks if a table exists in the database.
-   */
-  async isTableExist(tableName: string): Promise<boolean> {
-    console.info(`Checking if table ${tableName} exists...`);
-    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => {
-        if (err) {
-          console.error("Error checking table", err.message);
-          reject(err);
-        } else {
-          if (row !== undefined) {
-            console.log(`Table ${tableName} exists.`);
-          }
-          resolve(row !== undefined);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the required tables in the database.
-   * The required tables are the job_vacancies and applicants tables.
-   */
-  async createRequiredTables() {
-    const isTableApplicantsExist = await this.isTableExist("applicants");
-    if (!isTableApplicantsExist) {
-      console.info("Creating applicants table...");
-      await this.createApplicantsTable();
-    }
-  }
-
-  /**
-   * Inserts a vacancy into the database.
-   * @param {string} position The position of the vacancy.
-   * @param {string} location The location of the vacancy.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<void>} A promise that resolves when the vacancy is inserted.
-   * @example insertVacancy("Software Engineer", "Jakarta", "283020")
-   */
-  async insertJobVacancy(position: string, location: string, pintarnyaJobId: string, applicants: number): Promise<void> {
-    console.info(`Inserting vacancy ${position} into the database...`);
-
-    const insertQuery = `
-      INSERT INTO job_vacancies (position, location, pintarnya_job_id, applicants)
-      VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting vacancy", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted vacancy."));
-        }
-      });
-    });
-
-    // Dual-write: mirror the vacancy into the central Supabase database.
-    await ingestPortalVacancy({
-      source_portal: "glints",
-      source_vacancy_id: pintarnyaJobId,
-      position,
-      location,
-      applicants_count: applicants,
-    });
-  }
-
-  /**
-   * Inserts an applicant into the database.
-   * @param {string} email The email of the applicant.
-   * @param {string} appliedForId The applied for ID.
-   * @returns {Promise<void>} A promise that resolves when the applicant is inserted.
-   * @example insertApplicant("johndoe@mail.app", "283020")
-   * @returns Promise<void>
-   */
-  async insertApplicant(data: Applicant): Promise<void> {
-    console.info(`Inserting applicant ${data.email} into the database...`);
-
-    const safeEmail = data.email.replace(/'/g, "''");
-    const safeData = JSON.stringify(data).replace(/'/g, "''");
-    const insertQuery = `
-      INSERT INTO applicants (email, data)
-      VALUES ('${safeEmail}', '${safeData}')
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting applicant", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted applicant."));
-        }
-      });
-    });
-
-    // Dual-write: the local SQLite row above stays the fallback, this mirrors
-    // the applicant into the central Supabase database.
-    await ingestPortalApplicant(data as unknown as PortalApplicant, "glints");
-  }
-
-  /**
-   * Gets an applicant by the email.
-   * @param {string} email The email of the applicant.
-   * @returns {Promise<ApplicantDB>} A promise that resolves with the applicant.
-   * @example getApplicantByEmail("johndoe@mail.app")
-   */
-  async getApplicantByEmail(email: string): Promise<ApplicantDB> {
-    console.info(`Getting applicant by email ${email}...`);
-
-    const safeEmail = email.replace(/'/g, "''");
-    const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${safeEmail}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error getting applicant", err.message);
-          reject(err);
-        } else {
-          console.log("Got applicant", row);
-          resolve(row);
-        }
-      });
-    });
-  }
-
-  /**
-   * Closes the database connection.
-   */
-  async closeDatabaseConnection() {
-    if (!this.DB) return;
-    return new Promise<void>((resolve, reject) => {
-      this.DB!.close((err) => {
-        if (err) {
-          console.error("Error closing database", err.message);
-          reject(err);
-        } else {
-          console.log("Scraping completed.");
-          resolve();
-        }
-      });
-    });
-  }
 }

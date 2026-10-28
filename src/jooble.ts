@@ -1,11 +1,7 @@
 import playwright from "playwright";
 import fs from "fs";
-import axios from "axios";
 import path from "path";
 import crypto from "crypto";
-import FormData from "form-data";
-import type sqlite3 from 'sqlite3';
-import { ingestPortalApplicant, ingestPortalVacancy, PortalApplicant } from "./central/portalBridge";
 import { trackBrowser } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
 import { sendApplicantToSink } from "./portalSink";
@@ -77,25 +73,15 @@ type Contact = {
  */
 type VacancyPage = { title: string; link: string };
 
-/**
- * Represents an applicant for a jobVacancy position in the database.
- */
-type ApplicantDB = Pick<Applicant, "email"> & {
-  id: number;
-}
-
 export class Jooble {
   private HEADLESS: boolean = true;
   private LIMIT: number = 0;
   private COOKIES: Cookie[] = [];
   private LOCALSTORAGE: LocalStorageItem[] = [];
-  private APIDESTINATION: string = "";
   private TIMEOUT: number = 30000;
   private COLLECTED: number = 0;
   private VACANCIES_SEEN: number = 0;
   private SLOWMO: number = 10000;
-  private DB_PATH: string = "";
-  private DB?: sqlite3.Database;
   private sink: SupabaseSink | null = null;
 
   /**
@@ -108,10 +94,8 @@ export class Jooble {
     this.LIMIT = config.limit;
     this.COOKIES = config.cookies;
     this.LOCALSTORAGE = config.local_storage;
-    this.APIDESTINATION = config.api_destination;
     this.TIMEOUT = config.timeout;
     this.SLOWMO = config.slowmo;
-    this.DB_PATH = path.join(__dirname, config.db_path);
     console.info("CONFIG JOOBLE LOADED");
   }
 
@@ -135,12 +119,6 @@ export class Jooble {
     return this.COLLECTED;
   }
 
-  private async ensureLegacyDatabase(): Promise<void> {
-    if (this.DB) return;
-    this.DB = await this.createDatabaseConnection();
-    await this.createRequiredTables();
-  }
-
   /**
    * Writes one applicant straight into the scoring Supabase via the shared
    * direct-sink slice (see src/portalSink.ts). jooble carries no portal-native
@@ -162,42 +140,6 @@ export class Jooble {
       raw: { type: param.type },
     });
     this.COLLECTED++;
-  }
-
-  /**
-   * @deprecated Legacy HTTP hop to `api_destination` plus the local SQLite
-   * insert. Kept untouched but bypassed: jooble now lands applicants directly
-   * in the scoring Supabase via sendToSink().
-   * @param param - The applicant data.
-   * @returns A Promise that resolves when the request is sent successfully.
-   */
-  async sendRequest(param: Applicant): Promise<void> {
-    try {
-      const bodyFormData = new FormData();
-      bodyFormData.append("channel", param.portal);
-      bodyFormData.append("type", param.type);
-      bodyFormData.append("applied_for", param.applied_for);
-      bodyFormData.append("applied_date", param.applied_date);
-      bodyFormData.append("email", param.email);
-      bodyFormData.append("fullname", param.name);
-      bodyFormData.append("contact", JSON.stringify(param.phone));
-      bodyFormData.append("cv", fs.createReadStream(param.cv));
-
-      await axios({
-        method: "post",
-        url: this.APIDESTINATION,
-        data: bodyFormData,
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-
-      console.info("Success sending param", param);
-      await this.ensureLegacyDatabase();
-      await this.insertApplicant(param);
-      this.COLLECTED++;
-    } catch (error) {
-      console.info("Error sending param", param);
-      console.error("Error sending request with response:", (error as any).response.data);
-    }
   }
 
   /**
@@ -435,204 +377,4 @@ export class Jooble {
     console.log("DONE");
   }
 
-  /**
-   * Establishes a connection to the SQLite database.
-   * @returns {sqlite3.Database} The database connection.
-   */
-  async createDatabaseConnection(): Promise<sqlite3.Database> {
-    /**
-     * Create the database file if it does not exist.
-     */
-    if (!fs.existsSync(this.DB_PATH)) {
-      fs.mkdirSync(path.dirname(this.DB_PATH), { recursive: true });
-      fs.writeFileSync(this.DB_PATH, "");
-    }
-
-    /**
-     * Open the database connection. sqlite3 is required lazily so the sink
-     * path never loads the native binding (see AGENTS.md sharp edges).
-     */
-    const sqlite = require("sqlite3") as typeof import("sqlite3");
-    return new Promise((resolve, reject) => {
-      this.DB = new sqlite.Database(this.DB_PATH, (err) => {
-        if (err) {
-          console.error("Error opening database", err.message);
-          reject(err);
-        } else {
-          console.log("Connected to the database.");
-          resolve(this.DB!);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the applicants table in the database.
-   */
-  async createApplicantsTable() {
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS applicants (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT NOT NULL,
-        data TEXT NOT NULL
-      )
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.run(createTableQuery, (err) => {
-        if (err) {
-          console.error("Error creating applicants table", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Created applicants table."));
-        }
-      });
-    });
-  }
-
-  /**
-   * Checks if a table exists in the database.
-   */
-  async isTableExist(tableName: string): Promise<boolean> {
-    console.info(`Checking if table ${tableName} exists...`);
-    const query = `SELECT name FROM sqlite_master WHERE type='table' AND name='${tableName}'`;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get(query, (err, row) => {
-        if (err) {
-          console.error("Error checking table", err.message);
-          reject(err);
-        } else {
-          if (row !== undefined) {
-            console.log(`Table ${tableName} exists.`);
-          }
-          resolve(row !== undefined);
-        }
-      });
-    });
-  }
-
-  /**
-   * Creates the required tables in the database.
-   * The required tables are the job_vacancies and applicants tables.
-   */
-  async createRequiredTables() {
-    const isTableApplicantsExist = await this.isTableExist("applicants");
-    if (!isTableApplicantsExist) {
-      console.info("Creating applicants table...");
-      await this.createApplicantsTable();
-    }
-  }
-
-  /**
-   * Inserts a vacancy into the database.
-   * @param {string} position The position of the vacancy.
-   * @param {string} location The location of the vacancy.
-   * @param {string} pintarnyaJobId The Pintarnya job ID.
-   * @returns {Promise<void>} A promise that resolves when the vacancy is inserted.
-   * @example insertVacancy("Software Engineer", "Jakarta", "283020")
-   */
-  async insertJobVacancy(position: string, location: string, pintarnyaJobId: string, applicants: number): Promise<void> {
-    console.info(`Inserting vacancy ${position} into the database...`);
-
-    const insertQuery = `
-      INSERT INTO job_vacancies (position, location, pintarnya_job_id, applicants)
-      VALUES ('${position}', '${location}', '${pintarnyaJobId}', ${applicants})
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting vacancy", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted vacancy."));
-        }
-      });
-    });
-
-    // Dual-write: mirror the vacancy into the central Supabase database.
-    await ingestPortalVacancy({
-      source_portal: "jooble",
-      source_vacancy_id: pintarnyaJobId,
-      position,
-      location,
-      applicants_count: applicants,
-    });
-  }
-
-  /**
-   * Inserts an applicant into the database.
-   * @param {string} email The email of the applicant.
-   * @param {string} appliedForId The applied for ID.
-   * @returns {Promise<void>} A promise that resolves when the applicant is inserted.
-   * @example insertApplicant("johndoe@mail.app", "283020")
-   * @returns Promise<void>
-   */
-  async insertApplicant(data: Applicant): Promise<void> {
-    console.info(`Inserting applicant ${data.email} into the database...`);
-
-    const insertQuery = `
-      INSERT INTO applicants (email, data)
-      VALUES ('${data.email}', '${JSON.stringify(data)}')
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      this.DB!.run(insertQuery, (err) => {
-        if (err) {
-          console.error("Error inserting applicant", err.message);
-          reject(err);
-        } else {
-          resolve(console.log("Inserted applicant."));
-        }
-      });
-    });
-
-    // Dual-write: the local SQLite row above stays the fallback, this mirrors
-    // the applicant into the central Supabase database.
-    await ingestPortalApplicant(data as unknown as PortalApplicant, "jooble");
-  }
-
-  /**
-   * Gets an applicant by the email.
-   * @param {string} email The email of the applicant.
-   * @returns {Promise<ApplicantDB>} A promise that resolves with the applicant.
-   * @example getApplicantByEmail("johndoe@mail.app")
-   */
-  async getApplicantByEmail(email: string): Promise<ApplicantDB> {
-    console.info(`Getting applicant by email ${email}...`);
-
-    const selectQuery = `
-      SELECT * FROM applicants WHERE email = '${email}'
-    `;
-
-    return new Promise((resolve, reject) => {
-      this.DB!.get<ApplicantDB>(selectQuery, (err, row) => {
-        if (err) {
-          console.error("Error getting applicant", err.message);
-          reject(err);
-        } else {
-          console.log("Got applicant", row);
-          resolve(row);
-        }
-      });
-    });
-  }
-
-  /**
-   * Closes the database connection.
-   */
-  async closeDatabaseConnection() {
-    return new Promise<void>((resolve, reject) => {
-      this.DB!.close((err) => {
-        if (err) {
-          console.error("Error closing database", err.message);
-          reject(err);
-        } else {
-          console.log("Scraping completed.");
-          resolve();
-        }
-      });
-    });
-  }
 }

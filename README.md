@@ -305,9 +305,9 @@ Since the Supabase sink feature, scraped candidates are written straight into
 the scoring Supabase (`src/supabaseSink.ts`) instead of hopping through the
 legacy `api_destination` HTTP endpoint. Glints, jooble, seek, pintarnya and
 kitalulus (v1) are all wired to it through the shared slice in
-`src/portalSink.ts`; only kitalulus-v2 still uses `sendRequest` +
-`api_destination`, and each portal's legacy `sendRequest` path is kept but
-bypassed and marked deprecated.
+`src/portalSink.ts` and no longer define `sendRequest` or the legacy SQLite
+CRUD helpers at all; only kitalulus-v2 still uses `sendRequest` +
+`api_destination`.
 
 The sink reads its configuration from the environment (via dotenv). Copy
 `.env.sample` to `.env` and fill in:
