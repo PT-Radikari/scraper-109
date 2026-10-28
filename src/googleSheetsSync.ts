@@ -40,10 +40,9 @@ dotenv.config();
  * Inert by default: loadGoogleSheetsConfig() returns null without
  * GOOGLE_SHEETS_SPREADSHEET_ID plus one of the two credential shapes above in
  * env, same posture as every other optional integration in this repo
- * (loadDashboardConfig, central ingestion). A sync failure here must never
- * fail or alter the scraping cycle that triggered it — syncPortalResultsToSheets
- * swallows its own errors, matching src/central/portalBridge.ts's rule for
- * the central mirror.
+ * (loadDashboardConfig). A sync failure here must never fail or alter the
+ * scraping cycle that triggered it — syncPortalResultsToSheets swallows its
+ * own errors.
  */
 
 const DEFAULT_SCOPE = "https://www.googleapis.com/auth/spreadsheets";

@@ -66,25 +66,12 @@ describe("dockerfile node runtime", () => {
   it("overlays an exactly pinned Node version onto the base image", () => {
     const nodeVersion = dockerfileNodeVersion();
     // The overlay must land before dependency installation so native modules
-    // (sqlite3) build against the Node that will run them.
+    // build against the Node that will run them.
     const dockerfile = readDockerfile();
     expect(dockerfile.indexOf("ARG NODE_VERSION")).toBeLessThan(
       dockerfile.indexOf("npm ci"),
     );
     expect(semver.valid(nodeVersion)).not.toBeNull();
-  });
-
-  it("installs the C/C++ toolchain before npm ci so sqlite3 can compile", () => {
-    // The overlaid Node has no prebuilt sqlite3 binding, so `npm ci` falls
-    // back to node-gyp; without make/g++ present first, the build dies with
-    // "not found: make" — the post-PR#7 production build failure.
-    // Match RUN instructions, not comments that also mention these strings.
-    const dockerfile = readDockerfile();
-    const toolchain = dockerfile.search(/^RUN apt-get update[\s\S]*?build-essential/m);
-    const npmCi = dockerfile.search(/^RUN npm ci/m);
-    expect(toolchain).toBeGreaterThan(-1);
-    expect(npmCi).toBeGreaterThan(-1);
-    expect(toolchain).toBeLessThan(npmCi);
   });
 
   it("satisfies the engines.node range of every locked dependency", () => {

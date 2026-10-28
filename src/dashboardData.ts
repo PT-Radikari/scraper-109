@@ -186,8 +186,8 @@ function serviceHeaders(config: DashboardConfig, extra: Record<string, string> =
  * The portal column is not spelled the same everywhere: scrape_runs records
  * the server's command name ("kitalulus", see runPortalCycle in
  * src/server.ts) while the sink writes KitaLulus rows as "kita_lulus"
- * (src/kitalulus.ts / src/kitalulus-v2.ts). A dashboard filter must match
- * either spelling, or kitalulus reads as zero rows everywhere.
+ * (src/kitalulus.ts). A dashboard filter must match either spelling, or
+ * kitalulus reads as zero rows everywhere.
  */
 const PORTAL_ALIASES: Record<string, readonly string[]> = {
   kitalulus: ["kitalulus", "kita_lulus"],

@@ -31,17 +31,13 @@ RUN ARCH="$(dpkg --print-architecture)" && \
     rm /tmp/node.tar.gz && \
     [ "$(node --version)" = "v${NODE_VERSION}" ]
 
-# The overlaid Node has no prebuilt sqlite3 binding (its prebuild-install
-# resolves no binary for this runtime), so `npm ci` must compile sqlite3 from
-# source — build-essential provides the make/g++ toolchain the base image
-# lacks. Installed before `npm ci`, together with the runtime libraries
-# Playwright's browsers need, in one lean apt layer.
-#
-# sqlite3 here is the standalone CLI (src/viewer.ts shells out to it to query
-# the per-portal db/*.db files) — separate from the npm `sqlite3` package's
-# native binding that `npm ci` builds below.
+# Runtime libraries Playwright's browsers need, installed before `npm ci` in
+# one lean apt layer. The npm `sqlite3` package and the standalone sqlite3
+# CLI were removed with the rest of the SQLite-backed code (scraper-109); no
+# remaining runtime or test path needs either, so neither build-essential nor
+# the CLI is installed here any more.
 RUN apt-get update && \
-    apt-get -y install --no-install-recommends build-essential sqlite3 \
+    apt-get -y install --no-install-recommends \
     libnss3 libatk-bridge2.0-0 libdrm-dev libxkbcommon-dev \
     libgbm-dev libasound-dev libatspi2.0-0 libxshmfence-dev && \
     rm -rf /var/lib/apt/lists/*

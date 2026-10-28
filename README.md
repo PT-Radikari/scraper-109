@@ -59,7 +59,7 @@ Every scraper launches Playwright's bundled Chromium first and falls back to a s
 
 Scraper Retries
 
-Every portal run launched through `src/server.ts` (`kitalulus`, `kitalulus-v2-*`, `jooble`, `seek`, `glints`, `pintarnya`) is wrapped in an exponential-backoff retry loop: a failed run is retried from scratch — a fresh scraper instance, a fresh browser — after a growing delay, and the process exits with status 1 only once the attempt budget is spent.
+Every portal run launched through `src/server.ts` (`kitalulus`, `jooble`, `seek`, `glints`, `pintarnya`) is wrapped in an exponential-backoff retry loop: a failed run is retried from scratch — a fresh scraper instance, a fresh browser — after a growing delay, and the process exits with status 1 only once the attempt budget is spent.
 
 The policy is read from the environment (see `.env.sample`, defaults in `src/retry.ts`):
 ```
@@ -99,40 +99,6 @@ docker run -it --name playwright-runner-glints -v ./db:/app/db --rm playwright-r
 This command will create and run a Docker container named "playwright-runner-pintarnya" using the "playwright-runner:latest" image. It will also mount the "./db" directory from your local machine to the "/app/db" directory inside the container.
 
 This document provides a basic guide to setting up a Playwright project. The specific steps for building your project might vary depending on your project structure and configuration.
-Central Supabase Ingestion
-
-Scraped candidates, job vacancies and applications are mirrored into a central Supabase (Postgres) database, on top of the per-portal SQLite databases in `db/`.
-
-Dual-write: only kitalulus-v2 still takes this path — the sink-routed portals (glints, jooble, seek, pintarnya, kitalulus v1) write through the direct Supabase sink described below and are deliberately not mirrored here. A legacy scraper writes its local SQLite row first, then the entity is upserted centrally - vacancies and applications into the `scraper` schema, candidates into the talent table through the stream described below. If the central write fails the entity stays in the local outbox (`db/central.db`) and the background sync runner replays it, so nothing is lost during a Supabase outage.
-
-IDRKOS cross-check: every candidate is checked against the IDRKOS candidate pool before it lands centrally. A candidate already in IDRKOS is linked through `idrkos_staf_id` and marked `idrkos_verified`; a new candidate (scraped or onboarded through QR) is marked `scraped_new` and prioritised at the top of the talent listings (`scraper.talent_listing`). The check runs against the `cross_check_idrkos_candidate` Postgres function, falling back to the IDRKOS `/talents` API.
-
-Candidate stream: freshly scraped candidates are streamed into the central talent table (`public.talent_scraping`) continuously, rather than pushed one blocking request at a time. A candidate is written to the local outbox, handed to the stream and the scrape moves on; the stream sends a batch as soon as it holds `CENTRAL_TALENT_STREAM_MAX_BATCH` candidates or `CENTRAL_TALENT_STREAM_FLUSH_MS` has elapsed, and records the central outcome on the outbox row afterwards. A rejected batch therefore leaves the row `pending` for the sync runner exactly like a failed direct push. Set `CENTRAL_TALENT_STREAM_ENABLED=false` to upsert one candidate per request instead, and `CENTRAL_TALENT_SCHEMA` / `CENTRAL_TALENT_TABLE` to write somewhere other than `public.talent_scraping`.
-
-Setup (`.env.sample` points at the self-hosted Supabase at `http://rekrutmen-supabase-a4b9d1-122-49-230-39.sslip.io`; change `CENTRAL_SUPABASE_URL` for any other deployment):
-```
-cp .env.sample .env          # then fill in the Supabase and IDRKOS credentials
-psql "$CENTRAL_DATABASE_URL" -f migrations/0001_central_ingestion.sql
-psql "$CENTRAL_DATABASE_URL" -f migrations/0002_talent_scraping.sql
-```
-Migration 0001 also creates `scraper.idrkos_talents`, the view the cross-check reads. Point it at whichever table holds the IDRKOS candidate pool. Migration 0002 creates the `talent_scraping` table the candidate stream writes to.
-
-Running the background sync:
-```
-npm run central:sync         # long-lived runner, one pass every CENTRAL_SYNC_INTERVAL_MS
-npm run central:sync-once    # a single pass, for a cron entry
-npm run central:stats        # outbox counters (pending / synced / failed)
-```
-
-Run it alongside the scrapers in docker:
-```
-docker run -d --name playwright-runner-central-sync -v ./db:/app/db --env-file .env --rm playwright-runner:latest npm run start:central-sync
-```
-
-Or from cron, replacing the daemon:
-```
-*/5 * * * * cd /app && npm run start:central-sync-once >> /var/log/central-sync.log 2>&1
-```
 
 ---
 
@@ -181,10 +147,7 @@ Run a single scraper with ts-node (no build required):
 
 | Command | Source |
 |---|---|
-| `npm run dev:kitalulus` | Kitalulus (v1) |
-| `npm run dev:kitalulus-v2-vacancies` | Kitalulus v2 — vacancies |
-| `npm run dev:kitalulus-v2-applicants` | Kitalulus v2 — applicants |
-| `npm run dev:kitalulus-v2-process-applicants` | Kitalulus v2 — process applicants |
+| `npm run dev:kitalulus` | Kitalulus |
 | `npm run dev:jooble` | Jooble |
 | `npm run dev:seek` | Seek |
 | `npm run dev:pintarnya` | Pintarnya |
@@ -216,14 +179,9 @@ entrypoint (`xvfb:<portal>`) plus a `:once` variant for a single run:
 | `npm run xvfb:jooble` | `npm run xvfb:jooble:once` | Jooble |
 | `npm run xvfb:seek` | `npm run xvfb:seek:once` | Seek |
 | `npm run xvfb:pintarnya` | `npm run xvfb:pintarnya:once` | Pintarnya |
-| `npm run xvfb:kitalulus` | `npm run xvfb:kitalulus:once` | Kitalulus (v1, the live variant) |
-
-Kitalulus v2 keeps its staged one-shot commands:
+| `npm run xvfb:kitalulus` | `npm run xvfb:kitalulus:once` | Kitalulus |
 
 ```
-npm run xvfb:kitalulus-v2-vacancies
-npm run xvfb:kitalulus-v2-applicants
-npm run xvfb:kitalulus-v2-process-applicants
 npm run xvfb          # generic, no source selected
 ```
 
@@ -254,7 +212,7 @@ All `start:*` commands automatically use `xvfb-run` for headless compatibility.
 
 ### Docker Compose
 
-`docker-compose.yml` runs the production topology as five independent
+`docker-compose.yml` runs the production topology as four independent
 containers, all built from the same image (`dockerfile`; one `command:` per
 service picks the portal) so one portal crashing or restarting never touches
 the others:
@@ -264,7 +222,6 @@ the others:
 | `scraper-kitalulus` | `npm run start:kitalulus:continuous` | Playwright/xvfb |
 | `scraper-glints` | `npm run start:glints:continuous` | Playwright/xvfb |
 | `scraper-jobstreet` | `npm run start:seek:continuous` | Playwright/xvfb (the codebase calls this portal `seek`) |
-| `scraper-sync` | `npm run start:central-sync` | plain Node, no browser |
 | `scraper-viewer` | `npm run dev:viewer` | plain Node (ts-node), exposes port 4000 |
 
 Jooble and Pintarnya are intentionally not included (Jooble is
@@ -282,16 +239,14 @@ docker compose down
 - **Secrets**: only via `.env` through `env_file:` — never in the Dockerfile
   or committed anywhere. `docker compose config` validates even with no
   `.env` present (an empty/missing `.env` is treated as all-defaults).
-- **Volumes**: one named volume (`scraper-db`) shared by every service for
-  the per-portal SQLite checkpoint files under `db/` (`kitalulus.db`,
-  `glints.db`, `seek.db`, ...) — each portal only ever writes its own
-  filename; `scraper-viewer` no longer reads any of them (its SQLite-backed
-  applicant panel was removed — see AGENTS.md "Sharp edges"). Nothing in this
-  codebase opens a persistent Playwright browser profile, so there is no
-  separate browser-profile volume to manage.
-- **Healthchecks**: the browser-driving and sync services check that their
-  built server process is still running; `scraper-viewer` checks that its
-  HTTP port actually answers.
+- **Volumes**: one named volume (`scraper-db`) shared by every service,
+  mounted at `db/` — no service currently reads or writes through it (see
+  AGENTS.md "Sharp edges" and `db/README.md`). Nothing in this codebase opens
+  a persistent Playwright browser profile, so there is no separate
+  browser-profile volume to manage.
+- **Healthchecks**: the browser-driving services check that their built
+  server process is still running; `scraper-viewer` checks that its HTTP
+  port actually answers.
 - **`shm_size: 1gb`** is set on every service — Docker's default 64MB
   `/dev/shm` is too small for Chromium under Playwright and crashes the
   renderer ("Target crashed") the moment a real page loads.
@@ -311,10 +266,8 @@ Runs the Jest test suite.
 Since the Supabase sink feature, scraped candidates are written straight into
 the scoring Supabase (`src/supabaseSink.ts`) instead of hopping through the
 legacy `api_destination` HTTP endpoint. Glints, jooble, seek, pintarnya and
-kitalulus (v1) are all wired to it through the shared slice in
-`src/portalSink.ts` and no longer define `sendRequest` or the legacy SQLite
-CRUD helpers at all; only kitalulus-v2 still uses `sendRequest` +
-`api_destination`.
+kitalulus are all wired to it through the shared slice in `src/portalSink.ts`
+and no longer define `sendRequest` or the legacy SQLite CRUD helpers at all.
 
 The sink reads its configuration from the environment (via dotenv). Copy
 `.env.sample` to `.env` and fill in:
@@ -353,13 +306,6 @@ docker run -d --name scraper-jooble --restart always --env-file .env playwright-
 exponential retry policy above, so transient browser failures retry before the
 next scheduled cycle.
 
-The sink-routed portals no longer load SQLite on their direct Supabase path
-(it is required lazily, only if a deprecated legacy method runs). Kitalulus-v2
-and the legacy paths still use the native `sqlite3` dependency; if `node_modules/` was copied from a
-host with a different OS/architecture, reinstall dependencies for the current
-platform or run `npm rebuild sqlite3`. The Docker image installs its own
-dependencies during the build, so rebuilding locally cannot break the container.
-
 ## Google Sheet sync
 
 An optional mirror of the scrape results into a Google Sheet, alongside the Supabase sink above
@@ -371,8 +317,8 @@ or an authorized_user OAuth refresh token (inline JSON env vars or local files) 
 below.
 
 - **Trigger**: `src/server.ts`'s `runPortalCycle` calls it once, after a cycle that finished
-  successfully (never on a failed cycle, and a sync failure itself never fails the cycle — same
-  "must never abort a scraping run" rule the central-ingestion bridge follows). It is a mirror, not
+  successfully (never on a failed cycle, and a sync failure itself never fails the cycle — a
+  "must never abort a scraping run" rule). It is a mirror, not
   a new standing service: no extra container, no polling loop.
 - **Grain / tabs**: two tabs, `Vacancies` (one row per `scrape.portal_vacancies` row) and
   `Candidates` (one row per `scrape.portal_candidates` row, each carrying its most recent linked
