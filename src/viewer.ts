@@ -1,6 +1,6 @@
 import express from "express";
 import axios from "axios";
-import { execSync, spawn, spawnSync, ChildProcess } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 import path from "path";
 import { loadHidden, saveHidden, updateHidden, HiddenKind } from "./dashboardHidden";
 import {
@@ -56,7 +56,6 @@ app.post("/api/ai/*", async (req, res) => {
   }
 });
 
-const DB_DIR = path.join(__dirname, "../db");
 const ROOT_DIR = path.join(__dirname, "../");
 const TS_NODE = path.join(ROOT_DIR, "node_modules/.bin/ts-node");
 // Resolved from ROOT_DIR (not __dirname) so this keeps working when viewer.js
@@ -146,57 +145,6 @@ function disableSchedule() {
   scheduleEnabled = false;
   nextRunAt = null;
 }
-
-const DB_FILES = [
-  { name: "glints",    file: "glints.db" },
-  { name: "jooble",   file: "jooble.db" },
-  { name: "kitalulus",file: "kitalulus.db" },
-  { name: "pintarnya",file: "pintarnya.db" },
-  { name: "seek",     file: "seek.db" },
-];
-
-function runDB(dbFile: string, sql: string): void {
-  try {
-    const dbPath = path.join(DB_DIR, dbFile);
-    execSync(`sqlite3 "${dbPath}" "${sql}"`, { encoding: "utf-8" });
-  } catch {}
-}
-
-function queryDB(dbFile: string, sql: string): any[] {
-  try {
-    const dbPath = path.join(DB_DIR, dbFile);
-    const out = execSync(`sqlite3 -json "${dbPath}" "${sql}"`, { encoding: "utf-8" });
-    return out.trim() ? JSON.parse(out) : [];
-  } catch {
-    return [];
-  }
-}
-
-// Add scraped_at column to all DBs if not already present
-// Must use DEFAULT NULL — SQLite ALTER TABLE does not allow non-constant defaults like CURRENT_TIMESTAMP
-for (const src of DB_FILES) {
-  runDB(src.file, "ALTER TABLE applicants ADD COLUMN scraped_at DATETIME DEFAULT NULL");
-}
-
-function getAllApplicants() {
-  const results: any[] = [];
-  for (const src of DB_FILES) {
-    const rows = queryDB(src.file, "SELECT id, email, data, scraped_at FROM applicants");
-    for (const row of rows) {
-      try {
-        const data = typeof row.data === "string" ? JSON.parse(row.data) : {};
-        results.push({ _source: src.name, _id: row.id, _scraped_at: row.scraped_at ?? null, ...data });
-      } catch {
-        results.push({ _source: src.name, _id: row.id, _scraped_at: row.scraped_at ?? null, email: row.email });
-      }
-    }
-  }
-  return results;
-}
-
-app.get("/api/applicants", (_req, res) => {
-  res.json(getAllApplicants());
-});
 
 // Human-triggered Glints promotion ("Pindahkan ke Terhubung"). Glints serves an
 // applicant's email, phone and resume only after the application leaves
@@ -828,34 +776,10 @@ const HTML = `<!DOCTYPE html>
       <button class="btn btn-schedule" id="btn-schedule" onclick="toggleSchedule()">Auto (hourly): OFF</button>
       <span class="schedule-countdown" id="schedule-countdown"></span>
       <button class="btn" onclick="toggleAllLogs()">Toggle All Logs</button>
-      <button class="btn" onclick="reloadApplicants()">Refresh Table</button>
-    </div>
-  </div>
-
-  <div class="controls">
-    <input type="text" id="search" placeholder="Search name, email, position..." />
-    <select id="filter-source">
-      <option value="">All sources</option>
-      <option value="glints">Glints</option>
-      <option value="jooble">Jooble</option>
-      <option value="kitalulus">Kitalulus</option>
-      <option value="pintarnya">Pintarnya</option>
-      <option value="seek">Seek</option>
-    </select>
-    <span class="count" id="count"></span>
-  </div>
-
-  <div id="table-container"><p class="loading">Loading...</p></div>
-
-  <div class="modal-overlay" id="modal-overlay">
-    <div class="modal">
-      <button class="modal-close" id="modal-close">&#x2715;</button>
-      <div id="modal-body"></div>
     </div>
   </div>
 
   <script>
-    let allApplicants = [];
     let statusInterval = null;
     let schedule = { enabled: false, nextRunAt: null };
     let openLogs = new Set();
@@ -1108,147 +1032,6 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
-    // ── Applicants table ───────────────────────────────────────────
-
-    async function reloadApplicants() {
-      document.getElementById('table-container').innerHTML = '<p class="loading">Loading...</p>';
-      const res = await fetch('/api/applicants');
-      allApplicants = await res.json();
-      render();
-    }
-
-    function render() {
-      const search = document.getElementById('search').value.toLowerCase();
-      const source = document.getElementById('filter-source').value;
-
-      const filtered = allApplicants.filter(a => {
-        const matchSrc = !source || a._source === source;
-        const haystack = [a.name, a.email, a.applied_for, a._source].join(' ').toLowerCase();
-        return matchSrc && (!search || haystack.includes(search));
-      });
-
-      document.getElementById('count').textContent = filtered.length + ' applicant' + (filtered.length !== 1 ? 's' : '');
-
-      if (!filtered.length) {
-        document.getElementById('table-container').innerHTML = '<p style="color:#555;padding:20px 0">No results.</p>';
-        return;
-      }
-
-      const rows = filtered.map((a, i) => {
-        const phone = a.contact?.contact_number || a.whatapps?.contact_number || a.phone || '-';
-        return \`<tr>
-          <td>\${i + 1}</td>
-          <td><span class="tag">\${a._source || '-'}</span></td>
-          <td>\${esc(a.name || '-')}</td>
-          <td>\${esc(a.email || '-')}</td>
-          <td>\${esc(a.applied_for || '-')}</td>
-          <td>\${esc(a.applied_date || '-')}</td>
-          <td>\${esc(a._scraped_at ? a._scraped_at.slice(0,10) : '-')}</td>
-          <td>\${esc(phone)}</td>
-          <td>\${esc(a.location || '-')}</td>
-          <td><button class="detail-btn" onclick="showDetail(\${allApplicants.indexOf(a)})">View</button></td>
-        </tr>\`;
-      }).join('');
-
-      document.getElementById('table-container').innerHTML = \`
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>Source</th><th>Name</th><th>Email</th>
-              <th>Applied For</th><th>Applied Date</th><th>Scraped</th><th>Phone</th><th>Location</th><th></th>
-            </tr>
-          </thead>
-          <tbody>\${rows}</tbody>
-        </table>
-      \`;
-    }
-
-    function showDetail(idx) {
-      const a = allApplicants[idx];
-      const phone = a.contact?.contact_number || a.whatapps?.contact_number || a.phone || '-';
-      const skills = Array.isArray(a.skill) ? a.skill : (Array.isArray(a.skills) ? a.skills : []);
-      const experiences = Array.isArray(a.work_experience) ? a.work_experience : (Array.isArray(a.work_experiences) ? a.work_experiences : []);
-      const education = Array.isArray(a.education) ? a.education : (Array.isArray(a.educations) ? a.educations : []);
-      const cvLink = a.cv_url || storageLinkFromPath(a.cv);
-
-      let html = \`<h2>\${esc(a.name || 'Unknown')}</h2>\`;
-
-      html += \`<div class="section">
-        <div class="section-title">Basic Info</div>
-        \${field('Source', a._source)}
-        \${field('Applied For', a.applied_for)}
-        \${field('Applied Date', a.applied_date)}
-        \${field('Scraped At', a._scraped_at ? a._scraped_at.replace('T', ' ').slice(0,19) : null)}
-        \${field('Email', a.email)}
-        \${field('Phone', phone)}
-        \${field('Location', a.location)}
-        \${field('Gender', a.gender)}
-        \${field('Date of Birth', a.date_of_birth)}
-        \${field('Salary Expectation', a.salary_expectation ? 'Rp ' + Number(a.salary_expectation).toLocaleString() : null)}
-      </div>\`;
-
-      if (a.summary) {
-        html += \`<div class="section">
-          <div class="section-title">Summary</div>
-          <p style="white-space:pre-wrap">\${esc(a.summary)}</p>
-        </div>\`;
-      }
-
-      if (skills.length) {
-        html += \`<div class="section">
-          <div class="section-title">Skills</div>
-          <div class="skills">\${skills.map(s => \`<span class="tag">\${esc(s)}</span>\`).join('')}</div>
-        </div>\`;
-      }
-
-      if (experiences.length) {
-        html += \`<div class="section">
-          <div class="section-title">Work Experience</div>
-          \${experiences.map(e => \`<div class="exp-item">
-            <strong>\${esc(e.position || '-')} — \${esc(e.organization || '-')}</strong>
-            <div style="color:#555;font-size:13px">\${esc(e.period_from || '')} → \${esc(e.period_to || '')}</div>
-            \${e.job_desc ? \`<p style="margin-top:6px;white-space:pre-wrap;font-size:13px">\${esc(e.job_desc)}</p>\` : ''}
-          </div>\`).join('')}
-        </div>\`;
-      }
-
-      if (education.length) {
-        html += \`<div class="section">
-          <div class="section-title">Education</div>
-          \${education.map(e => \`<div class="edu-item">
-            <strong>\${esc(e.institution || '-')}</strong>
-            <div style="color:#555;font-size:13px">\${esc(e.education || '')} · \${esc(e.period_start_year || '')}–\${esc(e.period_end_year || '')}</div>
-          </div>\`).join('')}
-        </div>\`;
-      }
-
-      if (a.url_profile || a.page_url) {
-        html += \`<div class="section">
-          <div class="section-title">Links</div>
-          \${a.url_profile ? \`<div><a href="\${esc(a.url_profile)}" target="_blank">Profile Page</a></div>\` : ''}
-          \${a.page_url ? \`<div><a href="\${esc(a.page_url)}" target="_blank">Application Page</a></div>\` : ''}
-        </div>\`;
-      }
-
-      if (cvLink || a.cv_filename || a.cv_text) {
-        html += \`<div class="section">
-          <div class="section-title">CV</div>
-          \${cvLink ? \`<div><a href="\${esc(cvLink)}" target="_blank">Open Saved CV PDF</a></div>\` : ''}
-          \${a.cv_filename ? field('Filename', a.cv_filename) : ''}
-          \${a.cv_ocr_method ? field('Text Extracted Via', a.cv_ocr_method) : ''}
-          \${a.cv_text ? \`<div style="margin-top:8px"><div style="color:#555;font-size:12px;margin-bottom:6px">Extracted Text</div><pre style="white-space:pre-wrap;font-family:inherit;font-size:13px;background:#f8f8f8;padding:12px;border:1px solid #eee;max-height:320px;overflow:auto">\${esc(a.cv_text)}</pre></div>\` : '<div style="color:#666">No extracted CV text.</div>'}
-        </div>\`;
-      }
-
-      document.getElementById('modal-body').innerHTML = html;
-      document.getElementById('modal-overlay').classList.add('open');
-    }
-
-    function field(label, value) {
-      if (!value) return '';
-      return \`<div class="field"><span class="field-label">\${label}</span><span class="field-value">\${esc(String(value))}</span></div>\`;
-    }
-
     function esc(str) {
       return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
@@ -1256,14 +1039,6 @@ const HTML = `<!DOCTYPE html>
     function safeHref(url) {
       if (!/^https?:\\/\\//i.test(String(url || ''))) return '';
       return esc(url);
-    }
-
-    function storageLinkFromPath(filePath) {
-      if (!filePath) return '';
-      const normalized = String(filePath).replace(/\\\\/g, '/');
-      const parts = normalized.split('/');
-      const filename = parts[parts.length - 1];
-      return filename ? '/storage/' + encodeURIComponent(filename) : '';
     }
 
     // ── Portal dashboard (scrape.* via /api/dashboard/*) ─────────────
@@ -1607,19 +1382,8 @@ const HTML = `<!DOCTYPE html>
     setInterval(pollPostings, 20000);
     setInterval(pollCandidates, 20000);
 
-    document.getElementById('modal-close').addEventListener('click', () => {
-      document.getElementById('modal-overlay').classList.remove('open');
-    });
-    document.getElementById('modal-overlay').addEventListener('click', (e) => {
-      if (e.target === e.currentTarget) document.getElementById('modal-overlay').classList.remove('open');
-    });
-
-    document.getElementById('search').addEventListener('input', render);
-    document.getElementById('filter-source').addEventListener('change', render);
-
     // Init
     buildScraperRows(null);
-    reloadApplicants();
     pollStatus();
     fetchSchedule();
     setInterval(updateScheduleUI, 30000);

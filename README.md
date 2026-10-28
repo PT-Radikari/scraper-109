@@ -271,7 +271,8 @@ docker compose down
 - **Volumes**: one named volume (`scraper-db`) shared by every service for
   the per-portal SQLite checkpoint files under `db/` (`kitalulus.db`,
   `glints.db`, `seek.db`, ...) — each portal only ever writes its own
-  filename, and `scraper-viewer` needs to read all of them. Nothing in this
+  filename; `scraper-viewer` no longer reads any of them (its SQLite-backed
+  applicant panel was removed — see AGENTS.md "Sharp edges"). Nothing in this
   codebase opens a persistent Playwright browser profile, so there is no
   separate browser-profile volume to manage.
 - **Healthchecks**: the browser-driving and sync services check that their
