@@ -615,7 +615,7 @@ describe("syncPortalResultsToSheets", () => {
     );
   });
 
-  it("masks PII and sends presence-only CV/photo flags end to end", async () => {
+  it("sends email/phone unmasked, masks date_of_birth/location, and sends presence-only CV/photo flags end to end", async () => {
     (getVacanciesForSync as jest.Mock).mockResolvedValue([
       {
         portal: "glints",
@@ -692,10 +692,11 @@ describe("syncPortalResultsToSheets", () => {
     expect(candidateRow[0]).toBe("glints");
     expect(candidateRow[1]).toBe("cand-1");
     expect(candidateRow[2]).toBe("Ada Lovelace");
-    // PII is masked, never sent verbatim.
-    expect(candidateRow[3]).not.toBe("ada.lovelace@example.com");
-    expect(candidateRow[3]).toContain("@example.com");
-    expect(candidateRow[4]).not.toBe("+6281234567890");
+    // Email and phone are sent unmasked (captain's decision 2026-10-28,
+    // overriding the 2026-10-27 masking call for these two fields only).
+    expect(candidateRow[3]).toBe("ada.lovelace@example.com");
+    expect(candidateRow[4]).toBe("+6281234567890");
+    // date_of_birth and location are still masked.
     expect(candidateRow[5]).toBe("1998-**-**");
     expect(candidateRow[6]).not.toContain("Selatan");
     // CV/photo are presence flags only, never the object key or a link.
