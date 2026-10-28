@@ -422,7 +422,7 @@ describe("upsertRows", () => {
       "Candidates",
       ["portal", "portal_candidate_id"],
       [["glints", "cand-1"]],
-      [{ 1: "https://employers.glints.id/manage-candidates?jid=1" }],
+      [{ 1: { url: "https://employers.glints.id/manage-candidates?jid=1" } }],
     );
 
     expect(batchUpdates).toHaveLength(2);
@@ -454,7 +454,7 @@ describe("upsertRows", () => {
       "Candidates",
       ["portal", "portal_candidate_id"],
       [["glints", "cand-9"]],
-      [{ 1: "https://employers.glints.id/manage-candidates?jid=9" }],
+      [{ 1: { url: "https://employers.glints.id/manage-candidates?jid=9" } }],
     );
 
     expect(batchUpdates).toHaveLength(1);
@@ -484,7 +484,7 @@ describe("upsertRows", () => {
       "Candidates",
       ["portal", "portal_candidate_id"],
       [["glints", "cand-9"]],
-      [{ 1: "https://employers.glints.id/manage-candidates?jid=9" }],
+      [{ 1: { url: "https://employers.glints.id/manage-candidates?jid=9" } }],
     );
 
     expect(batchUpdates).toHaveLength(0);
@@ -505,7 +505,7 @@ describe("upsertRows", () => {
       "Candidates",
       ["portal", "portal_candidate_id"],
       [["glints", "cand-1"]],
-      [{ 1: "glints/202610/not-a-url.pdf" }],
+      [{ 1: { url: "glints/202610/not-a-url.pdf" } }],
     );
 
     expect(batchUpdates).toHaveLength(1); // only the plain RAW write — no second USER_ENTERED pass
@@ -1041,7 +1041,7 @@ describe("portal_candidate_id and cv_link as real hyperlinks, not plain text", (
       .flatMap((w) => (w.data as { data: Array<{ range: string; values: string[][] }> }).data)
       .find((d) => d.range === "Candidates!M2");
     expect(cvLinkWrite?.values[0][0]).toBe(
-      '=HYPERLINK("https://scrapview.example.com/cv/glints/9","https://scrapview.example.com/cv/glints/9")',
+      '=HYPERLINK("https://scrapview.example.com/cv/glints/9","Open CV")',
     );
   });
 });

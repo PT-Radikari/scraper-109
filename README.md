@@ -412,7 +412,8 @@ below.
   already-visited portal URL (a per-candidate deep link for Glints; a shared vacancy/list page for
   portals that never navigate to a candidate-specific route, which is still a real, working,
   non-fabricated link, just not candidate-granular) — never fabricated when absent, in which case
-  the cell stays the bare id as before.
+  the cell stays the bare id as before. `cv_link`'s display text is the fixed label `"Open CV"`
+  (captain's decision 2026-10-28) rather than the raw link text, via `RowLinkCell.text`.
 - **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, decided by the captain 2026-10-28 — **"scrapview_link"
   is the default (ON)**): appends a 13th `cv_link` column holding a stable, clickable link to the
   viewer's own `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a

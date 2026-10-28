@@ -428,30 +428,36 @@ export async function ensureTab(config: GoogleSheetsConfig, title: string, heade
   }
 }
 
+/** One linked cell for `upsertRows`' hyperlink pass: `text` overrides the cell's own plain value as the HYPERLINK's display text (e.g. "Open CV" instead of the raw link); omitted, it defaults to that value (e.g. the bare id for portal_candidate_id). */
+export interface RowLinkCell {
+  url: string;
+  text?: string;
+}
+
 /**
  * Upserts rows into a tab keyed by its first two columns (portal, <portal-native id>):
  * a key already on the sheet gets its row updated in place; a new key is
  * appended. Never produces a duplicate-appended line for an existing key —
  * the "idempotent, not append-only" requirement this sync was built to.
  *
- * `rowLinks[i]`, when given, maps a 0-based column index to the URL that
- * row's cell should become a clickable link to — e.g. `{1: profileUrl}` for
- * portal_candidate_id. The plain-text write above always carries the exact
- * same value it always has (so every other column's formatting, and a
+ * `rowLinks[i]`, when given, maps a 0-based column index to the cell that
+ * row's cell should become a clickable link to — e.g. `{1: {url: profileUrl}}`
+ * for portal_candidate_id. The plain-text write above always carries the
+ * exact same value it always has (so every other column's formatting, and a
  * caller with no `rowLinks`, is unaffected); a second, narrower
  * `USER_ENTERED` pass then replaces just those cells with a
- * `HYPERLINK(url, existing text)` formula, once each row's final row number
- * is known (immediately for an updated row, or parsed from the append
- * response's `updatedRange` for a brand-new one — a response that doesn't
- * carry one, e.g. a test double, just means that row's links are skipped,
- * never a thrown error over a cosmetic enrichment).
+ * `HYPERLINK(url, text)` formula, once each row's final row number is known
+ * (immediately for an updated row, or parsed from the append response's
+ * `updatedRange` for a brand-new one — a response that doesn't carry one,
+ * e.g. a test double, just means that row's links are skipped, never a
+ * thrown error over a cosmetic enrichment).
  */
 export async function upsertRows(
   config: GoogleSheetsConfig,
   title: string,
   header: string[],
   rows: string[][],
-  rowLinks?: Array<Record<number, string> | undefined>,
+  rowLinks?: Array<Record<number, RowLinkCell> | undefined>,
 ): Promise<void> {
   if (rows.length === 0) return;
   const lastCol = colLetter(header.length);
@@ -509,11 +515,11 @@ export async function upsertRows(
     const links = rowLinks[i];
     const rowNumber = rowNumbers[i];
     if (!links || !rowNumber) continue;
-    for (const [colKey, url] of Object.entries(links)) {
+    for (const [colKey, cell] of Object.entries(links)) {
       const col = Number(colKey);
-      const text = rows[i][col];
-      if (!text || !isHttpUrl(url)) continue;
-      const formula = `=HYPERLINK("${escapeFormulaString(url)}","${escapeFormulaString(text)}")`;
+      const text = cell.text ?? rows[i][col];
+      if (!text || !isHttpUrl(cell.url)) continue;
+      const formula = `=HYPERLINK("${escapeFormulaString(cell.url)}","${escapeFormulaString(text)}")`;
       linkData.push({ range: `${title}!${colLetter(col + 1)}${rowNumber}`, values: [[formula]] });
     }
   }
@@ -630,10 +636,10 @@ async function resolveCvLink(c: CandidateSyncRow, mode: CvLinkMode, dashboardCon
   }
 }
 
-/** Plain values plus a 0-based-column -> URL map for `upsertRows`' hyperlink pass (never includes a column whose own value isn't a real http(s) URL already, so a storage key or a blank cell is never wrapped). */
+/** Plain values plus a 0-based-column -> link map for `upsertRows`' hyperlink pass (never includes a column whose own value isn't a real http(s) URL already, so a storage key or a blank cell is never wrapped). */
 interface CandidateRowResult {
   values: string[];
-  links: Record<number, string>;
+  links: Record<number, RowLinkCell>;
 }
 
 async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<CandidateRowResult> {
@@ -651,16 +657,18 @@ async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConf
     presenceFlag(c.hasPhoto),
     formatWIB(c.lastSeenAt),
   ];
-  const links: Record<number, string> = {};
+  const links: Record<number, RowLinkCell> = {};
   // portal_candidate_id -> the candidate's real, already-visited portal URL.
   // Never fabricated: a portal/row with no captured profileUrl just keeps
   // the bare id as plain text, same as before this column could ever link.
-  if (values[1] && isHttpUrl(c.profileUrl)) links[1] = c.profileUrl as string;
+  if (values[1] && isHttpUrl(c.profileUrl)) links[1] = { url: c.profileUrl as string };
 
   if (mode === "off") return { values, links };
   const cvLink = await resolveCvLink(c, mode, dashboardConfig);
   values.push(cvLink);
-  if (isHttpUrl(cvLink)) links[values.length - 1] = cvLink;
+  // Labeled "Open CV" (captain's decision 2026-10-28) rather than the raw
+  // URL — the link itself still resolves through to the PDF either way.
+  if (isHttpUrl(cvLink)) links[values.length - 1] = { url: cvLink, text: "Open CV" };
   return { values, links };
 }
 
