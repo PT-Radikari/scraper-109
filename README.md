@@ -368,8 +368,10 @@ below.
   "must never abort a scraping run" rule the central-ingestion bridge follows). It is a mirror, not
   a new standing service: no extra container, no polling loop.
 - **Grain / tabs**: two tabs, `Vacancies` (one row per `scrape.portal_vacancies` row) and
-  `Candidates` (one row per `scrape.portal_candidates` row, each carrying its first linked
-  application's `applied_for`/`applied_date`). Each sync call re-pages through every row the
+  `Candidates` (one row per `scrape.portal_candidates` row, each carrying its most recent linked
+  application's `applied_for`/`applied_date` — the embedded `portal_applications` select is ordered
+  `applied_date.desc`, so a candidate with several applications deterministically shows the newest
+  one). Each sync call re-pages through every row the
   triggering portal currently has in Supabase (not just what changed) and **upserts in place**,
   keyed by the sheet row's first two columns — `(portal, portal_vacancy_id)` for Vacancies,
   `(portal, portal_candidate_id)` for Candidates — so a re-scrape updates its existing line and

@@ -329,6 +329,37 @@ describe("getCandidatesForSync", () => {
       },
     ]);
   });
+
+  it("requests the embedded applications ordered newest-first, so PostgREST's response is deterministic", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValueOnce({ data: [] } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    await getCandidatesForSync(config, "glints");
+    const params = mockedAxios.get.mock.calls[0][1]?.params as Record<string, string>;
+    expect(params["portal_applications.order"]).toBe("applied_date.desc");
+  });
+
+  it("surfaces the newest application when PostgREST returns several for one candidate", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValueOnce({
+      data: [
+        {
+          id: 42, portal: "glints", portal_candidate_id: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
+          phone: "081234567890", date_of_birth: "1998-05-12", location: "Jakarta", cv_object_key: "x.pdf",
+          photo_object_key: null, last_seen_at: "t",
+          // Ordered newest-first the way the "portal_applications.order": "applied_date.desc" param makes PostgREST return them.
+          portal_applications: [
+            { applied_for: "Senior Analyst", applied_date: "2026-10-15" },
+            { applied_for: "Analyst", applied_date: "2026-10-01" },
+          ],
+        },
+      ],
+    } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    const rows = await getCandidatesForSync(config, "glints");
+    expect(rows[0].appliedFor).toBe("Senior Analyst");
+    expect(rows[0].appliedDate).toBe("2026-10-15");
+  });
 });
 
 describe("getSignedUrl", () => {
