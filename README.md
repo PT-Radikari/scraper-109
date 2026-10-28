@@ -388,14 +388,15 @@ below.
   filter (Sheets API `setBasicFilter`) over the header+data range is (re-)applied on every sync too,
   so it stays in place even if someone removes it by hand; a filter failure is logged and otherwise
   ignored — it must never block the actual data write.
-- **Fields and PII handling** (decided 2026-10-27): `email`, `phone`, `date_of_birth` and
-  `location` are masked before they ever leave the process (`maskEmail`/`maskPhone` from
-  `src/dashboardData.ts`; `maskDateOfBirth`/`maskLocation` in `src/googleSheetsSync.ts`) — a sheet
-  is far more exportable/forwardable than the authenticated dashboard, so it never gets the
-  dashboard's unmasked view. `cv_object_key`/`photo_object_key` never appear as links or raw keys,
-  only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
-  isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
-  `src/googleSheetsSync.ts` for the exact column list.
+- **Fields and PII handling**: `date_of_birth` and `location` are masked before they ever leave
+  the process (`maskDateOfBirth`/`maskLocation` in `src/googleSheetsSync.ts`). `email` and `phone`
+  were masked too under the original 2026-10-27 decision, but the captain explicitly overrode that
+  for these two fields on 2026-10-28 ("don't censor it") — the sheet now carries them exactly as
+  Scrapview's own dashboard does; `src/dashboardData.ts`'s `maskEmail`/`maskPhone` remain used only
+  by the dashboard API's own masked view, never by the sheet sync. `cv_object_key`/`photo_object_key`
+  never appear as links or raw keys, only as a `"captured"`/`"none"` presence flag — a signed
+  CV/photo URL expires in 10 minutes and isn't safe to paste into a cell. See
+  `Vacancies`/`Candidates` headers in `src/googleSheetsSync.ts` for the exact column list.
 - **Timestamps in WIB** (decided 2026-10-28): `last_seen_at` (both tabs) and `applied_date`
   (Candidates) are formatted `"YYYY-MM-DD HH:mm:ss WIB"` (Asia/Jakarta, UTC+7, no DST) via the
   shared `formatWIB` (`src/wib.ts`) before they ever reach the cell — display-only, Supabase's own
