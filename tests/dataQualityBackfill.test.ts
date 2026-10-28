@@ -1,5 +1,10 @@
 import axios from "axios";
-import { clearNonDocumentCvArtifacts, linkOrphanApplications, runDataQualityBackfill } from "../src/dataQualityBackfill";
+import {
+  clearNonDocumentCvArtifacts,
+  linkOrphanApplications,
+  fixPollutedVacancyTitles,
+  runDataQualityBackfill,
+} from "../src/dataQualityBackfill";
 import { DashboardConfig } from "../src/dashboardData";
 
 jest.mock("axios");
@@ -167,13 +172,110 @@ describe("linkOrphanApplications", () => {
   });
 });
 
+describe("fixPollutedVacancyTitles", () => {
+  it("recovers the real title from a sibling application and corrects both the vacancy and every polluted application", async () => {
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/rest/v1/portal_vacancies")) {
+        return Promise.resolve({ data: [{ id: 10, title: "Chat" }] } as never);
+      }
+      if (url.includes("/rest/v1/portal_applications")) {
+        return Promise.resolve({
+          data: [
+            { candidate_id: 1, applied_for: "Chat" },
+            { candidate_id: 2, applied_for: "Chat" },
+            { candidate_id: 3, applied_for: "Contact Center Agent" },
+          ],
+        } as never);
+      }
+      return Promise.resolve({ data: [] } as never);
+    });
+    const patchSpy = mockedAxios.patch.mockResolvedValue({ data: {} } as never);
+
+    const dryReport = await fixPollutedVacancyTitles(CONFIG);
+    expect(dryReport.corrected).toEqual([
+      { vacancyId: 10, portal: "kita_lulus", oldTitle: "Chat", newTitle: "Contact Center Agent", applicationsCorrected: 2 },
+    ]);
+    expect(patchSpy).not.toHaveBeenCalled();
+
+    const appliedReport = await fixPollutedVacancyTitles(CONFIG, { dryRun: false });
+    expect(appliedReport.corrected).toHaveLength(1);
+    expect(patchSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/rest/v1/portal_vacancies?id=eq.10"),
+      { title: "Contact Center Agent" },
+      expect.anything(),
+    );
+    expect(patchSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/rest/v1/portal_applications?vacancy_id=eq.10&candidate_id=eq.1"),
+      { applied_for: "Contact Center Agent" },
+      expect.anything(),
+    );
+    expect(patchSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/rest/v1/portal_applications?vacancy_id=eq.10&candidate_id=eq.2"),
+      { applied_for: "Contact Center Agent" },
+      expect.anything(),
+    );
+    // The already-correct application is never touched.
+    expect(patchSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("candidate_id=eq.3"),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("reports unresolved, never fabricating a title, when every linked application is equally polluted", async () => {
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/rest/v1/portal_vacancies")) {
+        return Promise.resolve({ data: [{ id: 11, title: "Chat" }] } as never);
+      }
+      if (url.includes("/rest/v1/portal_applications")) {
+        return Promise.resolve({
+          data: [
+            { candidate_id: 4, applied_for: "Chat" },
+            { candidate_id: 5, applied_for: "Chat" },
+          ],
+        } as never);
+      }
+      return Promise.resolve({ data: [] } as never);
+    });
+
+    const report = await fixPollutedVacancyTitles(CONFIG, { dryRun: false });
+
+    expect(report.corrected).toEqual([]);
+    expect(report.unresolved).toEqual([
+      {
+        vacancyId: 11,
+        portal: "kita_lulus",
+        title: "Chat",
+        reason: "no sibling application under this vacancy carries a real title to recover from",
+      },
+    ]);
+    expect(mockedAxios.patch).not.toHaveBeenCalled();
+  });
+
+  it("never inspects a vacancy whose title isn't a known noise token", async () => {
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/rest/v1/portal_vacancies")) {
+        return Promise.resolve({ data: [{ id: 12, title: "Warehouse Staff" }] } as never);
+      }
+      return Promise.resolve({ data: [] } as never);
+    });
+
+    const report = await fixPollutedVacancyTitles(CONFIG);
+
+    expect(report.inspected).toBe(0);
+    expect(report.corrected).toEqual([]);
+    expect(report.unresolved).toEqual([]);
+  });
+});
+
 describe("runDataQualityBackfill", () => {
-  it("runs both repairs and combines their reports", async () => {
+  it("runs all three repairs and combines their reports", async () => {
     mockedAxios.get.mockResolvedValue({ data: [] } as never);
 
     const report = await runDataQualityBackfill(CONFIG);
 
     expect(report.cvArtifacts).toEqual({ inspected: 0, suspects: 0, cleared: [], dryRun: true });
     expect(report.orphanApplications).toEqual({ inspected: 0, linked: [], unresolved: [], dryRun: true });
+    expect(report.pollutedTitles).toEqual({ inspected: 0, corrected: [], unresolved: [], dryRun: true });
   });
 });

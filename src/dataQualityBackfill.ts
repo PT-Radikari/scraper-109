@@ -3,10 +3,11 @@ import { DashboardConfig } from "./dashboardData";
 
 /**
  * One-shot, manually-invoked data-quality repair for scrape.portal_candidates
- * / scrape.portal_applications — never part of the scraping pipeline or the
- * continuous loop, same posture as backfillAllPortalsToSheets
- * (src/googleSheetsSync.ts). Two independent repairs, both read-mostly and
- * both defaulting to a dry run that only reports what would change:
+ * / scrape.portal_applications / scrape.portal_vacancies — never part of the
+ * scraping pipeline or the continuous loop, same posture as
+ * backfillAllPortalsToSheets (src/googleSheetsSync.ts). Three independent
+ * repairs, all read-mostly and all defaulting to a dry run that only reports
+ * what would change:
  *
  *  - clearNonDocumentCvArtifacts: a candidate's cv_object_key is supposed to
  *    always point at a real PDF/DOC/DOCX (every live upload path sniffs the
@@ -30,10 +31,19 @@ import { DashboardConfig } from "./dashboardData";
  *    title match already exists in portal_vacancies for that portal —
  *    never invented, and left unresolved (reported, not guessed) otherwise.
  *
- * Needs SCORING_SUPABASE_SERVICE_KEY: both repairs write directly (bypassing
- * RLS) the same way getSignedUrl already does for the one existing
- * service-only read, since the anon grants deliberately don't cover
- * nulling-out an existing cv_object_key or back-dated application inserts.
+ *  - fixPollutedVacancyTitles: a kita_lulus vacancy card's "Chat" quick-action
+ *    button text could land in the card's innerText before the real title,
+ *    getting stored as both portal_vacancies.title and every then-current
+ *    application's applied_for. Recovers the real title only from a sibling
+ *    application under the same vacancy_id that isn't itself polluted;
+ *    a vacancy where every linked application is equally polluted is left
+ *    alone and reported, never guessed at.
+ *
+ * Needs SCORING_SUPABASE_SERVICE_KEY: all three repairs write directly
+ * (bypassing RLS) the same way getSignedUrl already does for the one
+ * existing service-only read, since the anon grants deliberately don't
+ * cover nulling-out an existing cv_object_key, back-dated application
+ * inserts, or overwriting a write-once vacancy title.
  */
 
 const PAGE_SIZE = 1000;
@@ -235,18 +245,127 @@ export async function linkOrphanApplications(
   return { inspected: orphans.length, linked, unresolved, dryRun };
 }
 
+/**
+ * Vacancy-card noise tokens that can end up as a stored title/applied_for
+ * instead of the real job title — the same set src/kitalulus.ts's
+ * KitaLulus.VACANCY_CARD_NOISE now filters out of a *fresh* scrape (see
+ * pickVacancyCardFields). Duplicated here, not imported, so this read-mostly
+ * repair script never pulls in kitalulus.ts's Playwright dependency; keep
+ * the two sets in sync if a new noise token is ever found live.
+ */
+const POLLUTED_TITLE_TOKENS = new Set(["Chat", "Pesan", "Diposting Ulang", "Dibuka", "Ditutup"]);
+
+export interface CorrectedPollutedTitle {
+  vacancyId: number;
+  portal: string;
+  oldTitle: string;
+  newTitle: string;
+  applicationsCorrected: number;
+}
+
+export interface UnresolvablePollutedTitle {
+  vacancyId: number;
+  portal: string;
+  title: string;
+  reason: string;
+}
+
+export interface PollutedTitleReport {
+  /** Vacancies whose stored title is itself a noise token. */
+  inspected: number;
+  corrected: CorrectedPollutedTitle[];
+  unresolved: UnresolvablePollutedTitle[];
+  dryRun: boolean;
+}
+
+/**
+ * Corrects a vacancy whose stored title is a noise token (e.g. the literal
+ * "Chat", from a quick-action button's text landing in the card's innerText
+ * before kitalulus.ts's extractOpenVacancies started filtering it — see
+ * pickVacancyCardFields) by recovering the real title from any *other*
+ * application already linked to that same vacancy_id whose own applied_for
+ * isn't itself a noise token. portal_vacancies.title is normally write-once
+ * (see AGENTS.md); this is a deliberate one-time administrative correction
+ * via the service key, bypassing that normal upsert path entirely — never
+ * introducing unverified content, only ever replacing a confirmed-polluted
+ * value with one taken from the live data itself. A vacancy with no such
+ * sibling (every linked application is equally polluted, or there are none)
+ * is left untouched and reported in `unresolved`, never fabricated.
+ */
+export async function fixPollutedVacancyTitles(
+  config: DashboardConfig,
+  opts: { portal?: string; dryRun?: boolean } = {},
+): Promise<PollutedTitleReport> {
+  const dryRun = opts.dryRun ?? true;
+  const portal = opts.portal ?? "kita_lulus";
+
+  const vacancies = await pageAll<{ id: number; title: string | null }>(config, "portal_vacancies", {
+    select: "id,title",
+    portal: `eq.${portal}`,
+  });
+  const polluted = vacancies.filter((v) => POLLUTED_TITLE_TOKENS.has((v.title ?? "").trim()));
+
+  const corrected: CorrectedPollutedTitle[] = [];
+  const unresolved: UnresolvablePollutedTitle[] = [];
+
+  for (const vacancy of polluted) {
+    const oldTitle = (vacancy.title ?? "").trim();
+    const applications = await pageAll<{ candidate_id: number; applied_for: string | null }>(
+      config,
+      "portal_applications",
+      { select: "candidate_id,applied_for", vacancy_id: `eq.${vacancy.id}` },
+    );
+    const newTitle = applications
+      .map((a) => (a.applied_for ?? "").trim())
+      .find((t) => t && !POLLUTED_TITLE_TOKENS.has(t));
+
+    if (!newTitle) {
+      unresolved.push({
+        vacancyId: vacancy.id,
+        portal,
+        title: oldTitle,
+        reason: "no sibling application under this vacancy carries a real title to recover from",
+      });
+      continue;
+    }
+
+    const pollutedApplications = applications.filter((a) => (a.applied_for ?? "").trim() === oldTitle);
+
+    if (!dryRun) {
+      await axios.patch(
+        `${config.url}/rest/v1/portal_vacancies?id=eq.${vacancy.id}`,
+        { title: newTitle },
+        { headers: serviceHeaders(config, { Prefer: "return=minimal" }) },
+      );
+      for (const application of pollutedApplications) {
+        await axios.patch(
+          `${config.url}/rest/v1/portal_applications?vacancy_id=eq.${vacancy.id}&candidate_id=eq.${application.candidate_id}`,
+          { applied_for: newTitle },
+          { headers: serviceHeaders(config, { Prefer: "return=minimal" }) },
+        );
+      }
+    }
+
+    corrected.push({ vacancyId: vacancy.id, portal, oldTitle, newTitle, applicationsCorrected: pollutedApplications.length });
+  }
+
+  return { inspected: polluted.length, corrected, unresolved, dryRun };
+}
+
 export interface DataQualityBackfillReport {
   cvArtifacts: CvArtifactReport;
   orphanApplications: OrphanApplicationReport;
+  pollutedTitles: PollutedTitleReport;
 }
 
-/** Runs both repairs. `dryRun` (default true) must be explicitly set to false to write anything. */
+/** Runs all three repairs. `dryRun` (default true) must be explicitly set to false to write anything. */
 export async function runDataQualityBackfill(
   config: DashboardConfig,
-  opts: { dryRun?: boolean; orphanPortal?: string } = {},
+  opts: { dryRun?: boolean; orphanPortal?: string; pollutedTitlePortal?: string } = {},
 ): Promise<DataQualityBackfillReport> {
   const dryRun = opts.dryRun ?? true;
   const cvArtifacts = await clearNonDocumentCvArtifacts(config, { dryRun });
   const orphanApplications = await linkOrphanApplications(config, { portal: opts.orphanPortal ?? "glints", dryRun });
-  return { cvArtifacts, orphanApplications };
+  const pollutedTitles = await fixPollutedVacancyTitles(config, { portal: opts.pollutedTitlePortal ?? "kita_lulus", dryRun });
+  return { cvArtifacts, orphanApplications, pollutedTitles };
 }

@@ -159,6 +159,13 @@ The same page also renders a **scraping-progress dashboard** (`src/dashboardData
 - **Run detail view**: `scrape_runs` timeline for a portal with per-stage errors and retry count.
 - A signed-CV-link action that mints the URL server-side only (`POST /api/dashboard/sign-url`): the route re-validates the object key against the candidate row with the anon key before calling Storage with the service key, so the service key never reaches the browser.
 
+Every timestamp this dashboard shows (`fmtTime` in the page's own client-side script) is rendered
+in Asia/Jakarta (WIB, UTC+7, no DST) regardless of the viewer's own browser timezone — the
+captain's 2026-10-28 decision. The API itself still returns the raw UTC instant (`started_at` /
+`finished_at` / `last_seen_at` / `lastRun` / `nextRun`), since the client also computes run
+durations from it; only the rendered text is WIB. Server-side log lines and the Google Sheet (see
+**Google Sheet sync** below) use the same formatting, via the shared `formatWIB` in `src/wib.ts`.
+
 Each section polls independently with an in-flight guard so overlapping requests are dropped rather than queued.
 
 `GET /cv/:portal/:candidateId` is the same sign-then-redirect behavior as the action above, but as a
@@ -389,6 +396,12 @@ below.
   only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
   isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
   `src/googleSheetsSync.ts` for the exact column list.
+- **Timestamps in WIB** (decided 2026-10-28): `last_seen_at` (both tabs) and `applied_date`
+  (Candidates) are formatted `"YYYY-MM-DD HH:mm:ss WIB"` (Asia/Jakarta, UTC+7, no DST) via the
+  shared `formatWIB` (`src/wib.ts`) before they ever reach the cell — display-only, Supabase's own
+  `timestamptz` storage is untouched. A value `formatWIB` can't parse as a real instant (e.g. a
+  portal's own free-text date string) is written through unchanged rather than becoming "Invalid
+  Date WIB".
 - **Real clickable links, not plain text** (decided 2026-10-28): `cv_link` (when it holds a URL)
   and `portal_candidate_id` (when the candidate has a real `profileUrl` on file) are written as a
   `HYPERLINK(url, text)` formula via a second, narrower `USER_ENTERED` write — `upsertRows`'
@@ -453,10 +466,10 @@ below.
   independent re-count of each portal's Supabase rows compared against what was written, so a
   dropped row or a silently-truncated page is caught rather than assumed; exits non-zero on a
   mismatch. Never runs on its own — it is not part of the scraping pipeline or the continuous loop.
-- **Data-quality backfill** (`src/dataQualityBackfill.ts`): a separate one-shot repair for two
+- **Data-quality backfill** (`src/dataQualityBackfill.ts`): a separate one-shot repair for three
   Supabase-side data gaps, run before `sheets:backfill` so the sheet picks up the correction —
   `npm run data-quality:backfill` (defaults to a dry run that only reports; pass `--apply` to
-  write). Needs `SCORING_SUPABASE_SERVICE_KEY`, since both repairs write directly, bypassing RLS.
+  write). Needs `SCORING_SUPABASE_SERVICE_KEY`, since every repair writes directly, bypassing RLS.
   1. `clearNonDocumentCvArtifacts`: a `cv_object_key` is supposed to always point at a real
      PDF/DOC/DOCX — every live upload path sniffs the bytes before storing them. Finds every key
      whose extension isn't already a recognized document type, downloads and sniffs *only that
@@ -471,3 +484,11 @@ below.
      Recovers it only when an exact title match already exists in `portal_vacancies` for that
      portal; reports (never guesses at) every candidate it can't resolve, e.g. one with no
      `data.applied_for` to recover from at all.
+  3. `fixPollutedVacancyTitles`: a `kita_lulus` vacancy whose stored `title` (and every
+     then-linked application's `applied_for`) is itself a vacancy-card noise token (the literal
+     "Chat", from a quick-action button's text — see `pickVacancyCardFields` in
+     `src/kitalulus.ts`) gets the real title recovered from a *sibling* application under the
+     same `vacancy_id` that isn't itself polluted, correcting both `portal_vacancies.title` and
+     every polluted `portal_applications.applied_for` row — a deliberate one-time administrative
+     correction via the service key, bypassing the normal write-once upsert path. A vacancy where
+     every linked application is equally polluted is left alone and reported, never guessed at.

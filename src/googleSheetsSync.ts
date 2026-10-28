@@ -15,6 +15,7 @@ import {
   VacancySyncRow,
   CandidateSyncRow,
 } from "./dashboardData";
+import { formatWIB } from "./wib";
 
 dotenv.config();
 
@@ -599,7 +600,7 @@ function vacancyRow(v: VacancySyncRow): string[] {
     v.status ?? "",
     v.totalApplicant != null ? String(v.totalApplicant) : "",
     v.description ?? "",
-    v.lastSeenAt,
+    formatWIB(v.lastSeenAt),
   ];
 }
 
@@ -645,10 +646,10 @@ async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConf
     maskDateOfBirth(c.dateOfBirth) ?? "",
     maskLocation(c.location) ?? "",
     c.appliedFor ?? "",
-    c.appliedDate ?? "",
+    formatWIB(c.appliedDate),
     presenceFlag(c.hasCv),
     presenceFlag(c.hasPhoto),
-    c.lastSeenAt,
+    formatWIB(c.lastSeenAt),
   ];
   const links: Record<number, string> = {};
   // portal_candidate_id -> the candidate's real, already-visited portal URL.

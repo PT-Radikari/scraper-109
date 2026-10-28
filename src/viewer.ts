@@ -1143,9 +1143,23 @@ const HTML = `<!DOCTYPE html>
       return String(s || 'queued').replace(/_/g, ' ');
     }
 
+    // Always rendered in Asia/Jakarta (WIB, UTC+7) regardless of the
+    // viewer's own browser timezone — the captain's 2026-10-28 decision.
+    // Display-only: fmtDuration below still computes from the raw ISO
+    // instants, never from this formatted string.
+    var WIB_FMT = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Jakarta', hourCycle: 'h23',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
     function fmtTime(iso) {
       if (!iso) return '—';
-      return new Date(iso).toLocaleString();
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return '—';
+      const parts = {};
+      WIB_FMT.formatToParts(d).forEach(function (p) { parts[p.type] = p.value; });
+      return parts.year + '-' + parts.month + '-' + parts.day + ' ' +
+        parts.hour + ':' + parts.minute + ':' + parts.second + ' WIB';
     }
 
     function fmtDuration(ms) {

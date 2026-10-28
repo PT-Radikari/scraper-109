@@ -686,7 +686,7 @@ describe("syncPortalResultsToSheets", () => {
     const vacancyAppend = appends.find((a) => a.url.includes("Vacancies"));
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     expect((vacancyAppend?.data as { values: string[][] }).values[0]).toEqual([
-      "glints", "vac-1", "Warehouse Staff", "https://x", "new", "3", "Full JD", "2026-10-27T00:00:00Z",
+      "glints", "vac-1", "Warehouse Staff", "https://x", "new", "3", "Full JD", "2026-10-27 07:00:00 WIB",
     ]);
     const candidateRow = (candidateAppend?.data as { values: string[][] }).values[0];
     expect(candidateRow[0]).toBe("glints");

@@ -7,6 +7,7 @@ import { sendApplicantToSink, SinkArtifactBytes } from "./portalSink";
 import fs from "fs";
 import path from "path";
 import { trackBrowser } from "./browserRegistry";
+import { formatWIB } from "./wib";
 
 const INDONESIAN_MONTHS = [
   "Januari",
@@ -1270,9 +1271,9 @@ export class Pintarnya {
       }
 
       if (this.DELAY > 0 && this.COLLECTED_APPLICANT > 0 && this.COLLECTED_APPLICANT % this.DELAY_AFTER === 0) {
-        console.info("Delaying the scraping process...", new Date());
+        console.info("Delaying the scraping process...", formatWIB(new Date()));
         await page.waitForTimeout(this.DELAY);
-        console.info("Resuming the scraping process...", new Date());
+        console.info("Resuming the scraping process...", formatWIB(new Date()));
       }
 
       console.info(`-------------------------------------------------------`);
