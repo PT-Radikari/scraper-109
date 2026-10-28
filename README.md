@@ -389,21 +389,33 @@ below.
   only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
   isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
   `src/googleSheetsSync.ts` for the exact column list.
+- **Real clickable links, not plain text** (decided 2026-10-28): `cv_link` (when it holds a URL)
+  and `portal_candidate_id` (when the candidate has a real `profileUrl` on file) are written as a
+  `HYPERLINK(url, text)` formula via a second, narrower `USER_ENTERED` write — `upsertRows`'
+  `rowLinks` parameter — right after the ordinary plain-text `RAW` write that covers the rest of
+  the row. This keeps every other column (dates, phone numbers, ids) immune to Sheets'
+  `USER_ENTERED` auto-formatting, since only the two linked cells are ever written with that input
+  mode. `portal_candidate_id` links to `data.url_profile` — the candidate's own real,
+  already-visited portal URL (a per-candidate deep link for Glints; a shared vacancy/list page for
+  portals that never navigate to a candidate-specific route, which is still a real, working,
+  non-fabricated link, just not candidate-granular) — never fabricated when absent, in which case
+  the cell stays the bare id as before.
 - **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, decided by the captain 2026-10-28 — **"scrapview_link"
-  is the default (ON)**): appends a 13th `cv_link` column holding a stable link to the viewer's own
-  `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a fresh Supabase
-  signed URL on each click and redirects — the same resolve-on-click behavior scrapview's own UI
-  already uses. The cell itself never expires and never carries the raw storage key or a baked-in
-  signed URL. Needs `SCRAPVIEW_BASE_URL` (the viewer's public base URL); if unset, cells are left
-  blank with a warning rather than failing the sync. Applies to the backfill too. Other values,
-  kept for flexibility/testing: `"off"` (no `cv_link` column at all, the original shape) ·
-  `"object_key"` (the raw, non-expiring `cv_object_key`, not a clickable link by itself) ·
-  `"signed_url"` (mints a Supabase Storage signed URL directly into the cell on every sync,
-  `GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS` default 3600 — goes stale after that TTL until the
-  next sync re-mints it, and needs `SCORING_SUPABASE_SERVICE_KEY`). A per-candidate link-resolution
-  failure in any mode degrades to an empty cell and a warning, never a sync-wide failure. An
-  existing tab's shorter header (e.g. one populated before this column existed) is extended with
-  the new trailing column name on the next sync, never touching what's already there.
+  is the default (ON)**): appends a 13th `cv_link` column holding a stable, clickable link to the
+  viewer's own `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a
+  fresh Supabase signed URL on each click and redirects — the same resolve-on-click behavior
+  scrapview's own UI already uses. The cell itself never expires and never carries the raw storage
+  key or a baked-in signed URL. Needs `SCRAPVIEW_BASE_URL` (the viewer's public base URL); if
+  unset, cells are left blank with a warning rather than failing the sync. Applies to the backfill
+  too. Other values, kept for flexibility/testing: `"off"` (no `cv_link` column at all, the
+  original shape) · `"object_key"` (the raw, non-expiring `cv_object_key`, not a clickable link by
+  itself) · `"signed_url"` (mints a Supabase Storage signed URL directly into the cell on every
+  sync, also hyperlinked, `GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS` default 3600 — goes stale
+  after that TTL until the next sync re-mints it, and needs `SCORING_SUPABASE_SERVICE_KEY`). A
+  per-candidate link-resolution failure in any mode degrades to an empty cell and a warning, never
+  a sync-wide failure. An existing tab's shorter header (e.g. one populated before this column
+  existed) is extended with the new trailing column name on the next sync, never touching what's
+  already there.
 - **Failure behavior**: unconfigured (`GOOGLE_SHEETS_SPREADSHEET_ID` plus one full credential shape
   missing) is a silent no-op — existing scraper behavior is unchanged on a fresh checkout. A
   misconfigured credential (malformed JSON, an unreadable token/client-secret file, a token file
@@ -441,3 +453,21 @@ below.
   independent re-count of each portal's Supabase rows compared against what was written, so a
   dropped row or a silently-truncated page is caught rather than assumed; exits non-zero on a
   mismatch. Never runs on its own — it is not part of the scraping pipeline or the continuous loop.
+- **Data-quality backfill** (`src/dataQualityBackfill.ts`): a separate one-shot repair for two
+  Supabase-side data gaps, run before `sheets:backfill` so the sheet picks up the correction —
+  `npm run data-quality:backfill` (defaults to a dry run that only reports; pass `--apply` to
+  write). Needs `SCORING_SUPABASE_SERVICE_KEY`, since both repairs write directly, bypassing RLS.
+  1. `clearNonDocumentCvArtifacts`: a `cv_object_key` is supposed to always point at a real
+     PDF/DOC/DOCX — every live upload path sniffs the bytes before storing them. Finds every key
+     whose extension isn't already a recognized document type, downloads and sniffs *only that
+     subset* (never the whole table), and nulls out any that don't actually sniff as one — so the
+     Sheet/`/cv` route correctly show "no CV on file" instead of serving the wrong content. Never
+     fabricates a CV for a candidate who genuinely has none, and never touches a real document
+     sitting under an odd extension (verified by magic bytes, not trusted by name).
+  2. `linkOrphanApplications`: a handful of early candidates (portal `glints`, inserted before that
+     portal moved onto the shared `sendApplicantToSink` contract) have no linked
+     `portal_applications` row at all, so the Sheet's `applied_for` reads empty for them even
+     though the vacancy title they applied for is still sitting in their own `data.applied_for`.
+     Recovers it only when an exact title match already exists in `portal_vacancies` for that
+     portal; reports (never guesses at) every candidate it can't resolve, e.g. one with no
+     `data.applied_for` to recover from at all.

@@ -406,6 +406,111 @@ describe("upsertRows", () => {
     await upsertRows(CONFIG, "Vacancies", ["portal", "portal_vacancy_id"], []);
     expect(mockedAxios.get).not.toHaveBeenCalled();
   });
+
+  it("writes an updated row's linked columns as a HYPERLINK formula via a separate USER_ENTERED pass, never touching the plain RAW write", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockResolvedValue({ data: { values: [["glints", "cand-1"]] } }); // existing row 2
+    const batchUpdates: Array<{ data: unknown }> = [];
+    mockedAxios.post.mockImplementation((url: string, data?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes("values:batchUpdate")) batchUpdates.push({ data });
+      return Promise.resolve({ data: {} });
+    });
+
+    await upsertRows(
+      CONFIG,
+      "Candidates",
+      ["portal", "portal_candidate_id"],
+      [["glints", "cand-1"]],
+      [{ 1: "https://employers.glints.id/manage-candidates?jid=1" }],
+    );
+
+    expect(batchUpdates).toHaveLength(2);
+    expect(batchUpdates[0].data).toMatchObject({ valueInputOption: "RAW" });
+    expect(batchUpdates[1].data).toEqual({
+      valueInputOption: "USER_ENTERED",
+      data: [
+        {
+          range: "Candidates!B2",
+          values: [['=HYPERLINK("https://employers.glints.id/manage-candidates?jid=1","cand-1")']],
+        },
+      ],
+    });
+  });
+
+  it("writes a brand-new appended row's linked column by parsing the append response's row number", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockResolvedValue({ data: {} }); // no existing rows -> append
+    const batchUpdates: Array<{ data: unknown }> = [];
+    mockedAxios.post.mockImplementation((url: string, data?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes(":append")) return Promise.resolve({ data: { updates: { updatedRange: "Candidates!A4583:B4583" } } });
+      if (url.includes("values:batchUpdate")) batchUpdates.push({ data });
+      return Promise.resolve({ data: {} });
+    });
+
+    await upsertRows(
+      CONFIG,
+      "Candidates",
+      ["portal", "portal_candidate_id"],
+      [["glints", "cand-9"]],
+      [{ 1: "https://employers.glints.id/manage-candidates?jid=9" }],
+    );
+
+    expect(batchUpdates).toHaveLength(1);
+    expect(batchUpdates[0].data).toEqual({
+      valueInputOption: "USER_ENTERED",
+      data: [
+        {
+          range: "Candidates!B4583",
+          values: [['=HYPERLINK("https://employers.glints.id/manage-candidates?jid=9","cand-9")']],
+        },
+      ],
+    });
+  });
+
+  it("skips the hyperlink pass for an appended row when the append response carries no updatedRange, instead of guessing a row number", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockResolvedValue({ data: {} });
+    const batchUpdates: Array<{ data: unknown }> = [];
+    mockedAxios.post.mockImplementation((url: string, data?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes("values:batchUpdate")) batchUpdates.push({ data });
+      return Promise.resolve({ data: {} }); // :append answers with no `updates` field at all
+    });
+
+    await upsertRows(
+      CONFIG,
+      "Candidates",
+      ["portal", "portal_candidate_id"],
+      [["glints", "cand-9"]],
+      [{ 1: "https://employers.glints.id/manage-candidates?jid=9" }],
+    );
+
+    expect(batchUpdates).toHaveLength(0);
+  });
+
+  it("never wraps a non-http value (e.g. a bare key) in a HYPERLINK formula even when a link entry names that column", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockResolvedValue({ data: { values: [["glints", "cand-1"]] } });
+    const batchUpdates: Array<{ data: unknown }> = [];
+    mockedAxios.post.mockImplementation((url: string, data?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes("values:batchUpdate")) batchUpdates.push({ data });
+      return Promise.resolve({ data: {} });
+    });
+
+    await upsertRows(
+      CONFIG,
+      "Candidates",
+      ["portal", "portal_candidate_id"],
+      [["glints", "cand-1"]],
+      [{ 1: "glints/202610/not-a-url.pdf" }],
+    );
+
+    expect(batchUpdates).toHaveLength(1); // only the plain RAW write — no second USER_ENTERED pass
+    expect(batchUpdates[0].data).toMatchObject({ valueInputOption: "RAW" });
+  });
 });
 
 describe("ensureTab", () => {
@@ -819,6 +924,125 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
     expect(row[12]).toBe("");
+  });
+});
+
+describe("portal_candidate_id and cv_link as real hyperlinks, not plain text", () => {
+  function mockSheetsPlumbingWithAppendRowNumber(
+    appends: Array<{ url: string; data: unknown }>,
+    linkWrites: Array<{ data: unknown }>,
+    updatedRange: string,
+  ) {
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      if (url.includes("!A2:B")) return Promise.resolve({ data: {} }); // no existing rows -> every row appends
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string, data?: unknown) => {
+      const url = decodeURIComponent(rawUrl);
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes(":append")) {
+        appends.push({ url, data });
+        return Promise.resolve({ data: { updates: { updatedRange } } });
+      }
+      if (url.includes("values:batchUpdate")) {
+        const body = data as { valueInputOption?: string };
+        if (body.valueInputOption === "USER_ENTERED") linkWrites.push({ data });
+      }
+      return Promise.resolve({ data: {} });
+    });
+  }
+
+  const ENV = {
+    GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+    GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com" }),
+    SCORING_SUPABASE_URL: "http://supabase.local",
+    SCORING_SUPABASE_ANON_KEY: "anon-key",
+    SCRAPVIEW_BASE_URL: "https://scrapview.example.com",
+  };
+
+  it("hyperlinks portal_candidate_id to the candidate's real, already-captured profileUrl", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, cvObjectKey: null, hasPhoto: false,
+        profileUrl: "https://employers.glints.id/manage-candidates?jid=1", lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    const linkWrites: Array<{ data: unknown }> = [];
+    mockSheetsPlumbingWithAppendRowNumber(appends, linkWrites, "Candidates!A2:M2");
+
+    await withEnv({ ...ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "s@t.iam.gserviceaccount.com", private_key: privateKeyPem }) }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    // The plain RAW write still carries the bare id, unchanged.
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[1]).toBe("cand-1");
+
+    const candidateLinkWrite = linkWrites.find((w) => (w.data as { data: Array<{ range: string }> }).data.some((d) => d.range.startsWith("Candidates!B")));
+    expect(candidateLinkWrite).toBeDefined();
+    expect((candidateLinkWrite?.data as { data: Array<{ range: string; values: string[][] }> }).data).toContainEqual({
+      range: "Candidates!B2",
+      values: [['=HYPERLINK("https://employers.glints.id/manage-candidates?jid=1","cand-1")']],
+    });
+  });
+
+  it("never links portal_candidate_id when no profileUrl was captured for that candidate", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, cvObjectKey: null, hasPhoto: false, profileUrl: null, lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    const linkWrites: Array<{ data: unknown }> = [];
+    mockSheetsPlumbingWithAppendRowNumber(appends, linkWrites, "Candidates!A2:M2");
+
+    await withEnv({ ...ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "s@t.iam.gserviceaccount.com", private_key: privateKeyPem }) }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    expect(linkWrites).toHaveLength(0);
+  });
+
+  it("hyperlinks the scrapview cv_link cell to open the PDF directly, alongside the portal_candidate_id link", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/202610/abc.pdf", hasPhoto: false,
+        profileUrl: "https://employers.glints.id/manage-candidates?jid=1", lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    const linkWrites: Array<{ data: unknown }> = [];
+    mockSheetsPlumbingWithAppendRowNumber(appends, linkWrites, "Candidates!A2:M2");
+
+    await withEnv({ ...ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "s@t.iam.gserviceaccount.com", private_key: privateKeyPem }) }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    const allLinkRanges = linkWrites.flatMap((w) => (w.data as { data: Array<{ range: string }> }).data.map((d) => d.range));
+    expect(allLinkRanges).toContain("Candidates!B2");
+    expect(allLinkRanges).toContain("Candidates!M2");
+    const cvLinkWrite = linkWrites
+      .flatMap((w) => (w.data as { data: Array<{ range: string; values: string[][] }> }).data)
+      .find((d) => d.range === "Candidates!M2");
+    expect(cvLinkWrite?.values[0][0]).toBe(
+      '=HYPERLINK("https://scrapview.example.com/cv/glints/9","https://scrapview.example.com/cv/glints/9")',
+    );
   });
 });
 

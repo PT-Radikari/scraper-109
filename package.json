@@ -24,6 +24,7 @@
     "central:sync-once": "ts-node src/server.ts central-sync-once",
     "central:stats": "ts-node src/server.ts central-stats",
     "sheets:backfill": "ts-node src/server.ts sheets-backfill",
+  "data-quality:backfill": "ts-node src/server.ts data-quality-backfill",
     "xvfb:kitalulus": "xvfb-run -a ts-node src/server.ts kitalulus-continuous",
     "xvfb:kitalulus:once": "xvfb-run -a ts-node src/server.ts kitalulus",
     "xvfb:kitalulus-v2-vacancies": "xvfb-run -a ts-node src/server.ts kitalulus-v2-vacancies",

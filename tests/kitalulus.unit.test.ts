@@ -209,6 +209,51 @@ describe("KitaLulus — pure helper functions", () => {
     });
   });
 
+  // ── pickVacancyCardFields ──────────────────────────────────────────────────
+  //
+  // Live rows were seen with applied_for/title literally "Chat" because a
+  // "Chat" quick-action button's text node sits before the real title in a
+  // vacancy card's DOM, and innerText() follows DOM order, not visual order.
+  describe("pickVacancyCardFields", () => {
+    it("skips a leading 'Chat' action-button line and picks the real title", () => {
+      const cardText = ["Chat", "Contact Center Agent", "Jakarta Selatan", "Dibuka"].join("\n");
+      expect(scraper.pickVacancyCardFields(cardText)).toMatchObject({
+        title: "Contact Center Agent",
+        location: "Jakarta Selatan",
+      });
+    });
+
+    it("picks the title normally when no noise token precedes it", () => {
+      const cardText = ["Warehouse Staff", "Bekasi", "Dibuka"].join("\n");
+      expect(scraper.pickVacancyCardFields(cardText)).toMatchObject({
+        title: "Warehouse Staff",
+        location: "Bekasi",
+      });
+    });
+
+    it("skips every known noise token, not just the first line", () => {
+      const cardText = ["Diposting Ulang", "Chat", "Pesan", "Driver Delivery", "Bengkulu"].join("\n");
+      expect(scraper.pickVacancyCardFields(cardText)).toMatchObject({
+        title: "Driver Delivery",
+        location: "Bengkulu",
+      });
+    });
+
+    it("extracts the expiry line and excludes it from the location guess", () => {
+      const cardText = ["Sales Executive", "Jakarta", "berakhir pada 31 Des 2026", "Dibuka"].join("\n");
+      expect(scraper.pickVacancyCardFields(cardText)).toEqual({
+        title: "Sales Executive",
+        location: "Jakarta",
+        expiresAt: "31 Des 2026",
+      });
+    });
+
+    it("falls back to a placeholder title when every line is noise or blank", () => {
+      expect(scraper.pickVacancyCardFields("Chat\nPesan\n").title).toBe("Pelamar KitaLulus");
+      expect(scraper.pickVacancyCardFields("").title).toBe("Pelamar KitaLulus");
+    });
+  });
+
   // ── extractVacancyDetail (list -> detail click-flow -> all three tabs) ────
   //
   // Captain correction (2026-09-08): the prior version of this method
