@@ -544,10 +544,11 @@ function main(): void {
         break;
       }
 
-      // One-shot, manually-invoked repair for the two Supabase-side data
+      // One-shot, manually-invoked repair for the three Supabase-side data
       // gaps that surfaced the Sheet's cv_link/applied_for issues (see
       // src/dataQualityBackfill.ts): a cv_object_key that doesn't lead to a
-      // real document, and a candidate inserted with no linked application.
+      // real document, a candidate inserted with no linked application, and
+      // a kita_lulus vacancy/application whose title is a noise token.
       // Defaults to a dry run that only reports; pass --apply to write.
       case "data-quality-backfill": {
         const apply = args.includes("--apply");
