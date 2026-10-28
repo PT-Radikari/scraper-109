@@ -736,12 +736,38 @@ export class KitaLulus {
   }
 
   /**
+   * Vacancy-card text lines that are never the job title: status badges and
+   * quick-action buttons ("Chat" to message an applicant chief among them —
+   * live rows were seen with applied_for/title literally "Chat" because its
+   * button sits before the title text node in the card's DOM, which
+   * innerText() follows, not visual order). extractOpenVacancies skips these
+   * when picking the title line instead of blindly trusting lines[0].
+   */
+  static readonly VACANCY_CARD_NOISE = new Set(["Chat", "Pesan", "Diposting Ulang", "Dibuka", "Ditutup"]);
+
+  /**
+   * Picks the title/location/expiry out of one vacancy card's full
+   * `innerText()`, skipping VACANCY_CARD_NOISE tokens rather than trusting
+   * line position — pulled out of extractOpenVacancies as a pure function so
+   * the noise-token handling is unit-testable without a Playwright page.
+   */
+  pickVacancyCardFields(cardText: string): { title: string; location: string | null; expiresAt: string | null } {
+    const lines = cardText.split("\n").map((l) => l.trim()).filter(Boolean);
+    const title = lines.find((l) => !KitaLulus.VACANCY_CARD_NOISE.has(l)) || "Pelamar KitaLulus";
+    const expiryLine = lines.find((l) => /berakhir pada/i.test(l)) ?? null;
+    const expiresAt = expiryLine ? expiryLine.replace(/^.*berakhir pada\s*/i, "").trim() : null;
+    const nonLocationLines = new Set([title, ...KitaLulus.VACANCY_CARD_NOISE]);
+    const location = lines.find((l) => l !== expiryLine && !nonLocationLines.has(l) && !/^Lihat/i.test(l)) ?? null;
+    return { title, location, expiresAt };
+  }
+
+  /**
    * Reads the "Lowongan" (vacancy management) listing and returns every open
    * vacancy that still has pending ("Belum Diproses") applicants, keyed by
    * KitaLulus' own `vacancy_id` (stable, from the "Belum Diproses" applicants
-   * link on each card — the first line of the card is the real job title).
-   * Vacancies with zero pending applicants are skipped since there is nothing
-   * new to scrape for them.
+   * link on each card — the first non-noise line of the card is the real job
+   * title; see VACANCY_CARD_NOISE). Vacancies with zero pending applicants
+   * are skipped since there is nothing new to scrape for them.
    */
   async extractOpenVacancies(page: playwright.Page): Promise<OpenVacancy[]> {
     console.info("[NAV] Navigating to Lowongan (vacancies) page...");
@@ -770,13 +796,7 @@ export class KitaLulus {
 
       const card = link.locator("xpath=ancestor::*[4]").first();
       const cardText = (await card.innerText().catch(() => "")) || "";
-      const lines = cardText.split("\n").map((l) => l.trim()).filter(Boolean);
-      const title = lines[0] || "Pelamar KitaLulus";
-      const expiryLine = lines.find((l) => /berakhir pada/i.test(l)) ?? null;
-      const expiresAt = expiryLine ? expiryLine.replace(/^.*berakhir pada\s*/i, "").trim() : null;
-      const nonLocationLines = new Set([title, "Diposting Ulang", "Dibuka", "Ditutup"]);
-      const location =
-        lines.find((l) => l !== expiryLine && !nonLocationLines.has(l) && !/^Lihat/i.test(l)) ?? null;
+      const { title, location, expiresAt } = this.pickVacancyCardFields(cardText);
 
       vacancies.push({
         vacancyId,

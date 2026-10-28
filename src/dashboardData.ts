@@ -638,6 +638,8 @@ export interface CandidateSyncRow {
   /** Raw storage object key, present only when hasCv is true. Only consulted by the Sheets sync's off-by-default CV-link column (src/googleSheetsSync.ts) — never exposed anywhere else, and never a link by itself. */
   cvObjectKey: string | null;
   hasPhoto: boolean;
+  /** The candidate's real, already-visited portal URL (data.url_profile) — a per-candidate deep link for glints, a shared vacancy/list-page link for portals that never navigate to a candidate-specific route. Consulted only to hyperlink the Sheet's portal_candidate_id cell (src/googleSheetsSync.ts); never fabricated when absent. */
+  profileUrl: string | null;
   lastSeenAt: string;
 }
 
@@ -657,7 +659,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
           select:
             "id,portal,portal_candidate_id,name,email,phone:data->contact->>contact_number," +
             "date_of_birth:data->>date_of_birth,location:data->>location,cv_object_key,photo_object_key," +
-            "last_seen_at,portal_applications(applied_for,applied_date)",
+            "profile_url:data->>url_profile,last_seen_at,portal_applications(applied_for,applied_date)",
           "portal_applications.order": "applied_date.desc",
         },
       });
@@ -682,6 +684,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
         hasCv: Boolean(row.cv_object_key),
         cvObjectKey: presentText(row.cv_object_key),
         hasPhoto: Boolean(row.photo_object_key),
+        profileUrl: presentText(row.profile_url),
         lastSeenAt: row.last_seen_at as string,
       });
     }

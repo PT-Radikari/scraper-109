@@ -314,7 +314,8 @@ describe("getCandidatesForSync", () => {
         {
           id: 42, portal: "glints", portal_candidate_id: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
           phone: "081234567890", date_of_birth: "1998-05-12", location: "Jakarta", cv_object_key: "x.pdf",
-          photo_object_key: null, last_seen_at: "t",
+          photo_object_key: null, profile_url: "https://employers.glints.id/manage-candidates?jid=1",
+          last_seen_at: "t",
           portal_applications: [{ applied_for: "Analyst", applied_date: "2026-10-01" }],
         },
       ],
@@ -325,9 +326,27 @@ describe("getCandidatesForSync", () => {
       {
         id: 42, portal: "glints", portalCandidateId: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
         phone: "081234567890", dateOfBirth: "1998-05-12", location: "Jakarta",
-        appliedFor: "Analyst", appliedDate: "2026-10-01", hasCv: true, cvObjectKey: "x.pdf", hasPhoto: false, lastSeenAt: "t",
+        appliedFor: "Analyst", appliedDate: "2026-10-01", hasCv: true, cvObjectKey: "x.pdf", hasPhoto: false,
+        profileUrl: "https://employers.glints.id/manage-candidates?jid=1", lastSeenAt: "t",
       },
     ]);
+  });
+
+  it("maps a missing profile_url to null rather than fabricating one", async () => {
+    jest.clearAllMocks();
+    mockedAxios.get.mockResolvedValue({
+      data: [
+        {
+          id: 43, portal: "kita_lulus", portal_candidate_id: "cand-2", name: "Budi", email: null,
+          phone: null, date_of_birth: null, location: null, cv_object_key: null,
+          photo_object_key: null, profile_url: null, last_seen_at: "t",
+          portal_applications: [],
+        },
+      ],
+    } as never);
+    const config = { url: URL, anonKey: ANON_KEY, bucket: "b", serviceKey: null };
+    const rows = await getCandidatesForSync(config, "kita_lulus");
+    expect(rows[0].profileUrl).toBeNull();
   });
 
   it("requests the embedded applications ordered newest-first, so PostgREST's response is deterministic", async () => {

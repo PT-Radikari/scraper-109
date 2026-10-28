@@ -15,6 +15,7 @@ import {
   VacancySyncRow,
   CandidateSyncRow,
 } from "./dashboardData";
+import { formatWIB } from "./wib";
 
 dotenv.config();
 
@@ -348,6 +349,23 @@ function compositeKey(portal: string, id: string): string {
   return `${portal}::${id}`;
 }
 
+/** True only for an absolute http(s) URL — the one shape this sync will ever wrap in a HYPERLINK formula. Never a storage key, a relative path, or anything else that could silently become a broken link. */
+export function isHttpUrl(value: string | null | undefined): boolean {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
+}
+
+/** Escapes a value for a double-quoted Sheets formula string argument (e.g. HYPERLINK("...","...")). */
+function escapeFormulaString(value: string): string {
+  return value.replace(/"/g, '""').replace(/[\r\n]+/g, " ");
+}
+
+/** The first row number a `values:append` response landed on (e.g. "Candidates!A4583:M4600" -> 4583), or null when the response doesn't carry one — the hyperlink enrichment pass then simply skips those rows rather than guessing. */
+function parseAppendStartRow(updatedRange: string | undefined): number | null {
+  if (!updatedRange) return null;
+  const match = /![A-Z]+(\d+):/.exec(updatedRange);
+  return match ? Number(match[1]) : null;
+}
+
 /**
  * Creates the tab if it doesn't exist yet, writes the header row if the tab
  * is empty, and extends an existing-but-shorter header with any new trailing
@@ -410,17 +428,36 @@ export async function ensureTab(config: GoogleSheetsConfig, title: string, heade
   }
 }
 
+/** One linked cell for `upsertRows`' hyperlink pass: `text` overrides the cell's own plain value as the HYPERLINK's display text (e.g. "Open CV" instead of the raw link); omitted, it defaults to that value (e.g. the bare id for portal_candidate_id). */
+export interface RowLinkCell {
+  url: string;
+  text?: string;
+}
+
 /**
  * Upserts rows into a tab keyed by its first two columns (portal, <portal-native id>):
  * a key already on the sheet gets its row updated in place; a new key is
  * appended. Never produces a duplicate-appended line for an existing key —
  * the "idempotent, not append-only" requirement this sync was built to.
+ *
+ * `rowLinks[i]`, when given, maps a 0-based column index to the cell that
+ * row's cell should become a clickable link to — e.g. `{1: {url: profileUrl}}`
+ * for portal_candidate_id. The plain-text write above always carries the
+ * exact same value it always has (so every other column's formatting, and a
+ * caller with no `rowLinks`, is unaffected); a second, narrower
+ * `USER_ENTERED` pass then replaces just those cells with a
+ * `HYPERLINK(url, text)` formula, once each row's final row number is known
+ * (immediately for an updated row, or parsed from the append response's
+ * `updatedRange` for a brand-new one — a response that doesn't carry one,
+ * e.g. a test double, just means that row's links are skipped, never a
+ * thrown error over a cosmetic enrichment).
  */
 export async function upsertRows(
   config: GoogleSheetsConfig,
   title: string,
   header: string[],
   rows: string[][],
+  rowLinks?: Array<Record<number, RowLinkCell> | undefined>,
 ): Promise<void> {
   if (rows.length === 0) return;
   const lastCol = colLetter(header.length);
@@ -437,11 +474,16 @@ export async function upsertRows(
 
   const updateData: Array<{ range: string; values: string[][] }> = [];
   const appendRows: string[][] = [];
-  for (const row of rows) {
+  const appendOrigIndexes: number[] = [];
+  const rowNumbers: Array<number | undefined> = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
     const rowNumber = keyToRow.get(compositeKey(row[0], row[1]));
     if (rowNumber) {
       updateData.push({ range: `${title}!A${rowNumber}:${lastCol}${rowNumber}`, values: [row] });
+      rowNumbers[i] = rowNumber;
     } else {
+      appendOrigIndexes.push(i);
       appendRows.push(row);
     }
   }
@@ -453,12 +495,39 @@ export async function upsertRows(
     });
   }
   if (appendRows.length > 0) {
-    await sheetsRequest(
+    const response = await sheetsRequest<{ updates?: { updatedRange?: string } }>(
       config,
       "post",
       `/values/${encodeURIComponent(`${title}!A1`)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
       { values: appendRows },
     );
+    const startRow = parseAppendStartRow(response.updates?.updatedRange);
+    if (startRow !== null) {
+      appendOrigIndexes.forEach((origIndex, k) => {
+        rowNumbers[origIndex] = startRow + k;
+      });
+    }
+  }
+
+  if (!rowLinks) return;
+  const linkData: Array<{ range: string; values: string[][] }> = [];
+  for (let i = 0; i < rows.length; i++) {
+    const links = rowLinks[i];
+    const rowNumber = rowNumbers[i];
+    if (!links || !rowNumber) continue;
+    for (const [colKey, cell] of Object.entries(links)) {
+      const col = Number(colKey);
+      const text = cell.text ?? rows[i][col];
+      if (!text || !isHttpUrl(cell.url)) continue;
+      const formula = `=HYPERLINK("${escapeFormulaString(cell.url)}","${escapeFormulaString(text)}")`;
+      linkData.push({ range: `${title}!${colLetter(col + 1)}${rowNumber}`, values: [[formula]] });
+    }
+  }
+  if (linkData.length > 0) {
+    await sheetsRequest(config, "post", "/values:batchUpdate", {
+      valueInputOption: "USER_ENTERED",
+      data: linkData,
+    });
   }
 }
 
@@ -537,7 +606,7 @@ function vacancyRow(v: VacancySyncRow): string[] {
     v.status ?? "",
     v.totalApplicant != null ? String(v.totalApplicant) : "",
     v.description ?? "",
-    v.lastSeenAt,
+    formatWIB(v.lastSeenAt),
   ];
 }
 
@@ -567,8 +636,14 @@ async function resolveCvLink(c: CandidateSyncRow, mode: CvLinkMode, dashboardCon
   }
 }
 
-async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<string[]> {
-  const base = [
+/** Plain values plus a 0-based-column -> link map for `upsertRows`' hyperlink pass (never includes a column whose own value isn't a real http(s) URL already, so a storage key or a blank cell is never wrapped). */
+interface CandidateRowResult {
+  values: string[];
+  links: Record<number, RowLinkCell>;
+}
+
+async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<CandidateRowResult> {
+  const values = [
     c.portal,
     c.portalCandidateId ?? "",
     c.name ?? "",
@@ -577,13 +652,24 @@ async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConf
     maskDateOfBirth(c.dateOfBirth) ?? "",
     maskLocation(c.location) ?? "",
     c.appliedFor ?? "",
-    c.appliedDate ?? "",
+    formatWIB(c.appliedDate),
     presenceFlag(c.hasCv),
     presenceFlag(c.hasPhoto),
-    c.lastSeenAt,
+    formatWIB(c.lastSeenAt),
   ];
-  if (mode === "off") return base;
-  return [...base, await resolveCvLink(c, mode, dashboardConfig)];
+  const links: Record<number, RowLinkCell> = {};
+  // portal_candidate_id -> the candidate's real, already-visited portal URL.
+  // Never fabricated: a portal/row with no captured profileUrl just keeps
+  // the bare id as plain text, same as before this column could ever link.
+  if (values[1] && isHttpUrl(c.profileUrl)) links[1] = { url: c.profileUrl as string };
+
+  if (mode === "off") return { values, links };
+  const cvLink = await resolveCvLink(c, mode, dashboardConfig);
+  values.push(cvLink);
+  // Labeled "Open CV" (captain's decision 2026-10-28) rather than the raw
+  // URL — the link itself still resolves through to the PDF either way.
+  if (isHttpUrl(cvLink)) links[values.length - 1] = { url: cvLink, text: "Open CV" };
+  return { values, links };
 }
 
 export interface SheetsSyncResult {
@@ -604,7 +690,13 @@ async function syncOnePortal(
   ]);
   const candidateRows = await Promise.all(candidates.map((c) => candidateRow(c, cvLinkMode, dashboardConfig)));
   await upsertRows(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER, vacancies.map(vacancyRow));
-  await upsertRows(sheetsConfig, CANDIDATES_TAB, candidatesHeaderFor(cvLinkMode), candidateRows);
+  await upsertRows(
+    sheetsConfig,
+    CANDIDATES_TAB,
+    candidatesHeaderFor(cvLinkMode),
+    candidateRows.map((r) => r.values),
+    candidateRows.map((r) => r.links),
+  );
   return { vacancies, candidates };
 }
 

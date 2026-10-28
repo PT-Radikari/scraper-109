@@ -1762,19 +1762,39 @@ export class Glints {
   }
 
   /**
+   * Identifies a resume download's real file type from its own magic bytes
+   * (never the server-supplied content-type alone, which is attacker/server
+   * controlled and proved unreliable live 2026-09-13 when this endpoint
+   * answered with the file itself under no particular content-type).
+   * Content-type is still consulted for the zip-based Office formats, since
+   * a zip signature alone is ambiguous, but it is never enough by itself.
+   * Returns null for anything that isn't recognizably a PDF/DOC/DOCX, so the
+   * caller can skip storing it rather than mislabel arbitrary bytes as a CV.
+   */
+  private sniffResumeExtension(bytes: Buffer, contentType: string): string | null {
+    if (bytes.subarray(0, 4).toString("latin1") === "%PDF") return "pdf";
+    const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04;
+    if (isZip && /wordprocessingml/i.test(contentType)) return "docx";
+    const isOle = bytes.length >= 4 && bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0;
+    if (isOle && /msword/i.test(contentType)) return "doc";
+    return null;
+  }
+
+  /**
    * Writes resume bytes returned directly by the download endpoint into the
-   * same storage directory fetchAndStore uses, with an extension from the
-   * file's signature or content type.
+   * same storage directory fetchAndStore uses. Returns "" without writing
+   * anything when the bytes don't sniff as a real PDF/DOC/DOCX — the caller
+   * then falls back to the JSON `{ url }` shape, and ultimately to an empty
+   * CV, rather than ever uploading unrecognized content as if it were one.
    */
   private async storeResumeBytes(bytes: Buffer, contentType: string): Promise<string> {
-    const extension =
-      bytes.subarray(0, 4).toString() === "%PDF" || /pdf/i.test(contentType)
-        ? "pdf"
-        : /wordprocessingml/i.test(contentType)
-          ? "docx"
-          : /msword/i.test(contentType)
-            ? "doc"
-            : "pdf";
+    const extension = this.sniffResumeExtension(bytes, contentType);
+    if (!extension) {
+      console.warn(
+        `[GLINTS] resume download returned unrecognized content (content-type ${contentType || "unknown"}, ${bytes.length} bytes) — discarding instead of storing it as a CV`,
+      );
+      return "";
+    }
     const storageDir = path.join(__dirname, "../storage/");
     await fs.promises.mkdir(storageDir, { recursive: true });
     const filePath = path.join(storageDir, `${Date.now()}.${extension}`);
@@ -1810,12 +1830,15 @@ export class Glints {
       }
       // The endpoint answers with the file itself (observed live 2026-09-13:
       // "%PDF-1.4…"), not the JSON { url } it was assumed to return, so
-      // response.json() threw on every resume. Store the bytes directly; the
-      // signed-URL form stays as the fallback for a JSON answer.
+      // response.json() threw on every resume. Store the bytes directly only
+      // when they sniff as a real document; the signed-URL form stays as the
+      // fallback for a genuine JSON answer, and anything else is discarded
+      // (storeResumeBytes warns) rather than uploaded as if it were a CV.
       const contentType = String(response.headers?.()?.["content-type"] ?? "");
       const bytes: Buffer | null = typeof response.body === "function" ? await response.body() : null;
-      if (bytes && bytes.length > 0 && (bytes.subarray(0, 4).toString() === "%PDF" || !/json/i.test(contentType))) {
-        return await this.storeResumeBytes(bytes, contentType);
+      if (bytes && bytes.length > 0) {
+        const stored = await this.storeResumeBytes(bytes, contentType);
+        if (stored !== "") return stored;
       }
       const body = bytes ? JSON.parse(bytes.toString("utf8")) : await response.json();
       const signedUrl = typeof body?.url === "string" ? body.url : "";

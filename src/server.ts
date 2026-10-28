@@ -3,6 +3,8 @@ import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
 import { syncPortalResultsToSheets, backfillAllPortalsToSheets } from "./googleSheetsSync";
+import { runDataQualityBackfill } from "./dataQualityBackfill";
+import { loadDashboardConfig } from "./dashboardData";
 import fs from "fs";
 import path from "path";
 
@@ -536,6 +538,33 @@ function main(): void {
             }
           } catch (error) {
             console.error("[sheets-backfill] failed:", error instanceof Error ? error.message : error);
+            process.exitCode = 1;
+          }
+        })();
+        break;
+      }
+
+      // One-shot, manually-invoked repair for the three Supabase-side data
+      // gaps that surfaced the Sheet's cv_link/applied_for issues (see
+      // src/dataQualityBackfill.ts): a cv_object_key that doesn't lead to a
+      // real document, a candidate inserted with no linked application, and
+      // a kita_lulus vacancy/application whose title is a noise token.
+      // Defaults to a dry run that only reports; pass --apply to write.
+      case "data-quality-backfill": {
+        const apply = args.includes("--apply");
+        console.log(`Will run the one-shot data-quality backfill${apply ? "" : " (dry run — pass --apply to write)"}`);
+        void (async () => {
+          try {
+            const config = loadDashboardConfig();
+            if (!config) {
+              console.error("[data-quality-backfill] Supabase is not configured (SCORING_SUPABASE_URL/ANON_KEY missing)");
+              process.exitCode = 1;
+              return;
+            }
+            const report = await runDataQualityBackfill(config, { dryRun: !apply });
+            console.log(JSON.stringify(report, null, 2));
+          } catch (error) {
+            console.error("[data-quality-backfill] failed:", error instanceof Error ? error.message : error);
             process.exitCode = 1;
           }
         })();
