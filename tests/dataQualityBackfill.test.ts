@@ -121,6 +121,28 @@ describe("linkOrphanApplications", () => {
     );
   });
 
+  it("sends applied_date as null rather than an empty string (Postgres 22007 on a `date` column — live bug 2026-10-28)", async () => {
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/rest/v1/portal_candidates")) {
+        return Promise.resolve({
+          data: [{ id: 23, portal: "glints", data: { applied_for: "Trainer Contact Center", applied_date: "" } }],
+        } as never);
+      }
+      if (url.includes("/rest/v1/portal_applications")) return Promise.resolve({ data: [] } as never);
+      if (url.includes("/rest/v1/portal_vacancies")) return Promise.resolve({ data: [{ id: 189, title: "Trainer Contact Center" }] } as never);
+      return Promise.resolve({ data: [] } as never);
+    });
+    const postSpy = mockedAxios.post.mockResolvedValue({ data: [] } as never);
+
+    await linkOrphanApplications(CONFIG, { portal: "glints", dryRun: false });
+
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.stringContaining("/rest/v1/portal_applications"),
+      [{ vacancy_id: 189, candidate_id: 23, applied_for: "Trainer Contact Center", applied_date: null }],
+      expect.anything(),
+    );
+  });
+
   it("reports unresolved instead of guessing when no vacancy with that exact title exists", async () => {
     mockedAxios.get.mockImplementation((url: string) => {
       if (url.includes("/rest/v1/portal_candidates")) {

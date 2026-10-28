@@ -229,10 +229,15 @@ export async function linkOrphanApplications(
       unresolved.push({ candidateId: candidate.id, portal, reason: `no vacancy titled "${appliedFor}" to link to` });
       continue;
     }
+    // portal_applications.applied_date is a `date` column: an empty string
+    // (how a gated/never-captured date is stored in data.applied_date, not
+    // null) is rejected by Postgres (22007, "invalid input syntax for type
+    // date"), so it must collapse to null same as a missing value.
+    const appliedDate = (candidate.data?.applied_date ?? "").trim() || null;
     if (!dryRun) {
       await axios.post(
         `${config.url}/rest/v1/portal_applications`,
-        [{ vacancy_id: vacancyId, candidate_id: candidate.id, applied_for: appliedFor, applied_date: candidate.data?.applied_date ?? null }],
+        [{ vacancy_id: vacancyId, candidate_id: candidate.id, applied_for: appliedFor, applied_date: appliedDate }],
         {
           headers: serviceHeaders(config, { Prefer: "resolution=ignore-duplicates, return=minimal" }),
           params: { on_conflict: "vacancy_id,candidate_id" },
