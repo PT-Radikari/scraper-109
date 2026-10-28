@@ -624,6 +624,7 @@ export async function getVacanciesForSync(config: DashboardConfig, portal: strin
 
 /** One candidate row shaped for the Google Sheet sync (src/googleSheetsSync.ts) — carries the natural key plus date_of_birth/location, which the dashboard's own CandidateRow doesn't select. Contact fields are returned unmasked here, same as getCandidates; the sync module applies its own masking before anything reaches the sheet. */
 export interface CandidateSyncRow {
+  id: number;
   portal: string;
   portalCandidateId: string | null;
   name: string | null;
@@ -634,6 +635,8 @@ export interface CandidateSyncRow {
   appliedFor: string | null;
   appliedDate: string | null;
   hasCv: boolean;
+  /** Raw storage object key, present only when hasCv is true. Only consulted by the Sheets sync's off-by-default CV-link column (src/googleSheetsSync.ts) — never exposed anywhere else, and never a link by itself. */
+  cvObjectKey: string | null;
   hasPhoto: boolean;
   lastSeenAt: string;
 }
@@ -652,7 +655,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
           limit: String(SYNC_PAGE_SIZE),
           offset: String(offset),
           select:
-            "portal,portal_candidate_id,name,email,phone:data->contact->>contact_number," +
+            "id,portal,portal_candidate_id,name,email,phone:data->contact->>contact_number," +
             "date_of_birth:data->>date_of_birth,location:data->>location,cv_object_key,photo_object_key," +
             "last_seen_at,portal_applications(applied_for,applied_date)",
         },
@@ -665,6 +668,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
       const applications = (row.portal_applications as Array<Record<string, unknown>>) ?? [];
       const firstApp = applications[0];
       out.push({
+        id: row.id as number,
         portal: row.portal as string,
         portalCandidateId: presentText(row.portal_candidate_id),
         name: presentText(row.name),
@@ -675,6 +679,7 @@ export async function getCandidatesForSync(config: DashboardConfig, portal: stri
         appliedFor: presentText(firstApp?.applied_for as string | undefined),
         appliedDate: presentText(firstApp?.applied_date as string | undefined),
         hasCv: Boolean(row.cv_object_key),
+        cvObjectKey: presentText(row.cv_object_key),
         hasPhoto: Boolean(row.photo_object_key),
         lastSeenAt: row.last_seen_at as string,
       });

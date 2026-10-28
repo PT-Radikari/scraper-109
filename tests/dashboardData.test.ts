@@ -41,6 +41,31 @@ function withEnv(vars: Record<string, string | undefined>, run: () => void) {
   }
 }
 
+/**
+ * Every SCORING_SUPABASE_* env var — matched dynamically by prefix, not an
+ * enumerated list, so a var this file's authors didn't think to name is
+ * still covered. Forcibly cleared before every test and restored after,
+ * regardless of what any individual test's own withEnv call does — so an
+ * ambient real .env in this worktree can never leak a real Supabase
+ * credential into a test's output. See the matching note in
+ * tests/googleSheetsSync.test.ts for the incident this guards against.
+ */
+let savedAmbientEnv: Record<string, string | undefined> = {};
+beforeEach(() => {
+  savedAmbientEnv = {};
+  for (const key of Object.keys(process.env).filter((k) => k.startsWith("SCORING_SUPABASE_"))) {
+    savedAmbientEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
+afterEach(() => {
+  for (const key of Object.keys(savedAmbientEnv)) {
+    const value = savedAmbientEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 describe("loadDashboardConfig", () => {
   it("returns null when SCORING_SUPABASE_URL/ANON_KEY are missing (fresh checkout)", () => {
     withEnv({ SCORING_SUPABASE_URL: undefined, SCORING_SUPABASE_ANON_KEY: undefined }, () => {
@@ -287,7 +312,7 @@ describe("getCandidatesForSync", () => {
     mockedAxios.get.mockResolvedValue({
       data: [
         {
-          portal: "glints", portal_candidate_id: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
+          id: 42, portal: "glints", portal_candidate_id: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
           phone: "081234567890", date_of_birth: "1998-05-12", location: "Jakarta", cv_object_key: "x.pdf",
           photo_object_key: null, last_seen_at: "t",
           portal_applications: [{ applied_for: "Analyst", applied_date: "2026-10-01" }],
@@ -298,9 +323,9 @@ describe("getCandidatesForSync", () => {
     const rows = await getCandidatesForSync(config, "glints");
     expect(rows).toEqual([
       {
-        portal: "glints", portalCandidateId: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
+        id: 42, portal: "glints", portalCandidateId: "cand-1", name: "Ada Lovelace", email: "ada@example.com",
         phone: "081234567890", dateOfBirth: "1998-05-12", location: "Jakarta",
-        appliedFor: "Analyst", appliedDate: "2026-10-01", hasCv: true, hasPhoto: false, lastSeenAt: "t",
+        appliedFor: "Analyst", appliedDate: "2026-10-01", hasCv: true, cvObjectKey: "x.pdf", hasPhoto: false, lastSeenAt: "t",
       },
     ]);
   });

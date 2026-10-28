@@ -7,6 +7,7 @@ import {
   getVacanciesForSync,
   getCandidatesForSync,
   countPortalRows,
+  getSignedUrl,
   maskEmail,
   maskPhone,
   ALL_PORTALS,
@@ -114,23 +115,44 @@ function readJsonFile<T>(filePath: string, label: string): T {
   } catch {
     throw new Error(`google sheets: could not read ${label} at ${filePath}`);
   }
+  return parseJsonOrThrow<T>(raw, `${filePath} (${label})`);
+}
+
+/** Parses an inline JSON env var's value. Only `label` ever reaches a thrown message — never the value itself. */
+function parseJsonOrThrow<T>(raw: string, label: string): T {
   try {
     return JSON.parse(raw) as T;
   } catch {
-    throw new Error(`google sheets: ${filePath} (${label}) is not valid JSON`);
+    throw new Error(`google sheets: ${label} is not valid JSON`);
   }
 }
 
 /**
- * Resolves the authorized_user (OAuth refresh token) credential from the two
- * local files. The token file alone is accepted if it already embeds
- * client_id/client_secret (ADC's authorized_user shape); otherwise both come
- * from the separate client_secret file (Cloud Console's downloaded
- * client_secret_*.json, under "installed" or "web").
+ * Resolves one of the two credential inputs (an inline JSON env var, or a
+ * local file path) into its parsed JSON. Inline takes priority — it is the
+ * deployment-friendly shape (one env var, no volume mount), matching how
+ * GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON already works. Returns null when
+ * neither is set.
  */
-function loadAuthorizedUserAuth(tokenPath: string, clientSecretPath: string): GoogleSheetsAuth {
-  const token = readJsonFile<AuthorizedUserTokenJson>(tokenPath, "GOOGLE_TOKEN_PATH/GOOGLE_APPLICATION_CREDENTIALS");
-  const clientSecretFile = readJsonFile<ClientSecretJson>(clientSecretPath, "GOOGLE_CLIENT_SECRET_PATH");
+function loadJsonFromInlineOrPath<T>(inlineEnvVar: string, pathEnvVar: string, label: string): T | null {
+  const inline = (process.env[inlineEnvVar] ?? "").trim();
+  if (inline) return parseJsonOrThrow<T>(inline, inlineEnvVar);
+  const path = (process.env[pathEnvVar] ?? "").trim();
+  if (path) return readJsonFile<T>(path, pathEnvVar);
+  return null;
+}
+
+/**
+ * Resolves the authorized_user (OAuth refresh token) credential from the
+ * token and client-secret inputs, each either an inline JSON env var or a
+ * local file path (GOOGLE_SHEETS_TOKEN_JSON / GOOGLE_TOKEN_PATH, alias
+ * GOOGLE_APPLICATION_CREDENTIALS; GOOGLE_SHEETS_CLIENT_SECRET_JSON /
+ * GOOGLE_CLIENT_SECRET_PATH). The token alone is accepted if it already
+ * embeds client_id/client_secret (ADC's authorized_user shape); otherwise
+ * both come from the client-secret input (Cloud Console's downloaded
+ * client_secret_*.json shape, under "installed" or "web").
+ */
+function loadAuthorizedUserAuth(token: AuthorizedUserTokenJson, clientSecretFile: ClientSecretJson, tokenSourceLabel: string): GoogleSheetsAuth {
   const fromFile = clientSecretFile.installed ?? clientSecretFile.web ?? clientSecretFile;
 
   const refreshToken = token.refresh_token;
@@ -138,10 +160,10 @@ function loadAuthorizedUserAuth(tokenPath: string, clientSecretPath: string): Go
   const clientSecret = token.client_secret ?? fromFile.client_secret;
 
   if (!refreshToken) {
-    throw new Error(`google sheets: ${tokenPath} has no refresh_token`);
+    throw new Error(`google sheets: ${tokenSourceLabel} has no refresh_token`);
   }
   if (!clientId || !clientSecret) {
-    throw new Error(`google sheets: could not resolve client_id/client_secret from ${clientSecretPath}`);
+    throw new Error(`google sheets: could not resolve client_id/client_secret (${tokenSourceLabel})`);
   }
   return { kind: "authorized_user", clientId, clientSecret, refreshToken };
 }
@@ -175,11 +197,26 @@ export function loadGoogleSheetsConfig(): GoogleSheetsConfig | null {
     };
   }
 
+  // Token: inline GOOGLE_SHEETS_TOKEN_JSON (deployment-friendly, no volume
+  // mount) takes priority over the path-based GOOGLE_TOKEN_PATH (alias
+  // GOOGLE_APPLICATION_CREDENTIALS), used for local/operator-managed files.
+  const tokenInline = (process.env.GOOGLE_SHEETS_TOKEN_JSON ?? "").trim();
   const tokenPath = (process.env.GOOGLE_TOKEN_PATH ?? process.env.GOOGLE_APPLICATION_CREDENTIALS ?? "").trim();
-  const clientSecretPath = (process.env.GOOGLE_CLIENT_SECRET_PATH ?? "").trim();
-  if (!tokenPath || !clientSecretPath) return null;
+  if (!tokenInline && !tokenPath) return null;
 
-  return { spreadsheetId, auth: loadAuthorizedUserAuth(tokenPath, clientSecretPath) };
+  const token = tokenInline
+    ? parseJsonOrThrow<AuthorizedUserTokenJson>(tokenInline, "GOOGLE_SHEETS_TOKEN_JSON")
+    : readJsonFile<AuthorizedUserTokenJson>(tokenPath, "GOOGLE_TOKEN_PATH/GOOGLE_APPLICATION_CREDENTIALS");
+  const tokenSourceLabel = tokenInline ? "GOOGLE_SHEETS_TOKEN_JSON" : tokenPath;
+
+  const clientSecretFile =
+    loadJsonFromInlineOrPath<ClientSecretJson>(
+      "GOOGLE_SHEETS_CLIENT_SECRET_JSON",
+      "GOOGLE_CLIENT_SECRET_PATH",
+      "GOOGLE_SHEETS_CLIENT_SECRET_JSON/GOOGLE_CLIENT_SECRET_PATH",
+    ) ?? {};
+
+  return { spreadsheetId, auth: loadAuthorizedUserAuth(token, clientSecretFile, tokenSourceLabel) };
 }
 
 /** Comma-separated GOOGLE_SHEETS_SCOPES, or the spreadsheets-only default. Only consulted by the service-account JWT's `scope` claim — a refresh_token grant keeps whatever scopes the original consent granted and does not take a scope parameter. */
@@ -311,18 +348,31 @@ function compositeKey(portal: string, id: string): string {
   return `${portal}::${id}`;
 }
 
-/** Creates the tab if it doesn't exist yet and writes the header row if the tab is empty. Idempotent. */
-async function ensureTab(config: GoogleSheetsConfig, title: string, header: string[]): Promise<void> {
-  const meta = await sheetsRequest<{ sheets: Array<{ properties: { title: string } }> }>(
+/**
+ * Creates the tab if it doesn't exist yet, writes the header row if the tab
+ * is empty, and extends an existing-but-shorter header with any new trailing
+ * column names (e.g. the CV-link column arriving later on a tab the backfill
+ * already populated) — existing column names and their data are never
+ * touched or reordered, only appended to. Also (re-)applies a basic filter
+ * over the full header+data range every time, so it survives someone
+ * removing it by hand; a filter failure is logged and otherwise ignored,
+ * since it must never block the actual data write. Idempotent throughout.
+ */
+export async function ensureTab(config: GoogleSheetsConfig, title: string, header: string[]): Promise<void> {
+  const meta = await sheetsRequest<{ sheets: Array<{ properties: { title: string; sheetId: number } }> }>(
     config,
     "get",
-    "?fields=sheets.properties.title",
+    "?fields=sheets.properties.title,sheets.properties.sheetId",
   );
-  const exists = meta.sheets.some((s) => s.properties.title === title);
-  if (!exists) {
-    await sheetsRequest(config, "post", ":batchUpdate", {
-      requests: [{ addSheet: { properties: { title } } }],
-    });
+  let sheetId = meta.sheets.find((s) => s.properties.title === title)?.properties.sheetId;
+  if (sheetId === undefined) {
+    const created = await sheetsRequest<{ replies: Array<{ addSheet: { properties: { sheetId: number } } }> }>(
+      config,
+      "post",
+      ":batchUpdate",
+      { requests: [{ addSheet: { properties: { title } } }] },
+    );
+    sheetId = created.replies[0].addSheet.properties.sheetId;
   }
 
   const headerRange = `${title}!A1:${colLetter(header.length)}1`;
@@ -331,11 +381,32 @@ async function ensureTab(config: GoogleSheetsConfig, title: string, header: stri
     "get",
     `/values/${encodeURIComponent(headerRange)}`,
   );
-  if (!current.values || current.values.length === 0) {
+  const existingHeader = current.values?.[0] ?? [];
+  if (existingHeader.length === 0) {
     await sheetsRequest(config, "put", `/values/${encodeURIComponent(headerRange)}?valueInputOption=RAW`, {
       range: headerRange,
       values: [header],
     });
+  } else if (existingHeader.length < header.length) {
+    const extendRange = `${title}!${colLetter(existingHeader.length + 1)}1:${colLetter(header.length)}1`;
+    await sheetsRequest(config, "put", `/values/${encodeURIComponent(extendRange)}?valueInputOption=RAW`, {
+      range: extendRange,
+      values: [header.slice(existingHeader.length)],
+    });
+  }
+
+  try {
+    await sheetsRequest(config, "post", ":batchUpdate", {
+      requests: [
+        {
+          setBasicFilter: {
+            filter: { range: { sheetId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: header.length } },
+          },
+        },
+      ],
+    });
+  } catch (error) {
+    console.warn(`[sheets-sync] could not set/refresh the basic filter on "${title}":`, error instanceof Error ? error.message : error);
   }
 }
 
@@ -391,9 +462,41 @@ export async function upsertRows(
   }
 }
 
-/** "captured" / "none" — the captain's decision keeps CV/photo out of the sheet as anything but a presence flag; a signed link expires in 10 minutes and isn't safe to paste into a cell. */
+/** "captured" / "none" — the baseline (CV_LINK_MODE "off") keeps CV/photo out of the sheet as anything but a presence flag; a signed link expires in 10 minutes and isn't safe to paste into a cell. */
 function presenceFlag(present: boolean): string {
   return present ? "captured" : "none";
+}
+
+/**
+ * Candidate CV access, off by default. Design for a decision the captain has
+ * not made yet — do not enable in deployment until told to:
+ *   - "off" (default/unset): no cv_link column at all. Exactly the
+ *     CANDIDATES_HEADER/candidateRow shape already shipped — zero behavior
+ *     change for every existing tab and test.
+ *   - "object_key": the raw scrape.portal_candidates.cv_object_key. Never
+ *     expires, but is not a clickable link by itself — needs separate
+ *     tooling (e.g. scrapview's own sign-url action) to resolve.
+ *   - "signed_url": a Supabase Storage signed URL, minted fresh on every
+ *     sync with GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS (default 3600).
+ *     Clickable immediately, but the link in the cell goes stale after that
+ *     TTL until the next sync re-mints it — unlike every other column, this
+ *     one's value is not durable between syncs. Requires
+ *     SCORING_SUPABASE_SERVICE_KEY (src/dashboardData.ts's getSignedUrl).
+ */
+export type CvLinkMode = "off" | "object_key" | "signed_url";
+
+export function loadCvLinkMode(): CvLinkMode {
+  const raw = (process.env.GOOGLE_SHEETS_CV_LINK_MODE ?? "").trim().toLowerCase();
+  return raw === "object_key" || raw === "signed_url" ? raw : "off";
+}
+
+function loadCvLinkSignedUrlTtlSeconds(): number {
+  const raw = Number(process.env.GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 3600;
+}
+
+function candidatesHeaderFor(mode: CvLinkMode): string[] {
+  return mode === "off" ? CANDIDATES_HEADER : [...CANDIDATES_HEADER, "cv_link"];
 }
 
 /** Keeps the birth year, masks month/day — enough for age-bracket triage without the full date. */
@@ -427,8 +530,26 @@ function vacancyRow(v: VacancySyncRow): string[] {
   ];
 }
 
-function candidateRow(c: CandidateSyncRow): string[] {
-  return [
+/** Resolves the cv_link column's value for one candidate under the given mode. Never throws — a per-candidate signing failure degrades to an empty cell and a warning, not a sync-wide failure. */
+async function resolveCvLink(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<string> {
+  if (!c.cvObjectKey) return "";
+  if (mode === "object_key") return c.cvObjectKey;
+  try {
+    const signed = await getSignedUrl(dashboardConfig, {
+      portal: c.portal,
+      candidateId: c.id,
+      kind: "cv",
+      expiresInSeconds: loadCvLinkSignedUrlTtlSeconds(),
+    });
+    return signed?.url ?? "";
+  } catch (error) {
+    console.warn(`[sheets-sync] could not mint a CV signed URL for candidate ${c.id}:`, error instanceof Error ? error.message : error);
+    return "";
+  }
+}
+
+async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<string[]> {
+  const base = [
     c.portal,
     c.portalCandidateId ?? "",
     c.name ?? "",
@@ -442,6 +563,8 @@ function candidateRow(c: CandidateSyncRow): string[] {
     presenceFlag(c.hasPhoto),
     c.lastSeenAt,
   ];
+  if (mode === "off") return base;
+  return [...base, await resolveCvLink(c, mode, dashboardConfig)];
 }
 
 export interface SheetsSyncResult {
@@ -455,12 +578,14 @@ async function syncOnePortal(
   dashboardConfig: DashboardConfig,
   portal: string,
 ): Promise<{ vacancies: VacancySyncRow[]; candidates: CandidateSyncRow[] }> {
+  const cvLinkMode = loadCvLinkMode();
   const [vacancies, candidates] = await Promise.all([
     getVacanciesForSync(dashboardConfig, portal),
     getCandidatesForSync(dashboardConfig, portal),
   ]);
+  const candidateRows = await Promise.all(candidates.map((c) => candidateRow(c, cvLinkMode, dashboardConfig)));
   await upsertRows(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER, vacancies.map(vacancyRow));
-  await upsertRows(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER, candidates.map(candidateRow));
+  await upsertRows(sheetsConfig, CANDIDATES_TAB, candidatesHeaderFor(cvLinkMode), candidateRows);
   return { vacancies, candidates };
 }
 
@@ -485,7 +610,7 @@ export async function syncPortalResultsToSheets(portal: string): Promise<SheetsS
 
   try {
     await ensureTab(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER);
-    await ensureTab(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER);
+    await ensureTab(sheetsConfig, CANDIDATES_TAB, candidatesHeaderFor(loadCvLinkMode()));
     const { vacancies, candidates } = await syncOnePortal(sheetsConfig, dashboardConfig, portal);
     return { vacancies: vacancies.length, candidates: candidates.length };
   } catch (error) {
@@ -541,7 +666,7 @@ export async function backfillAllPortalsToSheets(
   }
 
   await ensureTab(sheetsConfig, VACANCIES_TAB, VACANCIES_HEADER);
-  await ensureTab(sheetsConfig, CANDIDATES_TAB, CANDIDATES_HEADER);
+  await ensureTab(sheetsConfig, CANDIDATES_TAB, candidatesHeaderFor(loadCvLinkMode()));
 
   const results: PortalBackfillResult[] = [];
   for (const portal of portals) {

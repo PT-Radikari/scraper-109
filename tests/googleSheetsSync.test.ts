@@ -14,6 +14,7 @@ jest.mock("../src/dashboardData", () => {
     getVacanciesForSync: jest.fn(),
     getCandidatesForSync: jest.fn(),
     countPortalRows: jest.fn(),
+    getSignedUrl: jest.fn(),
   };
 });
 
@@ -23,12 +24,14 @@ import {
   maskDateOfBirth,
   maskLocation,
   upsertRows,
+  ensureTab,
   syncPortalResultsToSheets,
   backfillAllPortalsToSheets,
   resetGoogleSheetsTokenCache,
+  loadCvLinkMode,
   GoogleSheetsConfig,
 } from "../src/googleSheetsSync";
-import { getVacanciesForSync, getCandidatesForSync, countPortalRows, ALL_PORTALS } from "../src/dashboardData";
+import { getVacanciesForSync, getCandidatesForSync, countPortalRows, getSignedUrl, ALL_PORTALS } from "../src/dashboardData";
 
 async function withEnv(vars: Record<string, string | undefined>, run: () => void | Promise<void>) {
   const prev: Record<string, string | undefined> = {};
@@ -46,6 +49,38 @@ async function withEnv(vars: Record<string, string | undefined>, run: () => void
     }
   }
 }
+
+/**
+ * Every GOOGLE_* or SCORING_SUPABASE_* env var — matched dynamically by
+ * prefix, not an enumerated list, so a var this file's authors didn't think
+ * to name is still covered. Forcibly cleared before every test and restored
+ * after, regardless of what any individual test's own withEnv call does —
+ * so an ambient real .env in this worktree (left over from a one-shot
+ * backfill, say) can never leak a real credential into a test's output
+ * again. A prior run of this suite printed a real Google OAuth
+ * client_secret/refresh_token into a Bash tool result for exactly this
+ * reason: dotenv.config() loaded the worktree's real .env, and one test
+ * cleared only two of the relevant vars by name.
+ */
+function matchesGoogleOrSupabaseEnv(key: string): boolean {
+  return key.startsWith("GOOGLE_") || key.startsWith("SCORING_SUPABASE_");
+}
+
+let savedAmbientEnv: Record<string, string | undefined> = {};
+beforeEach(() => {
+  savedAmbientEnv = {};
+  for (const key of Object.keys(process.env).filter(matchesGoogleOrSupabaseEnv)) {
+    savedAmbientEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
+afterEach(() => {
+  for (const key of Object.keys(savedAmbientEnv)) {
+    const value = savedAmbientEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 let privateKeyPem: string;
 beforeAll(() => {
@@ -155,7 +190,10 @@ describe("loadGoogleSheetsConfig", () => {
       );
     });
 
-    it("returns null when only one of the two credential files is configured", () => {
+    it("throws (never silently returns null) when no client-secret source is given and the token doesn't embed one", () => {
+      // The client-secret file is only optional when the token already embeds client_id/client_secret;
+      // a bare token with neither is an incomplete config the user clearly intended, not "unconfigured".
+      fs.writeFileSync(tokenPath, JSON.stringify({ refresh_token: "refresh-abc" }));
       withEnv(
         {
           GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
@@ -164,7 +202,57 @@ describe("loadGoogleSheetsConfig", () => {
           GOOGLE_CLIENT_SECRET_PATH: undefined,
         },
         () => {
+          expect(() => loadGoogleSheetsConfig()).toThrow(/could not resolve client_id\/client_secret/);
+        },
+      );
+    });
+
+    it("returns null when neither the inline token nor the token path is configured", () => {
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: undefined,
+          GOOGLE_APPLICATION_CREDENTIALS: undefined,
+          GOOGLE_SHEETS_TOKEN_JSON: undefined,
+          GOOGLE_CLIENT_SECRET_PATH: clientSecretPath,
+        },
+        () => {
           expect(loadGoogleSheetsConfig()).toBeNull();
+        },
+      );
+    });
+
+    it("accepts GOOGLE_SHEETS_TOKEN_JSON/GOOGLE_SHEETS_CLIENT_SECRET_JSON as inline alternatives to the file paths", () => {
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: undefined,
+          GOOGLE_SHEETS_TOKEN_JSON: JSON.stringify({ refresh_token: "refresh-inline" }),
+          GOOGLE_SHEETS_CLIENT_SECRET_JSON: JSON.stringify({ installed: { client_id: "id-inline", client_secret: "secret-inline" } }),
+        },
+        () => {
+          expect(loadGoogleSheetsConfig()).toEqual({
+            spreadsheetId: "sheet1",
+            auth: { kind: "authorized_user", clientId: "id-inline", clientSecret: "secret-inline", refreshToken: "refresh-inline" },
+          });
+        },
+      );
+    });
+
+    it("prefers the inline token over a token file path when both are set", () => {
+      fs.writeFileSync(tokenPath, JSON.stringify({ refresh_token: "refresh-from-file", client_id: "id-file", client_secret: "secret-file" }));
+      withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet1",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_TOKEN_PATH: tokenPath,
+          GOOGLE_SHEETS_TOKEN_JSON: JSON.stringify({ refresh_token: "refresh-inline", client_id: "id-inline", client_secret: "secret-inline" }),
+        },
+        () => {
+          const config = loadGoogleSheetsConfig();
+          expect(config?.auth).toEqual({ kind: "authorized_user", clientId: "id-inline", clientSecret: "secret-inline", refreshToken: "refresh-inline" });
         },
       );
     });
@@ -320,6 +408,95 @@ describe("upsertRows", () => {
   });
 });
 
+describe("ensureTab", () => {
+  it("creates a missing tab, writes its header, and sets a basic filter over the header+data range", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) return Promise.resolve({ data: { sheets: [] } }); // tab doesn't exist yet
+      if (url.includes("!A1")) return Promise.resolve({ data: {} }); // no header yet either
+      return Promise.resolve({ data: {} });
+    });
+    const batchUpdateCalls: unknown[] = [];
+    let headerPutRange: string | undefined;
+    mockedAxios.post.mockImplementation((rawUrl: string, data?: unknown) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (decodeURIComponent(rawUrl).includes(":batchUpdate")) {
+        batchUpdateCalls.push(data);
+        if ((data as { requests?: Array<{ addSheet?: unknown }> }).requests?.[0]?.addSheet) {
+          return Promise.resolve({ data: { replies: [{ addSheet: { properties: { sheetId: 42 } } }] } });
+        }
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.put.mockImplementation((rawUrl: string) => {
+      headerPutRange = decodeURIComponent(rawUrl).split("/values/")[1]?.split("?")[0];
+      return Promise.resolve({ data: {} });
+    });
+
+    await ensureTab(CONFIG, "Vacancies", ["portal", "portal_vacancy_id", "title"]);
+
+    expect(batchUpdateCalls[0]).toMatchObject({ requests: [{ addSheet: { properties: { title: "Vacancies" } } }] });
+    expect(headerPutRange).toBe("Vacancies!A1:C1");
+    const filterCall = batchUpdateCalls.find((c) => (c as { requests?: Array<{ setBasicFilter?: unknown }> }).requests?.[0]?.setBasicFilter);
+    expect(filterCall).toMatchObject({
+      requests: [{ setBasicFilter: { filter: { range: { sheetId: 42, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: 3 } } } }],
+    });
+  });
+
+  it("extends a shorter existing header with new trailing columns, never touching the existing ones", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Candidates", sheetId: 7 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [["portal", "portal_candidate_id"]] } }); // only 2 of the expected 3 columns
+      return Promise.resolve({ data: {} });
+    });
+    let extendRange: string | undefined;
+    let extendValues: unknown;
+    mockedAxios.put.mockImplementation((rawUrl: string, data?: unknown) => {
+      extendRange = decodeURIComponent(rawUrl).split("/values/")[1]?.split("?")[0];
+      extendValues = (data as { values?: unknown }).values;
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      return Promise.resolve({ data: {} });
+    });
+
+    await ensureTab(CONFIG, "Candidates", ["portal", "portal_candidate_id", "cv_link"]);
+
+    expect(extendRange).toBe("Candidates!C1:C1");
+    expect(extendValues).toEqual([["cv_link"]]);
+  });
+
+  it("logs and continues when setting the basic filter fails, never blocking the header/tab setup", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (decodeURIComponent(rawUrl).includes(":batchUpdate")) return Promise.reject(new Error("permission denied"));
+      return Promise.resolve({ data: {} });
+    });
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(ensureTab(CONFIG, "Vacancies", ["portal", "portal_vacancy_id"])).resolves.toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('basic filter on "Vacancies"'), expect.anything());
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
 describe("syncPortalResultsToSheets", () => {
   it("is a no-op when unconfigured (fresh checkout)", async () => {
     await withEnv(
@@ -368,10 +545,11 @@ describe("syncPortalResultsToSheets", () => {
     mockedAxios.get.mockImplementation((rawUrl: string) => {
       const url = decodeURIComponent(rawUrl);
       if (url.includes("fields=sheets.properties.title")) {
-        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies" } }, { properties: { title: "Candidates" } }] } });
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
       }
       if (url.includes("!A1")) {
-        return Promise.resolve({ data: { values: [["portal"]] } }); // header already present
+        // Header already present at full length — long enough for any tab's header, so ensureTab never tries to extend it.
+        return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
       }
       if (url.includes("!A2:B")) {
         return Promise.resolve({ data: {} }); // no existing rows -> every row appends
@@ -449,6 +627,139 @@ describe("syncPortalResultsToSheets", () => {
   });
 });
 
+describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, off by default)", () => {
+  function mockSheetsPlumbing(appends: Array<{ url: string; data: unknown }>) {
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      if (url.includes("!A2:B")) return Promise.resolve({ data: {} });
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string, data?: unknown) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (decodeURIComponent(rawUrl).includes(":append")) appends.push({ url: decodeURIComponent(rawUrl), data });
+      return Promise.resolve({ data: {} });
+    });
+  }
+
+  const BASE_ENV = {
+    GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+    GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com" }),
+    SCORING_SUPABASE_URL: "http://supabase.local",
+    SCORING_SUPABASE_ANON_KEY: "anon-key",
+  };
+
+  function withPrivateKey() {
+    return { ...BASE_ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com", private_key: privateKeyPem }) };
+  }
+
+  it("defaults to off: no cv_link column, no header change, exactly the existing 12-column row shape", () => {
+    expect(loadCvLinkMode()).toBe("off");
+  });
+
+  it("object_key mode appends the raw cv_object_key as the 13th column", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/cand-1/cv.pdf", hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+
+    await withEnv({ ...withPrivateKey(), GOOGLE_SHEETS_CV_LINK_MODE: "object_key" }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row).toHaveLength(13);
+    expect(row[12]).toBe("glints/cand-1/cv.pdf");
+    expect(getSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it("signed_url mode mints a signed URL with the configured TTL and appends it as the 13th column", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/cand-1/cv.pdf", hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    (getSignedUrl as jest.Mock).mockResolvedValue({ url: "https://signed.example/cv.pdf", expiresAt: "2026-10-28T00:00:00Z" });
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+
+    await withEnv(
+      { ...withPrivateKey(), GOOGLE_SHEETS_CV_LINK_MODE: "signed_url", GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS: "7200" },
+      async () => {
+        await syncPortalResultsToSheets("glints");
+      },
+    );
+
+    expect(getSignedUrl).toHaveBeenCalledWith(expect.anything(), { portal: "glints", candidateId: 9, kind: "cv", expiresInSeconds: 7200 });
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[12]).toBe("https://signed.example/cv.pdf");
+  });
+
+  it("signed_url mode degrades to an empty cell (never throws) when minting the signed URL fails", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/cand-1/cv.pdf", hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    (getSignedUrl as jest.Mock).mockRejectedValue(new Error("service key not configured"));
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await withEnv({ ...withPrivateKey(), GOOGLE_SHEETS_CV_LINK_MODE: "signed_url" }, async () => {
+        const result = await syncPortalResultsToSheets("glints");
+        expect(result).toEqual({ vacancies: 0, candidates: 1 });
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[12]).toBe("");
+  });
+
+  it("neither object_key nor signed_url mode ever calls getSignedUrl/appends a column for a candidate with no CV", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, cvObjectKey: null, hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+
+    await withEnv({ ...withPrivateKey(), GOOGLE_SHEETS_CV_LINK_MODE: "signed_url" }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    expect(getSignedUrl).not.toHaveBeenCalled();
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[12]).toBe("");
+  });
+});
+
 describe("authorized_user access-token refresh", () => {
   const AUTH_USER_CONFIG: GoogleSheetsConfig = {
     spreadsheetId: "sheet-xyz",
@@ -495,6 +806,76 @@ describe("authorized_user access-token refresh", () => {
     expect(caught?.message).not.toContain("refresh-abc");
     expect(caught?.message).not.toContain("client-secret");
   });
+
+  it("the per-cycle auto-sync works end to end with the authorized_user credential, not just a service account", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([]);
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      return Promise.resolve({ data: {} });
+    });
+    let refreshGrantSent = false;
+    mockedAxios.post.mockImplementation((url: string, body?: unknown) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        if (typeof body === "string" && body.includes("grant_type=refresh_token")) refreshGrantSent = true;
+        return Promise.resolve({ data: { access_token: "user-token", expires_in: 3599 } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    await withEnv(
+      {
+        GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+        GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+        GOOGLE_SHEETS_TOKEN_JSON: JSON.stringify({ refresh_token: "refresh-abc", client_id: "client-id", client_secret: "client-secret" }),
+        SCORING_SUPABASE_URL: "http://supabase.local",
+        SCORING_SUPABASE_ANON_KEY: "anon-key",
+      },
+      async () => {
+        const result = await syncPortalResultsToSheets("glints");
+        expect(result).toEqual({ vacancies: 0, candidates: 0 });
+      },
+    );
+    expect(refreshGrantSent).toBe(true);
+  });
+
+  it("an OAuth refresh failure (invalid_grant) during the per-cycle auto-sync is logged and skipped, never thrown into the scraper", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([]);
+    mockedAxios.post.mockImplementation((url: string) => {
+      if (url === "https://oauth2.googleapis.com/token") {
+        const error = new Error("Request failed") as Error & { isAxiosError: boolean; response: unknown };
+        error.isAxiosError = true;
+        error.response = { status: 400, data: { error: "invalid_grant" } };
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.isAxiosError.mockReturnValue(true);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await withEnv(
+        {
+          GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+          GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: undefined,
+          GOOGLE_SHEETS_TOKEN_JSON: JSON.stringify({ refresh_token: "refresh-abc", client_id: "client-id", client_secret: "client-secret" }),
+          SCORING_SUPABASE_URL: "http://supabase.local",
+          SCORING_SUPABASE_ANON_KEY: "anon-key",
+        },
+        async () => {
+          await expect(syncPortalResultsToSheets("glints")).resolves.toBeNull();
+        },
+      );
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 describe("backfillAllPortalsToSheets", () => {
@@ -516,7 +897,7 @@ describe("backfillAllPortalsToSheets", () => {
     (countPortalRows as jest.Mock).mockImplementation((_config, table: string, portal: string) =>
       Promise.resolve(table === "portal_vacancies" && portal === "glints" ? 2 : 0),
     );
-    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies" } }, { properties: { title: "Candidates" } }], values: [["portal"]] } });
+    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }], values: [Array(20).fill("x")] } });
     mockedAxios.post.mockImplementation((url: string) => {
       if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
       return Promise.resolve({ data: {} });
@@ -545,7 +926,7 @@ describe("backfillAllPortalsToSheets", () => {
     (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
     (getCandidatesForSync as jest.Mock).mockResolvedValue([]);
     (countPortalRows as jest.Mock).mockResolvedValue(0);
-    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies" } }, { properties: { title: "Candidates" } }], values: [["portal"]] } });
+    mockedAxios.get.mockResolvedValue({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }], values: [Array(20).fill("x")] } });
     mockedAxios.post.mockImplementation((url: string) => {
       if (url === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
       return Promise.resolve({ data: {} });
