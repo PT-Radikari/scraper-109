@@ -161,6 +161,11 @@ The same page also renders a **scraping-progress dashboard** (`src/dashboardData
 
 Each section polls independently with an in-flight guard so overlapping requests are dropped rather than queued.
 
+`GET /cv/:portal/:candidateId` is the same sign-then-redirect behavior as the action above, but as a
+plain no-login link — the one the Google Sheet sync embeds in its `cv_link` column (see **Google
+Sheet sync** below). `:candidateId` is the `scrape.portal_candidates` row id (the same id
+`sign-url` takes), not the portal-native candidate id.
+
 ---
 
 ### Individual Scrapers (development mode)
@@ -382,13 +387,21 @@ below.
   only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
   isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
   `src/googleSheetsSync.ts` for the exact column list.
-- **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, **off by default** — the captain has not picked
-  an access model yet): `"off"` is the shape above, unchanged. `"object_key"` appends the raw,
-  non-expiring `cv_object_key` as a 13th column (not a clickable link by itself). `"signed_url"`
-  mints a fresh Supabase Storage signed URL on every sync (`GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS`,
-  default 3600) and appends that — clickable immediately, but the cell goes stale after the TTL
-  until the next sync re-mints it, and it needs `SCORING_SUPABASE_SERVICE_KEY`. A per-candidate
-  signing failure degrades to an empty cell and a warning, never a sync-wide failure.
+- **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, decided by the captain 2026-10-28 — **"scrapview_link"
+  is the default (ON)**): appends a 13th `cv_link` column holding a stable link to the viewer's own
+  `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a fresh Supabase
+  signed URL on each click and redirects — the same resolve-on-click behavior scrapview's own UI
+  already uses. The cell itself never expires and never carries the raw storage key or a baked-in
+  signed URL. Needs `SCRAPVIEW_BASE_URL` (the viewer's public base URL); if unset, cells are left
+  blank with a warning rather than failing the sync. Applies to the backfill too. Other values,
+  kept for flexibility/testing: `"off"` (no `cv_link` column at all, the original shape) ·
+  `"object_key"` (the raw, non-expiring `cv_object_key`, not a clickable link by itself) ·
+  `"signed_url"` (mints a Supabase Storage signed URL directly into the cell on every sync,
+  `GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS` default 3600 — goes stale after that TTL until the
+  next sync re-mints it, and needs `SCORING_SUPABASE_SERVICE_KEY`). A per-candidate link-resolution
+  failure in any mode degrades to an empty cell and a warning, never a sync-wide failure. An
+  existing tab's shorter header (e.g. one populated before this column existed) is extended with
+  the new trailing column name on the next sync, never touching what's already there.
 - **Failure behavior**: unconfigured (`GOOGLE_SHEETS_SPREADSHEET_ID` plus one full credential shape
   missing) is a silent no-op — existing scraper behavior is unchanged on a fresh checkout. A
   misconfigured credential (malformed JSON, an unreadable token/client-secret file, a token file

@@ -63,7 +63,7 @@ async function withEnv(vars: Record<string, string | undefined>, run: () => void
  * cleared only two of the relevant vars by name.
  */
 function matchesGoogleOrSupabaseEnv(key: string): boolean {
-  return key.startsWith("GOOGLE_") || key.startsWith("SCORING_SUPABASE_");
+  return key.startsWith("GOOGLE_") || key.startsWith("SCORING_SUPABASE_") || key.startsWith("SCRAPVIEW_");
 }
 
 let savedAmbientEnv: Record<string, string | undefined> = {};
@@ -627,7 +627,7 @@ describe("syncPortalResultsToSheets", () => {
   });
 });
 
-describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, off by default)", () => {
+describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by default)", () => {
   function mockSheetsPlumbing(appends: Array<{ url: string; data: unknown }>) {
     mockedAxios.get.mockImplementation((rawUrl: string) => {
       const url = decodeURIComponent(rawUrl);
@@ -656,8 +656,70 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, off by default)", () => {
     return { ...BASE_ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "sync@test.iam.gserviceaccount.com", private_key: privateKeyPem }) };
   }
 
-  it("defaults to off: no cv_link column, no header change, exactly the existing 12-column row shape", () => {
-    expect(loadCvLinkMode()).toBe("off");
+  it("defaults to scrapview_link (ON)", () => {
+    expect(loadCvLinkMode()).toBe("scrapview_link");
+  });
+
+  it("an unrecognized or blank GOOGLE_SHEETS_CV_LINK_MODE also falls back to scrapview_link, not off", () => {
+    withEnv({ GOOGLE_SHEETS_CV_LINK_MODE: "nonsense" }, () => {
+      expect(loadCvLinkMode()).toBe("scrapview_link");
+    });
+  });
+
+  it("off explicitly disables the column, back to the original 12-column shape", () => {
+    withEnv({ GOOGLE_SHEETS_CV_LINK_MODE: "off" }, () => {
+      expect(loadCvLinkMode()).toBe("off");
+    });
+  });
+
+  it("scrapview_link mode builds a stable viewer URL, never a raw key or a signed link, and needs no Supabase service key", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/cand-1/cv.pdf", hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+
+    await withEnv({ ...withPrivateKey(), SCRAPVIEW_BASE_URL: "https://scrapview.example.com/" }, async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    expect(getSignedUrl).not.toHaveBeenCalled();
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[12]).toBe("https://scrapview.example.com/cv/glints/9");
+  });
+
+  it("scrapview_link mode leaves the cell blank (and warns, never throws) when SCRAPVIEW_BASE_URL is unset", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: true, cvObjectKey: "glints/cand-1/cv.pdf", hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const appends: Array<{ url: string; data: unknown }> = [];
+    mockSheetsPlumbing(appends);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      await withEnv({ ...withPrivateKey(), SCRAPVIEW_BASE_URL: undefined }, async () => {
+        const result = await syncPortalResultsToSheets("glints");
+        expect(result).toEqual({ vacancies: 0, candidates: 1 });
+      });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("SCRAPVIEW_BASE_URL"));
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
+    const row = (candidateAppend?.data as { values: string[][] }).values[0];
+    expect(row[12]).toBe("");
   });
 
   it("object_key mode appends the raw cv_object_key as the 13th column", async () => {

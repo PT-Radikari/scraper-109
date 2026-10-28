@@ -468,31 +468,42 @@ function presenceFlag(present: boolean): string {
 }
 
 /**
- * Candidate CV access, off by default. Design for a decision the captain has
- * not made yet — do not enable in deployment until told to:
- *   - "off" (default/unset): no cv_link column at all. Exactly the
- *     CANDIDATES_HEADER/candidateRow shape already shipped — zero behavior
- *     change for every existing tab and test.
+ * Candidate CV access. Decided by the captain 2026-10-28 ("just put the link
+ * to the pdf just like what you did on the scrapview") — "scrapview_link" is
+ * now the default (ON):
+ *   - "scrapview_link" (default): a stable link to the viewer's own
+ *     GET /cv/:portal/:candidateId (src/viewer.ts), which mints a fresh
+ *     Supabase signed URL on each click and redirects — the same
+ *     resolve-on-click behavior scrapview's own UI already uses. The sheet
+ *     cell itself never expires and never carries a raw storage key or a
+ *     signed URL; only SCRAPVIEW_BASE_URL (e.g. https://scrapview.aryahanif.xyz)
+ *     is needed sheet-side, no Supabase service key.
+ *   - "off": no cv_link column at all. Exactly the CANDIDATES_HEADER/
+ *     candidateRow shape originally shipped.
  *   - "object_key": the raw scrape.portal_candidates.cv_object_key. Never
- *     expires, but is not a clickable link by itself — needs separate
- *     tooling (e.g. scrapview's own sign-url action) to resolve.
- *   - "signed_url": a Supabase Storage signed URL, minted fresh on every
- *     sync with GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS (default 3600).
- *     Clickable immediately, but the link in the cell goes stale after that
- *     TTL until the next sync re-mints it — unlike every other column, this
- *     one's value is not durable between syncs. Requires
- *     SCORING_SUPABASE_SERVICE_KEY (src/dashboardData.ts's getSignedUrl).
+ *     expires, but is not a clickable link by itself.
+ *   - "signed_url": a Supabase Storage signed URL minted directly into the
+ *     cell on every sync (GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS,
+ *     default 3600) — goes stale after that TTL until the next sync
+ *     re-mints it, unlike every other column. Superseded by
+ *     "scrapview_link" for live use; kept for flexibility/testing.
  */
-export type CvLinkMode = "off" | "object_key" | "signed_url";
+export type CvLinkMode = "off" | "object_key" | "signed_url" | "scrapview_link";
 
 export function loadCvLinkMode(): CvLinkMode {
   const raw = (process.env.GOOGLE_SHEETS_CV_LINK_MODE ?? "").trim().toLowerCase();
-  return raw === "object_key" || raw === "signed_url" ? raw : "off";
+  return raw === "off" || raw === "object_key" || raw === "signed_url" ? raw : "scrapview_link";
 }
 
 function loadCvLinkSignedUrlTtlSeconds(): number {
   const raw = Number(process.env.GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS);
   return Number.isFinite(raw) && raw > 0 ? raw : 3600;
+}
+
+/** Trailing-slash-trimmed SCRAPVIEW_BASE_URL, or null when unset. */
+function loadScrapviewBaseUrl(): string | null {
+  const raw = (process.env.SCRAPVIEW_BASE_URL ?? "").trim();
+  return raw ? raw.replace(/\/+$/, "") : null;
 }
 
 function candidatesHeaderFor(mode: CvLinkMode): string[] {
@@ -534,6 +545,14 @@ function vacancyRow(v: VacancySyncRow): string[] {
 async function resolveCvLink(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<string> {
   if (!c.cvObjectKey) return "";
   if (mode === "object_key") return c.cvObjectKey;
+  if (mode === "scrapview_link") {
+    const base = loadScrapviewBaseUrl();
+    if (!base) {
+      console.warn(`[sheets-sync] SCRAPVIEW_BASE_URL is not set, leaving cv_link blank for candidate ${c.id}`);
+      return "";
+    }
+    return `${base}/cv/${encodeURIComponent(c.portal)}/${c.id}`;
+  }
   try {
     const signed = await getSignedUrl(dashboardConfig, {
       portal: c.portal,
