@@ -2,6 +2,7 @@ import { closeIngestionService } from "./central/portalBridge";
 import { loadRetryConfig, runWithRetry } from "./retry";
 import { closeTrackedBrowsers } from "./browserRegistry";
 import { SupabaseSink } from "./supabaseSink";
+import { syncPortalResultsToSheets, backfillAllPortalsToSheets } from "./googleSheetsSync";
 import fs from "fs";
 import path from "path";
 
@@ -301,6 +302,7 @@ export async function runPortalCycle(
   portal: string,
   buildScraper: () => ContinuousScraper,
   sink: Pick<SupabaseSink, "recordRunStart" | "recordRunEnd"> | null,
+  syncToSheets: (portal: string) => Promise<unknown> = syncPortalResultsToSheets,
 ): Promise<void> {
   const config = loadRetryConfig();
   let lastScraper: ContinuousScraper | null = null;
@@ -349,6 +351,19 @@ export async function runPortalCycle(
       });
     } catch (error) {
       console.warn(`[scheduler] failed to record ${portal} run end`, error);
+    }
+  }
+
+  // Mirrors this portal's current scrape.* rows into the Google Sheet, only
+  // after a cycle that actually succeeded. syncPortalResultsToSheets already
+  // swallows its own errors (unconfigured or failing sync must never affect
+  // the scraping cycle); this catch is defense-in-depth for an injected
+  // override that doesn't.
+  if (!cycleError) {
+    try {
+      await syncToSheets(portal);
+    } catch (error) {
+      console.warn(`[scheduler] ${portal}: sheets sync failed`, error);
     }
   }
 }
@@ -498,6 +513,31 @@ function main(): void {
           await service.init();
           console.log(await service.stats());
           await service.close();
+        })();
+        break;
+      }
+
+      // One-shot, manually-invoked catch-up for populating the Google Sheet
+      // with every portal's existing scrape.* rows (see
+      // backfillAllPortalsToSheets in src/googleSheetsSync.ts). Never part of
+      // the scraping pipeline or the continuous loop — run by hand once the
+      // Google credential and sheet access are verified.
+      case "sheets-backfill": {
+        console.log("Will run the one-shot Google Sheets backfill");
+        void (async () => {
+          try {
+            const report = await backfillAllPortalsToSheets();
+            console.log(JSON.stringify(report, null, 2));
+            if (!report.allRowCountsMatch) {
+              console.error(
+                "[sheets-backfill] row count mismatch against Supabase for one or more portals - see report above",
+              );
+              process.exitCode = 1;
+            }
+          } catch (error) {
+            console.error("[sheets-backfill] failed:", error instanceof Error ? error.message : error);
+            process.exitCode = 1;
+          }
         })();
         break;
       }

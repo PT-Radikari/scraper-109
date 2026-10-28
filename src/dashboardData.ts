@@ -236,6 +236,15 @@ async function countRows(
   }
 }
 
+/** Exact row count for one portal's table via PostgREST `count=exact` — used by the Google Sheet backfill's verification step (src/googleSheetsSync.ts) to confirm nothing was dropped between the paginated fetch and the sheet write. */
+export async function countPortalRows(
+  config: DashboardConfig,
+  table: "portal_vacancies" | "portal_candidates",
+  portal: string,
+): Promise<number> {
+  return countRows(config, table, { portal: portalFilter(portal) });
+}
+
 async function fetchLatestRun(config: DashboardConfig, portal: string): Promise<ScrapeRunRow | null> {
   try {
     const response = await axios.get(`${config.url}/rest/v1/scrape_runs`, {
@@ -558,6 +567,127 @@ export async function getCandidates(
   } catch (error) {
     throw sanitize("fetch candidates", error);
   }
+}
+
+/** One vacancy row shaped for the Google Sheet sync (src/googleSheetsSync.ts) — carries the natural key (portal, portalVacancyId) the dashboard's own VacancyRow doesn't expose. */
+export interface VacancySyncRow {
+  portal: string;
+  portalVacancyId: string;
+  title: string | null;
+  link: string | null;
+  status: string | null;
+  totalApplicant: number | null;
+  description: string | null;
+  lastSeenAt: string;
+}
+
+const SYNC_PAGE_SIZE = 500;
+
+/** Every vacancy row for one portal, paged through in full (not just one page) — the sheet sync mirrors the whole table, not a dashboard page. */
+export async function getVacanciesForSync(config: DashboardConfig, portal: string): Promise<VacancySyncRow[]> {
+  const out: VacancySyncRow[] = [];
+  for (let offset = 0; ; offset += SYNC_PAGE_SIZE) {
+    let page: Record<string, unknown>[];
+    try {
+      const response = await withVacancyDescription((expr) =>
+        axios.get(`${config.url}/rest/v1/portal_vacancies`, {
+          headers: anonHeaders(config),
+          params: {
+            portal: portalFilter(portal),
+            order: "id.asc",
+            limit: String(SYNC_PAGE_SIZE),
+            offset: String(offset),
+            select: `portal,portal_vacancy_id,title,link,status,total_applicant,last_seen_at,description:${expr}`,
+          },
+        }),
+      );
+      page = response.data;
+    } catch (error) {
+      throw sanitize("fetch vacancies for sync", error);
+    }
+    for (const row of page) {
+      out.push({
+        portal: row.portal as string,
+        portalVacancyId: row.portal_vacancy_id as string,
+        title: presentText(row.title),
+        link: presentText(row.link),
+        status: presentText(row.status),
+        totalApplicant: typeof row.total_applicant === "number" ? row.total_applicant : null,
+        description: presentText(row.description),
+        lastSeenAt: row.last_seen_at as string,
+      });
+    }
+    if (page.length < SYNC_PAGE_SIZE) break;
+  }
+  return out;
+}
+
+/** One candidate row shaped for the Google Sheet sync (src/googleSheetsSync.ts) — carries the natural key plus date_of_birth/location, which the dashboard's own CandidateRow doesn't select. Contact fields are returned unmasked here, same as getCandidates; the sync module applies its own masking before anything reaches the sheet. */
+export interface CandidateSyncRow {
+  id: number;
+  portal: string;
+  portalCandidateId: string | null;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  dateOfBirth: string | null;
+  location: string | null;
+  appliedFor: string | null;
+  appliedDate: string | null;
+  hasCv: boolean;
+  /** Raw storage object key, present only when hasCv is true. Only consulted by the Sheets sync's off-by-default CV-link column (src/googleSheetsSync.ts) — never exposed anywhere else, and never a link by itself. */
+  cvObjectKey: string | null;
+  hasPhoto: boolean;
+  lastSeenAt: string;
+}
+
+/** Every candidate row for one portal, paged through in full. */
+export async function getCandidatesForSync(config: DashboardConfig, portal: string): Promise<CandidateSyncRow[]> {
+  const out: CandidateSyncRow[] = [];
+  for (let offset = 0; ; offset += SYNC_PAGE_SIZE) {
+    let page: Record<string, unknown>[];
+    try {
+      const response = await axios.get(`${config.url}/rest/v1/portal_candidates`, {
+        headers: anonHeaders(config),
+        params: {
+          portal: portalFilter(portal),
+          order: "id.asc",
+          limit: String(SYNC_PAGE_SIZE),
+          offset: String(offset),
+          select:
+            "id,portal,portal_candidate_id,name,email,phone:data->contact->>contact_number," +
+            "date_of_birth:data->>date_of_birth,location:data->>location,cv_object_key,photo_object_key," +
+            "last_seen_at,portal_applications(applied_for,applied_date)",
+          "portal_applications.order": "applied_date.desc",
+        },
+      });
+      page = response.data;
+    } catch (error) {
+      throw sanitize("fetch candidates for sync", error);
+    }
+    for (const row of page) {
+      const applications = (row.portal_applications as Array<Record<string, unknown>>) ?? [];
+      const firstApp = applications[0];
+      out.push({
+        id: row.id as number,
+        portal: row.portal as string,
+        portalCandidateId: presentText(row.portal_candidate_id),
+        name: presentText(row.name),
+        email: presentText(row.email),
+        phone: presentText(row.phone),
+        dateOfBirth: presentText(row.date_of_birth),
+        location: presentText(row.location),
+        appliedFor: presentText(firstApp?.applied_for as string | undefined),
+        appliedDate: presentText(firstApp?.applied_date as string | undefined),
+        hasCv: Boolean(row.cv_object_key),
+        cvObjectKey: presentText(row.cv_object_key),
+        hasPhoto: Boolean(row.photo_object_key),
+        lastSeenAt: row.last_seen_at as string,
+      });
+    }
+    if (page.length < SYNC_PAGE_SIZE) break;
+  }
+  return out;
 }
 
 /**

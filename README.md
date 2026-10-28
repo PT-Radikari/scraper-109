@@ -161,6 +161,11 @@ The same page also renders a **scraping-progress dashboard** (`src/dashboardData
 
 Each section polls independently with an in-flight guard so overlapping requests are dropped rather than queued.
 
+`GET /cv/:portal/:candidateId` is the same sign-then-redirect behavior as the action above, but as a
+plain no-login link — the one the Google Sheet sync embeds in its `cv_link` column (see **Google
+Sheet sync** below). `:candidateId` is the `scrape.portal_candidates` row id (the same id
+`sign-url` takes), not the portal-native candidate id.
+
 ---
 
 ### Individual Scrapers (development mode)
@@ -347,3 +352,92 @@ and the legacy paths still use the native `sqlite3` dependency; if `node_modules
 host with a different OS/architecture, reinstall dependencies for the current
 platform or run `npm rebuild sqlite3`. The Docker image installs its own
 dependencies during the build, so rebuilding locally cannot break the container.
+
+## Google Sheet sync
+
+An optional mirror of the scrape results into a Google Sheet, alongside the Supabase sink above
+and the scrapview dashboard — for operators who want the results in a spreadsheet. Implemented in
+`src/googleSheetsSync.ts` and talks the Sheets API v4 directly over axios (no `googleapis`
+dependency), the same "REST over axios, no SDK/driver" posture `src/supabaseSink.ts` takes with
+Supabase. Supports two credential shapes — a service account (JWT signed with Node's own `crypto`)
+or an authorized_user OAuth refresh token (inline JSON env vars or local files) — see **Config**
+below.
+
+- **Trigger**: `src/server.ts`'s `runPortalCycle` calls it once, after a cycle that finished
+  successfully (never on a failed cycle, and a sync failure itself never fails the cycle — same
+  "must never abort a scraping run" rule the central-ingestion bridge follows). It is a mirror, not
+  a new standing service: no extra container, no polling loop.
+- **Grain / tabs**: two tabs, `Vacancies` (one row per `scrape.portal_vacancies` row) and
+  `Candidates` (one row per `scrape.portal_candidates` row, each carrying its most recent linked
+  application's `applied_for`/`applied_date` — the embedded `portal_applications` select is ordered
+  `applied_date.desc`, so a candidate with several applications deterministically shows the newest
+  one). Each sync call re-pages through every row the
+  triggering portal currently has in Supabase (not just what changed) and **upserts in place**,
+  keyed by the sheet row's first two columns — `(portal, portal_vacancy_id)` for Vacancies,
+  `(portal, portal_candidate_id)` for Candidates — so a re-scrape updates its existing line and
+  never appends a duplicate. A tab is created (and given its header row) on first use if it doesn't
+  exist yet; an existing-but-shorter header (e.g. the CV-link column arriving later) is extended
+  with the new trailing column names, never touching or reordering what's already there. A basic
+  filter (Sheets API `setBasicFilter`) over the header+data range is (re-)applied on every sync too,
+  so it stays in place even if someone removes it by hand; a filter failure is logged and otherwise
+  ignored — it must never block the actual data write.
+- **Fields and PII handling** (decided 2026-10-27): `email`, `phone`, `date_of_birth` and
+  `location` are masked before they ever leave the process (`maskEmail`/`maskPhone` from
+  `src/dashboardData.ts`; `maskDateOfBirth`/`maskLocation` in `src/googleSheetsSync.ts`) — a sheet
+  is far more exportable/forwardable than the authenticated dashboard, so it never gets the
+  dashboard's unmasked view. `cv_object_key`/`photo_object_key` never appear as links or raw keys,
+  only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
+  isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
+  `src/googleSheetsSync.ts` for the exact column list.
+- **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, decided by the captain 2026-10-28 — **"scrapview_link"
+  is the default (ON)**): appends a 13th `cv_link` column holding a stable link to the viewer's own
+  `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a fresh Supabase
+  signed URL on each click and redirects — the same resolve-on-click behavior scrapview's own UI
+  already uses. The cell itself never expires and never carries the raw storage key or a baked-in
+  signed URL. Needs `SCRAPVIEW_BASE_URL` (the viewer's public base URL); if unset, cells are left
+  blank with a warning rather than failing the sync. Applies to the backfill too. Other values,
+  kept for flexibility/testing: `"off"` (no `cv_link` column at all, the original shape) ·
+  `"object_key"` (the raw, non-expiring `cv_object_key`, not a clickable link by itself) ·
+  `"signed_url"` (mints a Supabase Storage signed URL directly into the cell on every sync,
+  `GOOGLE_SHEETS_CV_LINK_SIGNED_URL_TTL_SECONDS` default 3600 — goes stale after that TTL until the
+  next sync re-mints it, and needs `SCORING_SUPABASE_SERVICE_KEY`). A per-candidate link-resolution
+  failure in any mode degrades to an empty cell and a warning, never a sync-wide failure. An
+  existing tab's shorter header (e.g. one populated before this column existed) is extended with
+  the new trailing column name on the next sync, never touching what's already there.
+- **Failure behavior**: unconfigured (`GOOGLE_SHEETS_SPREADSHEET_ID` plus one full credential shape
+  missing) is a silent no-op — existing scraper behavior is unchanged on a fresh checkout. A
+  misconfigured credential (malformed JSON, an unreadable token/client-secret file, a token file
+  with no `refresh_token`) or any Sheets/OAuth API failure (including a 403 from the sheet not being
+  shared with the credential's account, or an `invalid_grant` from an expired/revoked refresh token)
+  is logged as `[sheets-sync] ...` and otherwise swallowed; it never fails or alters the scrape
+  cycle that triggered it. The one-shot backfill (below) throws instead of swallowing — there is no
+  scrape cycle to protect there, so a failure should be loud.
+- **Config** (`.env.sample`): `GOOGLE_SHEETS_SPREADSHEET_ID` — the target spreadsheet's id (the
+  segment of its URL between `/d/` and `/edit`) — plus exactly one of:
+  - **Service account**: `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` — the full JSON key of a Google Cloud
+    service account with the Sheets API enabled, as one line. Runtime secret, deployment env
+    only — never commit the real value. The sheet must be shared with that service account's
+    `client_email` as an **Editor**, or every write fails with a 403.
+  - **Authorized user (OAuth refresh token)**: the token and the OAuth client's own client_secret
+    each come from an inline JSON env var or a local file path — inline takes priority when both
+    are set for the same input:
+    - `GOOGLE_SHEETS_TOKEN_JSON` (inline, **preferred for a deployed container** — one env var, no
+      volume mount) or `GOOGLE_TOKEN_PATH` (alias `GOOGLE_APPLICATION_CREDENTIALS`) — a path, for
+      an operator-managed file outside the repo. Must hold a `refresh_token`.
+    - `GOOGLE_SHEETS_CLIENT_SECRET_JSON` (inline) or `GOOGLE_CLIENT_SECRET_PATH` (path) — the OAuth
+      client's `client_secret_*.json` shape. Optional when the token input already embeds
+      `client_id`/`client_secret` (Google ADC's authorized_user shape).
+    Only paths/inline *values* are ever named in docs; neither file contents nor an inline value's
+    contents (refresh token, client secret, minted access token) ever appear in a log line or
+    thrown error — only the source (file path, or the env var name for an inline value) and, on an
+    OAuth failure, Google's error code (e.g. `invalid_grant`). The token's own Google account needs
+    edit access on the sheet, same as a service account would. Takes priority only when
+    `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` is unset. `GOOGLE_SHEETS_SCOPES` is consulted only by the
+    service-account flow.
+- **One-shot backfill**: `npm run sheets:backfill` mirrors every portal's *current* rows into the
+  sheet immediately (`backfillAllPortalsToSheets` in `src/googleSheetsSync.ts`), instead of waiting
+  for each portal's next scrape cycle — for populating a sheet that predates the sync. Same
+  upsert-by-key path as the per-cycle sync (read-only against Supabase beyond that), plus an
+  independent re-count of each portal's Supabase rows compared against what was written, so a
+  dropped row or a silently-truncated page is caught rather than assumed; exits non-zero on a
+  mismatch. Never runs on its own — it is not part of the scraping pipeline or the continuous loop.

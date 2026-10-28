@@ -455,6 +455,36 @@ app.post("/api/dashboard/sign-url", async (req, res) => {
   }
 });
 
+// Stable, no-login link for a candidate's CV — the one embedded in the
+// Google Sheet's cv_link column (src/googleSheetsSync.ts, "scrapview_link"
+// mode). The link itself never expires; it mints a fresh signed URL on each
+// click via the same getSignedUrl path /api/dashboard/sign-url uses, then
+// redirects — so the sheet cell never goes stale and never carries the raw
+// storage key or a long-lived signed URL.
+app.get("/cv/:portal/:candidateId", async (req, res) => {
+  const config = loadDashboardConfig();
+  if (!config) {
+    res.status(503).json({ error: "Supabase not configured (SCORING_SUPABASE_URL/ANON_KEY missing)" });
+    return;
+  }
+  const canonical = canonicalPortal(req.params.portal);
+  const candidateId = Number(req.params.candidateId);
+  if (!(ALL_PORTALS as readonly string[]).includes(canonical) || !Number.isInteger(candidateId)) {
+    res.status(400).json({ error: "invalid portal or candidateId" });
+    return;
+  }
+  try {
+    const result = await getSignedUrl(config, { portal: canonical, candidateId, kind: "cv" });
+    if (!result) {
+      res.status(404).json({ error: "no CV on file for this candidate" });
+      return;
+    }
+    res.redirect(302, result.url);
+  } catch (error) {
+    dashboardError(res, error);
+  }
+});
+
 app.get("/", (_req, res) => {
   res.send(HTML);
 });
