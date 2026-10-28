@@ -35,8 +35,9 @@ x-scraper: &scraper
   shm_size: "1gb"
   # Every portal's own SQLite checkpoint file lives under db/ (see
   # AGENTS.md "Sharp edges"); one shared volume is safe because each portal
-  # writes only its own filename (kitalulus.db, glints.db, seek.db, ...) and
-  # scraper-viewer needs to read all of them. Nothing in this codebase opens
+  # writes only its own filename (kitalulus.db, glints.db, seek.db, ...).
+  # scraper-viewer no longer reads any of them (its SQLite-backed applicant
+  # panel was removed — see AGENTS.md "Sharp edges"). Nothing in this codebase opens
   # a persistent Playwright browser profile, so there is no browser-profile
   # state to volume — every browser launch is ephemeral per scrape attempt.
   volumes:
