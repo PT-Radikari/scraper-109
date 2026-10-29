@@ -21,7 +21,7 @@ jest.mock("../src/dashboardData", () => {
 import {
   loadGoogleSheetsConfig,
   colLetter,
-  maskDateOfBirth,
+  isValidDateOfBirth,
   maskLocation,
   upsertRows,
   ensureTab,
@@ -316,17 +316,26 @@ describe("colLetter", () => {
   });
 });
 
-describe("maskDateOfBirth", () => {
-  it("keeps the year and masks month/day", () => {
-    expect(maskDateOfBirth("1998-05-12")).toBe("1998-**-**");
+describe("isValidDateOfBirth", () => {
+  it("accepts a real YYYY-MM-DD date", () => {
+    expect(isValidDateOfBirth("1998-05-12")).toBe(true);
   });
 
-  it("passes through null", () => {
-    expect(maskDateOfBirth(null)).toBeNull();
+  it("rejects null/undefined", () => {
+    expect(isValidDateOfBirth(null)).toBe(false);
+    expect(isValidDateOfBirth(undefined)).toBe(false);
   });
 
-  it("masks a non-ISO value by length instead of leaking it verbatim", () => {
-    expect(maskDateOfBirth("May 1998")).toBe("********");
+  it("rejects the literal \"0\" sentinel some portals (Glints) send for unknown DOB", () => {
+    expect(isValidDateOfBirth("0")).toBe(false);
+  });
+
+  it("rejects a non-ISO value", () => {
+    expect(isValidDateOfBirth("May 1998")).toBe(false);
+  });
+
+  it("rejects a calendar-invalid date (e.g. Feb 30)", () => {
+    expect(isValidDateOfBirth("2024-02-30")).toBe(false);
   });
 });
 
@@ -577,6 +586,56 @@ describe("ensureTab", () => {
     expect(extendValues).toEqual([["cv_link"]]);
   });
 
+  it("rewrites the whole header row when it has drifted anywhere other than a trailing extension (e.g. a column inserted mid-row)", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Candidates", sheetId: 7 } }] } });
+      }
+      // Old layout has no "age" column between date_of_birth and location.
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [["portal", "date_of_birth", "location"]] } });
+      return Promise.resolve({ data: {} });
+    });
+    let headerPutRange: string | undefined;
+    let headerPutValues: unknown;
+    mockedAxios.put.mockImplementation((rawUrl: string, data?: unknown) => {
+      headerPutRange = decodeURIComponent(rawUrl).split("/values/")[1]?.split("?")[0];
+      headerPutValues = (data as { values?: unknown }).values;
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      return Promise.resolve({ data: {} });
+    });
+
+    await ensureTab(CONFIG, "Candidates", ["portal", "date_of_birth", "age", "location"]);
+
+    expect(headerPutRange).toBe("Candidates!A1:D1");
+    expect(headerPutValues).toEqual([["portal", "date_of_birth", "age", "location"]]);
+  });
+
+  it("does nothing when the existing header already matches exactly", async () => {
+    mockTokenMint();
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Candidates", sheetId: 7 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [["portal", "date_of_birth", "age"]] } });
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.put.mockImplementation(() => Promise.resolve({ data: {} }));
+    mockedAxios.post.mockImplementation((rawUrl: string) => {
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      return Promise.resolve({ data: {} });
+    });
+
+    await ensureTab(CONFIG, "Candidates", ["portal", "date_of_birth", "age"]);
+
+    expect(mockedAxios.put).not.toHaveBeenCalled();
+  });
+
   it("logs and continues when setting the basic filter fails, never blocking the header/tab setup", async () => {
     mockTokenMint();
     mockedAxios.get.mockImplementation((rawUrl: string) => {
@@ -615,7 +674,7 @@ describe("syncPortalResultsToSheets", () => {
     );
   });
 
-  it("sends email/phone unmasked, masks date_of_birth/location, and sends presence-only CV/photo flags end to end", async () => {
+  it("sends email/phone/date_of_birth unmasked, masks only location, writes an age formula, and sends presence-only CV/photo flags end to end", async () => {
     (getVacanciesForSync as jest.Mock).mockResolvedValue([
       {
         portal: "glints",
@@ -696,12 +755,16 @@ describe("syncPortalResultsToSheets", () => {
     // overriding the 2026-10-27 masking call for these two fields only).
     expect(candidateRow[3]).toBe("ada.lovelace@example.com");
     expect(candidateRow[4]).toBe("+6281234567890");
-    // date_of_birth and location are still masked.
-    expect(candidateRow[5]).toBe("1998-**-**");
-    expect(candidateRow[6]).not.toContain("Selatan");
+    // date_of_birth is now sent unmasked, in full.
+    expect(candidateRow[5]).toBe("1998-05-12");
+    // age is written blank here (the formula lands in a later USER_ENTERED
+    // pass once the row number is known — see the "age column" describe
+    // block below); location is still masked.
+    expect(candidateRow[6]).toBe("");
+    expect(candidateRow[7]).not.toContain("Selatan");
     // CV/photo are presence flags only, never the object key or a link.
-    expect(candidateRow[9]).toBe("captured");
-    expect(candidateRow[10]).toBe("none");
+    expect(candidateRow[10]).toBe("captured");
+    expect(candidateRow[11]).toBe("none");
   });
 
   it("returns null and never throws when the Sheets API call fails", async () => {
@@ -730,6 +793,131 @@ describe("syncPortalResultsToSheets", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+});
+
+describe("age column (date_of_birth-derived DATEDIF formula)", () => {
+  function mockSheetsPlumbingWithAppendRowNumber(linkWrites: Array<{ data: unknown }>, updatedRange: string) {
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      if (url.includes("!A2:B")) return Promise.resolve({ data: {} });
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string, data?: unknown) => {
+      const url = decodeURIComponent(rawUrl);
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes(":append")) return Promise.resolve({ data: { updates: { updatedRange } } });
+      if (url.includes("values:batchUpdate")) {
+        const body = data as { valueInputOption?: string };
+        if (body.valueInputOption === "USER_ENTERED") linkWrites.push({ data });
+      }
+      return Promise.resolve({ data: {} });
+    });
+  }
+
+  const ENV = {
+    GOOGLE_SHEETS_SPREADSHEET_ID: "sheet-xyz",
+    SCORING_SUPABASE_URL: "http://supabase.local",
+    SCORING_SUPABASE_ANON_KEY: "anon-key",
+  };
+
+  function envWithKey() {
+    return { ...ENV, GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON: JSON.stringify({ client_email: "s@t.iam.gserviceaccount.com", private_key: privateKeyPem }) };
+  }
+
+  it("writes a DATEDIF formula into the age cell (column G) when date_of_birth is a valid date", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: "1998-05-12", location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const linkWrites: Array<{ data: unknown }> = [];
+    mockSheetsPlumbingWithAppendRowNumber(linkWrites, "Candidates!A2:M2");
+
+    await withEnv(envWithKey(), async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    const ageWrite = linkWrites
+      .flatMap((w) => (w.data as { data: Array<{ range: string; values: string[][] }> }).data)
+      .find((d) => d.range === "Candidates!G2");
+    expect(ageWrite?.values[0][0]).toBe('=IF(F2="","",DATEDIF(DATEVALUE(F2),TODAY(),"Y"))');
+  });
+
+  it("never writes an age formula when date_of_birth is empty", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: null, location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const linkWrites: Array<{ data: unknown }> = [];
+    mockSheetsPlumbingWithAppendRowNumber(linkWrites, "Candidates!A2:M2");
+
+    await withEnv(envWithKey(), async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    const ageWrite = linkWrites
+      .flatMap((w) => (w.data as { data: Array<{ range: string }> }).data)
+      .find((d) => d.range === "Candidates!G2");
+    expect(ageWrite).toBeUndefined();
+  });
+
+  it("never writes an age formula for a sentinel \"0\" date_of_birth (Glints' literal for unknown)", async () => {
+    (getVacanciesForSync as jest.Mock).mockResolvedValue([]);
+    (getCandidatesForSync as jest.Mock).mockResolvedValue([
+      {
+        id: 9, portal: "glints", portalCandidateId: "cand-1", name: "Ada", email: null, phone: null,
+        dateOfBirth: "0", location: null, appliedFor: null, appliedDate: null,
+        hasCv: false, hasPhoto: false, lastSeenAt: "t",
+      },
+    ]);
+    const linkWrites: Array<{ data: unknown }> = [];
+    const appends: Array<{ data: unknown }> = [];
+    mockedAxios.get.mockImplementation((rawUrl: string) => {
+      const url = decodeURIComponent(rawUrl);
+      if (url.includes("fields=sheets.properties.title")) {
+        return Promise.resolve({ data: { sheets: [{ properties: { title: "Vacancies", sheetId: 1 } }, { properties: { title: "Candidates", sheetId: 2 } }] } });
+      }
+      if (url.includes("!A1")) return Promise.resolve({ data: { values: [Array(20).fill("x")] } });
+      if (url.includes("!A2:B")) return Promise.resolve({ data: {} });
+      return Promise.resolve({ data: {} });
+    });
+    mockedAxios.post.mockImplementation((rawUrl: string, data?: unknown) => {
+      const url = decodeURIComponent(rawUrl);
+      if (rawUrl === "https://oauth2.googleapis.com/token") return Promise.resolve({ data: { access_token: "t", expires_in: 3600 } });
+      if (url.includes(":append")) {
+        appends.push({ data });
+        return Promise.resolve({ data: { updates: { updatedRange: "Candidates!A2:M2" } } });
+      }
+      if (url.includes("values:batchUpdate")) {
+        const body = data as { valueInputOption?: string };
+        if (body.valueInputOption === "USER_ENTERED") linkWrites.push({ data });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    await withEnv(envWithKey(), async () => {
+      await syncPortalResultsToSheets("glints");
+    });
+
+    const appendedRow = (appends[0]?.data as { values: string[][] }).values[0];
+    expect(appendedRow[5]).toBe(""); // date_of_birth blanked
+    expect(appendedRow[6]).toBe(""); // age blanked
+    const ageWrite = linkWrites
+      .flatMap((w) => (w.data as { data: Array<{ range: string }> }).data)
+      .find((d) => d.range === "Candidates!G2");
+    expect(ageWrite).toBeUndefined();
   });
 });
 
@@ -797,7 +985,7 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
     expect(getSignedUrl).not.toHaveBeenCalled();
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row[12]).toBe("https://scrapview.example.com/cv/glints/9");
+    expect(row[13]).toBe("https://scrapview.example.com/cv/glints/9");
   });
 
   it("scrapview_link mode leaves the cell blank (and warns, never throws) when SCRAPVIEW_BASE_URL is unset", async () => {
@@ -825,7 +1013,7 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
 
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row[12]).toBe("");
+    expect(row[13]).toBe("");
   });
 
   it("object_key mode appends the raw cv_object_key as the 13th column", async () => {
@@ -846,8 +1034,8 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
 
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row).toHaveLength(13);
-    expect(row[12]).toBe("glints/cand-1/cv.pdf");
+    expect(row).toHaveLength(14);
+    expect(row[13]).toBe("glints/cand-1/cv.pdf");
     expect(getSignedUrl).not.toHaveBeenCalled();
   });
 
@@ -874,7 +1062,7 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
     expect(getSignedUrl).toHaveBeenCalledWith(expect.anything(), { portal: "glints", candidateId: 9, kind: "cv", expiresInSeconds: 7200 });
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row[12]).toBe("https://signed.example/cv.pdf");
+    expect(row[13]).toBe("https://signed.example/cv.pdf");
   });
 
   it("signed_url mode degrades to an empty cell (never throws) when minting the signed URL fails", async () => {
@@ -902,7 +1090,7 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
 
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row[12]).toBe("");
+    expect(row[13]).toBe("");
   });
 
   it("neither object_key nor signed_url mode ever calls getSignedUrl/appends a column for a candidate with no CV", async () => {
@@ -924,7 +1112,7 @@ describe("CV-link column (GOOGLE_SHEETS_CV_LINK_MODE, scrapview_link on by defau
     expect(getSignedUrl).not.toHaveBeenCalled();
     const candidateAppend = appends.find((a) => a.url.includes("Candidates"));
     const row = (candidateAppend?.data as { values: string[][] }).values[0];
-    expect(row[12]).toBe("");
+    expect(row[13]).toBe("");
   });
 });
 
@@ -1037,10 +1225,10 @@ describe("portal_candidate_id and cv_link as real hyperlinks, not plain text", (
 
     const allLinkRanges = linkWrites.flatMap((w) => (w.data as { data: Array<{ range: string }> }).data.map((d) => d.range));
     expect(allLinkRanges).toContain("Candidates!B2");
-    expect(allLinkRanges).toContain("Candidates!M2");
+    expect(allLinkRanges).toContain("Candidates!N2");
     const cvLinkWrite = linkWrites
       .flatMap((w) => (w.data as { data: Array<{ range: string; values: string[][] }> }).data)
-      .find((d) => d.range === "Candidates!M2");
+      .find((d) => d.range === "Candidates!N2");
     expect(cvLinkWrite?.values[0][0]).toBe(
       '=HYPERLINK("https://scrapview.example.com/cv/glints/9","Open CV")',
     );
