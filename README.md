@@ -329,20 +329,27 @@ below.
   keyed by the sheet row's first two columns — `(portal, portal_vacancy_id)` for Vacancies,
   `(portal, portal_candidate_id)` for Candidates — so a re-scrape updates its existing line and
   never appends a duplicate. A tab is created (and given its header row) on first use if it doesn't
-  exist yet; an existing-but-shorter header (e.g. the CV-link column arriving later) is extended
-  with the new trailing column names, never touching or reordering what's already there. A basic
-  filter (Sheets API `setBasicFilter`) over the header+data range is (re-)applied on every sync too,
-  so it stays in place even if someone removes it by hand; a filter failure is logged and otherwise
-  ignored — it must never block the actual data write.
-- **Fields and PII handling**: `date_of_birth` and `location` are masked before they ever leave
-  the process (`maskDateOfBirth`/`maskLocation` in `src/googleSheetsSync.ts`). `email` and `phone`
-  were masked too under the original 2026-10-27 decision, but the captain explicitly overrode that
-  for these two fields on 2026-10-28 ("don't censor it") — the sheet now carries them exactly as
-  Scrapview's own dashboard does; `src/dashboardData.ts`'s `maskEmail`/`maskPhone` remain used only
-  by the dashboard API's own masked view, never by the sheet sync. `cv_object_key`/`photo_object_key`
-  never appear as links or raw keys, only as a `"captured"`/`"none"` presence flag — a signed
-  CV/photo URL expires in 10 minutes and isn't safe to paste into a cell. See
-  `Vacancies`/`Candidates` headers in `src/googleSheetsSync.ts` for the exact column list.
+  exist yet; an existing-but-shorter header that's still a true prefix of the current header (e.g.
+  the CV-link column arriving later) is extended with the new trailing column names, never touching
+  or reordering what's already there — but a header that has drifted anywhere else (e.g. a column
+  inserted mid-row) gets its whole row overwritten to match, which never touches data rows, so
+  callers must re-run a full upsert/backfill afterward to rewrite existing rows under the corrected
+  layout. A basic filter (Sheets API `setBasicFilter`) over the header+data range is (re-)applied on
+  every sync too, so it stays in place even if someone removes it by hand; a filter failure is
+  logged and otherwise ignored — it must never block the actual data write.
+- **Fields and PII handling**: `location` is masked before it ever leaves the process
+  (`maskLocation` in `src/googleSheetsSync.ts`). `date_of_birth`, `email` and `phone` were masked
+  too under the original 2026-10-27 decision, but the captain explicitly overrode that for these
+  fields (2026-10-28 for email/phone, 2026-10-29 for date_of_birth — "don't censor it") — the sheet
+  now carries them exactly as Scrapview's own dashboard does; `src/dashboardData.ts`'s
+  `maskEmail`/`maskPhone` remain used only by the dashboard API's own masked view, never by the
+  sheet sync. A sibling `age` column (Candidates only) is never computed at sync time — it's a
+  `DATEDIF` sheet formula reading that row's own `date_of_birth` cell, left blank whenever DOB is
+  empty or not a real calendar date (`isValidDateOfBirth` in `src/googleSheetsSync.ts`), so it never
+  goes stale between syncs. `cv_object_key`/`photo_object_key` never appear as links or raw keys,
+  only as a `"captured"`/`"none"` presence flag — a signed CV/photo URL expires in 10 minutes and
+  isn't safe to paste into a cell. See `Vacancies`/`Candidates` headers in
+  `src/googleSheetsSync.ts` for the exact column list.
 - **Timestamps in WIB** (decided 2026-10-28): `last_seen_at` (both tabs) and `applied_date`
   (Candidates) are formatted `"YYYY-MM-DD HH:mm:ss WIB"` (Asia/Jakarta, UTC+7, no DST) via the
   shared `formatWIB` (`src/wib.ts`) before they ever reach the cell — display-only, Supabase's own
@@ -353,16 +360,17 @@ below.
   and `portal_candidate_id` (when the candidate has a real `profileUrl` on file) are written as a
   `HYPERLINK(url, text)` formula via a second, narrower `USER_ENTERED` write — `upsertRows`'
   `rowLinks` parameter — right after the ordinary plain-text `RAW` write that covers the rest of
-  the row. This keeps every other column (dates, phone numbers, ids) immune to Sheets'
-  `USER_ENTERED` auto-formatting, since only the two linked cells are ever written with that input
-  mode. `portal_candidate_id` links to `data.url_profile` — the candidate's own real,
+  the row. The same pass also carries the `age` column's raw `DATEDIF` formula (a `RowFormulaCell`,
+  not a link). This keeps every other column (dates, phone numbers, ids) immune to Sheets'
+  `USER_ENTERED` auto-formatting, since only those few cells are ever written with that input mode.
+  `portal_candidate_id` links to `data.url_profile` — the candidate's own real,
   already-visited portal URL (a per-candidate deep link for Glints; a shared vacancy/list page for
   portals that never navigate to a candidate-specific route, which is still a real, working,
   non-fabricated link, just not candidate-granular) — never fabricated when absent, in which case
   the cell stays the bare id as before. `cv_link`'s display text is the fixed label `"Open CV"`
   (captain's decision 2026-10-28) rather than the raw link text, via `RowLinkCell.text`.
 - **CV link column** (`GOOGLE_SHEETS_CV_LINK_MODE`, decided by the captain 2026-10-28 — **"scrapview_link"
-  is the default (ON)**): appends a 13th `cv_link` column holding a stable, clickable link to the
+  is the default (ON)**): appends a 14th `cv_link` column holding a stable, clickable link to the
   viewer's own `GET /cv/:portal/:candidateId` (`src/viewer.ts`, no login required), which mints a
   fresh Supabase signed URL on each click and redirects — the same resolve-on-click behavior
   scrapview's own UI already uses. The cell itself never expires and never carries the raw storage
