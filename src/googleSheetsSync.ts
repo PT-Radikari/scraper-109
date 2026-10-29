@@ -70,6 +70,7 @@ export const CANDIDATES_HEADER = [
   "email",
   "phone",
   "date_of_birth",
+  "age",
   "location",
   "applied_for",
   "applied_date",
@@ -365,13 +366,22 @@ function parseAppendStartRow(updatedRange: string | undefined): number | null {
 
 /**
  * Creates the tab if it doesn't exist yet, writes the header row if the tab
- * is empty, and extends an existing-but-shorter header with any new trailing
- * column names (e.g. the CV-link column arriving later on a tab the backfill
- * already populated) — existing column names and their data are never
- * touched or reordered, only appended to. Also (re-)applies a basic filter
- * over the full header+data range every time, so it survives someone
- * removing it by hand; a filter failure is logged and otherwise ignored,
- * since it must never block the actual data write. Idempotent throughout.
+ * is empty, and otherwise brings an out-of-date header row in line with
+ * `header`:
+ *   - a shorter header that is still a true prefix of `header` (e.g. the
+ *     CV-link column arriving later on a tab the backfill already
+ *     populated) gets only its new trailing column names appended —
+ *     existing column names are never touched or reordered;
+ *   - a header that has drifted anywhere else (e.g. a column inserted
+ *     mid-row, such as "age" landing after "date_of_birth") gets its whole
+ *     row overwritten with `header` so the sheet's columns match the
+ *     layout callers now write rows under. This never touches data rows —
+ *     callers must re-run a full upsert/backfill afterward so existing rows
+ *     are rewritten under the corrected layout.
+ * Also (re-)applies a basic filter over the full header+data range every
+ * time, so it survives someone removing it by hand; a filter failure is
+ * logged and otherwise ignored, since it must never block the actual data
+ * write. Idempotent throughout.
  */
 export async function ensureTab(config: GoogleSheetsConfig, title: string, header: string[]): Promise<void> {
   const meta = await sheetsRequest<{ sheets: Array<{ properties: { title: string; sheetId: number } }> }>(
@@ -397,16 +407,22 @@ export async function ensureTab(config: GoogleSheetsConfig, title: string, heade
     `/values/${encodeURIComponent(headerRange)}`,
   );
   const existingHeader = current.values?.[0] ?? [];
+  const isPrefixMatch = existingHeader.every((value, i) => value === header[i]);
   if (existingHeader.length === 0) {
     await sheetsRequest(config, "put", `/values/${encodeURIComponent(headerRange)}?valueInputOption=RAW`, {
       range: headerRange,
       values: [header],
     });
-  } else if (existingHeader.length < header.length) {
+  } else if (isPrefixMatch && existingHeader.length < header.length) {
     const extendRange = `${title}!${colLetter(existingHeader.length + 1)}1:${colLetter(header.length)}1`;
     await sheetsRequest(config, "put", `/values/${encodeURIComponent(extendRange)}?valueInputOption=RAW`, {
       range: extendRange,
       values: [header.slice(existingHeader.length)],
+    });
+  } else if (!isPrefixMatch) {
+    await sheetsRequest(config, "put", `/values/${encodeURIComponent(headerRange)}?valueInputOption=RAW`, {
+      range: headerRange,
+      values: [header],
     });
   }
 
@@ -425,10 +441,15 @@ export async function ensureTab(config: GoogleSheetsConfig, title: string, heade
   }
 }
 
-/** One linked cell for `upsertRows`' hyperlink pass: `text` overrides the cell's own plain value as the HYPERLINK's display text (e.g. "Open CV" instead of the raw link); omitted, it defaults to that value (e.g. the bare id for portal_candidate_id). */
+/** One linked cell for `upsertRows`' formula pass: `text` overrides the cell's own plain value as the HYPERLINK's display text (e.g. "Open CV" instead of the raw link); omitted, it defaults to that value (e.g. the bare id for portal_candidate_id). */
 export interface RowLinkCell {
   url: string;
   text?: string;
+}
+
+/** One formula cell for `upsertRows`' formula pass (e.g. the age column's DATEDIF): `{R}` in `formula` is replaced with the cell's own 1-based row number once it's known, so the formula can reference other cells in the same row. */
+export interface RowFormulaCell {
+  formula: string;
 }
 
 /**
@@ -439,22 +460,23 @@ export interface RowLinkCell {
  *
  * `rowLinks[i]`, when given, maps a 0-based column index to the cell that
  * row's cell should become a clickable link to — e.g. `{1: {url: profileUrl}}`
- * for portal_candidate_id. The plain-text write above always carries the
- * exact same value it always has (so every other column's formatting, and a
- * caller with no `rowLinks`, is unaffected); a second, narrower
- * `USER_ENTERED` pass then replaces just those cells with a
- * `HYPERLINK(url, text)` formula, once each row's final row number is known
- * (immediately for an updated row, or parsed from the append response's
- * `updatedRange` for a brand-new one — a response that doesn't carry one,
- * e.g. a test double, just means that row's links are skipped, never a
- * thrown error over a cosmetic enrichment).
+ * for portal_candidate_id — or a `{formula}` cell (e.g. the age column's
+ * DATEDIF). The plain-text write above always carries the exact same value
+ * it always has (so every other column's formatting, and a caller with no
+ * `rowLinks`, is unaffected); a second, narrower `USER_ENTERED` pass then
+ * replaces just those cells with their `HYPERLINK(url, text)` or raw formula,
+ * once each row's final row number is known (immediately for an updated
+ * row, or parsed from the append response's `updatedRange` for a brand-new
+ * one — a response that doesn't carry one, e.g. a test double, just means
+ * that row's links/formulas are skipped, never a thrown error over a
+ * cosmetic enrichment).
  */
 export async function upsertRows(
   config: GoogleSheetsConfig,
   title: string,
   header: string[],
   rows: string[][],
-  rowLinks?: Array<Record<number, RowLinkCell> | undefined>,
+  rowLinks?: Array<Record<number, RowLinkCell | RowFormulaCell> | undefined>,
 ): Promise<void> {
   if (rows.length === 0) return;
   const lastCol = colLetter(header.length);
@@ -514,6 +536,11 @@ export async function upsertRows(
     if (!links || !rowNumber) continue;
     for (const [colKey, cell] of Object.entries(links)) {
       const col = Number(colKey);
+      if ("formula" in cell) {
+        const formula = cell.formula.replace(/\{R\}/g, String(rowNumber));
+        linkData.push({ range: `${title}!${colLetter(col + 1)}${rowNumber}`, values: [[formula]] });
+        continue;
+      }
       const text = cell.text ?? rows[i][col];
       if (!text || !isHttpUrl(cell.url)) continue;
       const formula = `=HYPERLINK("${escapeFormulaString(cell.url)}","${escapeFormulaString(text)}")`;
@@ -576,12 +603,16 @@ function candidatesHeaderFor(mode: CvLinkMode): string[] {
   return mode === "off" ? CANDIDATES_HEADER : [...CANDIDATES_HEADER, "cv_link"];
 }
 
-/** Keeps the birth year, masks month/day — enough for age-bracket triage without the full date. */
-export function maskDateOfBirth(value: string | null): string | null {
-  if (!value) return null;
-  const match = /^(\d{4})-\d{2}-\d{2}/.exec(value.trim());
-  if (match) return `${match[1]}-**-**`;
-  return "*".repeat(Math.min(value.trim().length, 8)) || null;
+/** True only for a real, calendar-valid YYYY-MM-DD date — the one shape date_of_birth/age are ever written from. Rejects malformed strings and sentinel values like the literal "0" some portals send for "unknown". */
+export function isValidDateOfBirth(value: string | null | undefined): value is string {
+  const match = value ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim()) : null;
+  if (!match) return false;
+  const [, y, m, d] = match;
+  const year = Number(y);
+  const month = Number(m);
+  const day = Number(d);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
 }
 
 /** Keeps the first character of the first token (city-level signal), masks the rest. */
@@ -636,17 +667,24 @@ async function resolveCvLink(c: CandidateSyncRow, mode: CvLinkMode, dashboardCon
 /** Plain values plus a 0-based-column -> link map for `upsertRows`' hyperlink pass (never includes a column whose own value isn't a real http(s) URL already, so a storage key or a blank cell is never wrapped). */
 interface CandidateRowResult {
   values: string[];
-  links: Record<number, RowLinkCell>;
+  links: Record<number, RowLinkCell | RowFormulaCell>;
 }
 
+/** 0-based column indexes of date_of_birth/age in CANDIDATES_HEADER — fixed, since both always sit before the cv_link column that's conditionally appended at the end. */
+const DATE_OF_BIRTH_COL = 5;
+const AGE_COL = 6;
+
 async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConfig: DashboardConfig): Promise<CandidateRowResult> {
+  const dateOfBirth = c.dateOfBirth;
+  const dobValid = isValidDateOfBirth(dateOfBirth);
   const values = [
     c.portal,
     c.portalCandidateId ?? "",
     c.name ?? "",
     c.email ?? "",
     c.phone ?? "",
-    maskDateOfBirth(c.dateOfBirth) ?? "",
+    dobValid ? dateOfBirth.trim() : "",
+    "", // age: left blank here, filled in by the DATEDIF formula below when DOB is valid, or stays blank otherwise.
     maskLocation(c.location) ?? "",
     c.appliedFor ?? "",
     formatWIB(c.appliedDate),
@@ -654,11 +692,18 @@ async function candidateRow(c: CandidateSyncRow, mode: CvLinkMode, dashboardConf
     presenceFlag(c.hasPhoto),
     formatWIB(c.lastSeenAt),
   ];
-  const links: Record<number, RowLinkCell> = {};
+  const links: Record<number, RowLinkCell | RowFormulaCell> = {};
   // portal_candidate_id -> the candidate's real, already-visited portal URL.
   // Never fabricated: a portal/row with no captured profileUrl just keeps
   // the bare id as plain text, same as before this column could ever link.
   if (values[1] && isHttpUrl(c.profileUrl)) links[1] = { url: c.profileUrl as string };
+  // age -> a sheet formula (never computed at sync time) so it never goes
+  // stale between runs; blank whenever DOB is empty or not a valid date, to
+  // match the date_of_birth cell it reads.
+  if (dobValid) {
+    const dobCol = colLetter(DATE_OF_BIRTH_COL + 1);
+    links[AGE_COL] = { formula: `=IF(${dobCol}{R}="","",DATEDIF(DATEVALUE(${dobCol}{R}),TODAY(),"Y"))` };
+  }
 
   if (mode === "off") return { values, links };
   const cvLink = await resolveCvLink(c, mode, dashboardConfig);
